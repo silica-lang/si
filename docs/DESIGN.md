@@ -323,10 +323,22 @@ Buses are **interfaces** — a named set of ops with semantics — that concrete
 ```si
 interface i2c {
   type address = u7
+  // Block transfer is the primitive: ONE yield wraps an entire DMA/FIFO transaction (SIL-003).
+  op transfer(addr: address, tx: buffer, rx: buffer)   -> () or fault yields
+  // The per-register ops are thin conveniences expressed over `transfer`.
   op write_reg(addr: address, reg: u8, val: u8)        -> () or fault yields
   op read_reg (addr: address, reg: u8)                 -> u8 or fault yields
   op read_reg24(addr: address, reg: u8)                -> u24 or fault yields
 }
+
+**Block transfer is the primitive; per-register ops are sugar (Gemini SIL-003).** If every byte
+crossed the bus through its own `yields` op, a multi-byte read would lower to a deep async state
+machine that suspends per byte — large frames (§5.3) and heavy scheduler churn. So the wire-level
+primitive is a whole-transaction `transfer(tx, rx)` that **suspends once** and can wrap a hardware
+FIFO loop or a DMA channel underneath; `read_reg`/`write_reg` are thin, readable conveniences
+expressed over it. The composed-device examples below keep the per-register spelling for clarity, but
+a driver that moves a block (a display frame, a sensor burst) reaches for `transfer` and pays one
+suspension, not N.
 ```
 
 A concrete I²C controller is a *leaf* device that `implements i2c` (its ops bottom out in MMIO).
@@ -563,10 +575,16 @@ an odd width like `u7` or `u24`.
 > release/on-metal — re-introducing exactly the silent-wraparound footgun the design exists to
 > kill. **Recommendation: trap by default everywhere, including release.** On metal a trap is just
 > the Layer-3 fault path (§5.4); it is not free, but neither is a silent wrong answer in a motor
-> controller. Provide an explicit, *visible* opt-out — `+%` for "I meant to wrap" at the operator
-> level, and a block/module attribute for "this hot loop is checked elsewhere, elide checks here."
-> The default must be safe; the opt-out must be loud. (This is a place where the embedded goal and
-> the agentic goal agree: an agent reasons far better about a language whose `+` means one thing.)
+> controller. Provide an explicit, *visible* opt-out at two grains: `+%`/`+|` operators for a single
+> wrap/saturate site, and a **scoped directive `@overflow(saturate | wrap | trap)`** on a block or op
+> that sets the default arithmetic mode inside it (Gemini SIL-004). The directive earns its place
+> because the *correct* behaviour for a real-time control loop is usually **saturation**, not a trap
+> (clamping a PID term beats faulting a live motor controller) and not silent wrap — and writing `+|`
+> on every line of the loop is exactly the kind of noise an agent gets wrong. `@overflow(saturate)`
+> makes "this whole loop clamps" one greppable declaration; **trap stays the global default**
+> everywhere it is not explicitly overridden. The default must be safe; the opt-out must be loud.
+> (This is a place where the embedded goal and the agentic goal agree: an agent reasons far better
+> about a language whose `+` means one thing within a clearly-marked scope.)
 
 **Fixed-point is first-class.** The binary point is in the type: `fixed<16,16>` is 16 integer bits
 and 16 fractional bits. The compiler handles scaling on multiply/add (a `fixed<16,16>` multiply
