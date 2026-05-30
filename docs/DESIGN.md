@@ -481,7 +481,7 @@ coprocessor deferrals open (§10): they are already in the type model, so adding
 
 **How `on`/`every` stay primitive while devices stay un-privileged.** The compiler core knows the
 *binding/trigger* concepts `on` and `every`. It does **not** know what a UART or an NVIC is. A
-device declares `emits <name> : event`; `on uart1.rx_ready { ... }` binds a handler to that event
+device declares `emits <name> : event`; `on usart2.rx_ready { ... }` binds a handler to that event
 source. The compiler resolves the binding to a concrete IRQ by following the device's `needs irq`
 relation into the (ordinary, std-lib) interrupt-controller device, and generates the vector-table
 entry. `every` is implemented over an ordinary timer device the same way. **The primitives are
@@ -588,7 +588,7 @@ op read_temp() when ready -> fixed<16,16> or fault yields {
 error zoo:
 
 ```si
-match uart1.write(b) {
+match usart2.write(b) {
   ok                -> { }
   fault f if f.code == timeout -> retry_later()
   fault f           -> escalate(f)
