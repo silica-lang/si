@@ -169,10 +169,10 @@ set and a `safe_state`.
 ```si
 device uart implements byte_sink, byte_source {
   regs {
-    SR  : reg32 at 0x00 { txe: bit[7], rxne: bit[5], busy: bit[3] }
-    DR  : reg32 at 0x04 { data: field[7:0] }
-    BRR : reg32 at 0x08 { div: field[15:0] }
-    CR1 : reg32 at 0x0C { enable: bit[13], rxneie: bit[5], txeie: bit[7] }
+    SR  : reg32 at 0x00 access ro { txe: bit[7], rxne: bit[5], busy: bit[3] }   // status: read-only
+    DR  : reg32 at 0x04 access rw side_effect pop_on_read { data: field[7:0] }  // read consumes a byte (§4.2)
+    BRR : reg32 at 0x08 access rw { div: field[15:0] }
+    CR1 : reg32 at 0x0C access rw { enable: bit[13], rxneie: bit[5], txeie: bit[7] }
   }
 
   config {
@@ -184,6 +184,7 @@ device uart implements byte_sink, byte_source {
   needs {
     clock : clock_source                 // typed reference, not a phandle
     irq   : irq_line
+    pins  : pin_group                    // typed pad mux (§3.3 pinctrl); one owner per physical pad
   }
 
   states { off, ready }
@@ -245,18 +246,30 @@ board nucleo_f401re {
     irqs { usart2_irq : irq_line = 38 }
   }
 
-  // peripheral instances are typed, checked against all four device sections
-  usart2 : uart at 0x4000_4400 {           // 0x4000_4400 is USART2 on this SoC — instance named for the part
-    config { baud = 115_200 }
-    needs  { clock = soc.sysclk, irq = soc.usart2_irq }
-  }
-
   // GPIO ports are ordinary device instances too — no privileged built-ins (§2)
   gpio_a : gpio at 0x4002_0000 { needs { clock = soc.sysclk } }
   gpio_c : gpio at 0x4002_0800 { needs { clock = soc.sysclk } }
 
+  // Pad multiplexing is a typed, checked resource: every physical pad has exactly one owner.
+  // Assigning the same pad twice, or an alt-function the pad cannot provide, is a compile error.
+  pinctrl {
+    usart2_pins : pinmux {
+      tx = gpio_a.pin(2) as alt_fn(7) drive push_pull speed high
+      rx = gpio_a.pin(3) as alt_fn(7) pulling up
+    }
+  }
+
+  // peripheral instances are typed, checked against all four device sections
+  usart2 : uart at 0x4000_4400 {           // 0x4000_4400 is USART2 on this SoC — instance named for the part
+    config { baud = 115_200 }
+    needs  { clock = soc.sysclk, irq = soc.usart2_irq, pins = pinctrl.usart2_pins }
+  }
+
   led_user  : gpio.pin = gpio_a.pin(5)  as output
   btn_user  : gpio.pin = gpio_c.pin(13) as input pulling up
+
+  // The hardware watchdog is a first-class device the scheduler feeds automatically (§5.6).
+  watchdog : wdt at 0x4000_2C00 { config { timeout = 100ms } }
 }
 ```
 
@@ -777,6 +790,15 @@ So the honest claim is: **statics + pools + handler frames + a bounded worst-cas
 at build time. Stack overflow is then a *budget* failure caught at link time, plus an MPU guard-page
 on parts that have one — not a runtime mystery.
 
+**Frame *union* keeps the static cost affordable (Gemini SIL-005).** Allocating a separate frame for
+every async handler would exhaust RAM on an 8–32 KB part, so the compiler does the opposite of
+wasteful: from the static call-graph and priority map it computes which handler frames have
+**disjoint lifetimes** — handlers that can never be live at the same time (a one-shot `boot` sequence
+vs. the steady-state loop; two handlers at the same single-threaded priority that cannot preempt each
+other) — and **overlaps their frames in a shared union** in the generated layout. This is the static
+analogue of stack reuse: predictable *and* compact. It is an optimization over the accounting above,
+not a change to it — the summed budget can only get smaller, never unknowable.
+
 ### 5.4 The three-layer fault model (execution view)
 
 §4.4 defined the layers in type terms; here is how they execute:
@@ -855,6 +877,17 @@ reset). Crucially, software safe-state is the *second* line of defence: the desi
 **hardware fail-safe** (pull-downs/biasing so the de-energized state is safe) and an independent
 **watchdog** that forces a reset if the fault path itself hangs. Silica models and sequences the
 software part; it does not pretend software alone makes a system safe.
+
+**The hardware watchdog is a first-class part of the runtime (Gemini SIL-006).** A software-only
+Layer-3 decoder cannot recover a CPU stuck in an interrupt storm, a livelock, or a wedged bus — so
+the watchdog is not left to the programmer to remember. A board declares one as an ordinary device
+(`watchdog : wdt at … { config { timeout = 100ms } }`, §3.3), and the **scheduler owns feeding it**:
+the generated event loop emits the feed only on a clean return to the idle/dispatch point. The
+consequence is deliberate — **a reaction that overruns its declared budget (`within …`, §4.5) starves
+the watchdog and triggers a hardware master reset** rather than hanging silently. The feed is never
+sprinkled through user code (that is how watchdogs get defeated — fed by the very loop that is stuck);
+it is a property of the scheduler, like the critical sections of §5.5. v1 wires a single
+system watchdog; windowed/multi-stage watchdogs are deferred-not-foreclosed (§10).
 
 ---
 
@@ -1028,6 +1061,16 @@ stub where one does not yet — **and every stub emits a diagnostic, never a sil
 (D10). The transpiler validates against the Silica type system, so a fact that does not type-check
 (an IRQ with no controller, a clock with no source) surfaces as a diagnostic too.
 
+**The transpiler runs the target's C preprocessor as phase 1 — and this does *not* violate the
+no-preprocessor rule (Gemini SIL-007).** Real `.dts`/`.dtsi` lean on `#include`, `#define`, and
+macro arithmetic, so the DTS *ingestion pipeline* is two-phase: `[raw .dts/.dtsi] → cpp -nostdinc
+-undef -x assembler-with-cpp → [flat preprocessed DTS] → Silica DTS parser → [board .si AST]`. The
+key distinction: §3.1 bans a preprocessor in **Silica source**; here `cpp` is run over **foreign
+input** by an import tool, exactly the way one runs a parser over any other external format. Nothing
+preprocessed survives into `.si` — the output is plain typed `board`/`soc` AST. This keeps the rule
+("no include-order or macro semantics in the language") intact while acknowledging the reality that
+the corpus we are harvesting *is* macro-laden.
+
 **The DTS facts are much more than reg/irq/clock, so the supported subset is defined explicitly
 (D10).** DTS also encodes `pinctrl` (pad mux — needed even for blink, §16/D16), `resets`, power
 domains, GPIO flags, `interrupt-parent` chains, `#address-cells`/`#size-cells`, `aliases`, `chosen`
@@ -1169,9 +1212,19 @@ Nucleo / iCE40-class target with full datasheets). Success = identical program r
 metal, LED blinks, the button reaction shares one `cell` with the timer reaction without a manual
 critical section, and a forced fault shows up as a decoded trace record.
 
+*Phase-0 validation matrix (Gemini), the concrete machine-checkable acceptance gates:* (1) **no
+dynamic allocation** — `.bss` + `.data` + computed pool/frame/stack sizes equal the program's total
+RAM footprint exactly (§5.3); (2) **deterministic pin muxing** — compiling two bindings to one
+physical pad is a *static error* (§3.3); (3) **barrier insertion** — the emitted C contains the
+required `__DSB()`/`__DMB()`/compiler-volatile fences around each register-write block and before
+IRQ enable (§4.2, §6.2). These are CI assertions, not prose claims.
+
 **Phase 1 — composition + faults.** Add interfaces, the `i2c`/`spi` controller leaf devices, one
 composed sensor (e.g. BME280, §3.5), `yields`/suspension lowering (§5.2), and the three-layer fault
-model incl. safe-state (§5.4–§5.6). This is where the keystone is proven against real silicon.
+model incl. safe-state and the **scheduler-fed hardware watchdog** (§5.4–§5.6). This is where the
+keystone is proven against real silicon — and the right place to validate the bus model (§3.5) and
+register access model (§4.2) against a genuinely awkward part (clock-stretching, `w1c`/`pop_on_read`
+registers), per risk #7 (§12).
 
 **Phase 2 — agent edit surface + facts.** Typed overlays (§3.6) as the agent edit API; the
 DTS→Silica transpiler (§8) to harvest board facts; graph-aware debug info v1 from the simulator
