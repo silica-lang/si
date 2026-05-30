@@ -540,11 +540,14 @@ explicit access qualifiers, and the compiler enforces them:
 | `ro` / `wo` / `rw` | read-only / write-only / read-write | rejects an illegal direction at compile time |
 | `w1c` | write-1-to-clear | a "clear" lowers to writing `1` to that bit, **never** read-modify-write |
 | `rc` | read-to-clear / read-has-side-effects | the read is treated as an effect; never elided, reordered, or duplicated |
+| `side_effect pop_on_read` | reading a data/FIFO register **consumes** data | a destructive read; the simulator and debug "watch" views must not peek it (watching a FIFO would drain it) — see the `DR` register in §3.2 |
 | `reserved` | reserved bits | preserved across any read-modify-write; never written with arbitrary values |
 | `reset = <v>` | power-on reset value | known statically; feeds the generated startup and the simulator (§7.1) |
 | `width = 8\|16\|32` | required access width | byte/half/word access enforced; no illegal narrowing/widening of the bus access |
 
-This matters most exactly where the simple "RMW everything" model is *wrong*: writing a multi-field
+Qualifiers attach at the **register or the field** level (`SR : reg32 ... access ro { ... }`, or a
+per-field `txe: bit[7] access ro`), so a status register that mixes read-only flags with a `w1c` bit
+is described exactly. This matters most exactly where the simple "RMW everything" model is *wrong*: writing a multi-field
 update to a register that contains a `w1c` status bit would inadvertently clear it; an `rc` data
 register read must not be duplicated by the optimizer; reserved bits must survive. The model also
 states ordering obligations the bare "volatile" claim glosses: a **barrier is required** before
