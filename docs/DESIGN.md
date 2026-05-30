@@ -52,9 +52,14 @@ things, and so does a careful human:
    parse. Edits are structured graph operations over named entities. The same mechanism that
    replaces Devicetree overlays is the mechanism an agent uses to edit code.
 
-The thesis in one line: **no hidden state, nothing statically unknowable.** Wherever the embedded
-goal and the agentic goal seem to pull apart, that is a signal the design is wrong, not a tradeoff
-to split.
+The thesis in one line: **no hidden *software* state, and nothing about the program's resources,
+topology, or effects is statically unknowable.** This is deliberately a claim about software, not
+physics: dynamic hardware behaviour — input levels, interrupt timing, analog values, clock
+tolerance, bus faults, metastability, the environment — is real and is modelled *explicitly* as
+events, faults, and bounded waits, never assumed away. What the language removes is *hidden*
+state (implicit globals, untyped effects, unknowable resource use), not *uncertainty about the
+world*. Wherever the embedded goal and the agentic goal seem to pull apart, that is a signal the
+design is wrong, not a tradeoff to split.
 
 **Scope.** Silica is deliberately a "toy" — an intellectual exercise — but with an aspirational
 long-term ceiling: *potentially replacing an RTOS like Zephyr for personal projects.* That ceiling
@@ -110,7 +115,11 @@ them is a design win, not a coincidence to be tolerated.
 
 The grammar is **regular and indexable**: `subject verb args`, one spelling per construct, every
 entity named, no positional/anonymous references (the Devicetree `<&phandle 0 2>` cell-array
-pattern is explicitly banned — see §3.5). Whitespace is not significant beyond token separation;
+pattern is explicitly banned — see §3.5). The banned thing is anonymous reference to *named
+entities* (the phandle-by-position pattern); **typed scalar arguments are not banned** — `gpio_a.pin(5)`
+passes a pad index, and `pll(hse, mul = 84, div = 8)` passes one named entity plus named scalars.
+The rule is "you never refer to a *thing* by its position in an array," not "functions take no
+arguments." Whitespace is not significant beyond token separation;
 blocks are brace-delimited. There is **no preprocessor** and **no textual include-order
 semantics** — a hard rule, because it is also what keeps content-addressed storage un-foreclosed
 (§9.5).
@@ -182,17 +191,17 @@ device uart implements byte_sink, byte_source {
 
   ops {
     op enable() when off -> () {
-      CR1.div  = comptime clock.hz / baud      // computed at compile time (§4.7)
+      BRR.div  = comptime clock.hz / baud      // baud-rate divisor lives in BRR; computed at compile time (§4.7)
       CR1{ enable = 1, rxneie = 1 }            // single read-modify-write, volatile + ordered
       become ready                              // state transition
     }
 
     op write(b: u8) when ready -> () or fault {
-      await SR.txe == 1 within 2ms else fault timeout   // bounded wait, fallible
+      poll SR.txe == 1 within 2ms else fault timeout    // bounded busy-wait; does NOT yield (§5.2)
       DR.data = b
     }
 
-    emits rx_ready : event when CR1.rxneie     // wired to `irq` by the compiler (§4.1)
+    emits rx_ready : event when SR.rxne and CR1.rxneie   // RXNE pending AND its IRQ enabled; wired to `irq` (§4.1)
   }
 }
 ```
@@ -203,6 +212,11 @@ Notes that matter:
   rxneie = 1 }` is one read-modify-write; `DR.data = b` is one volatile store. The programmer never
   writes `volatile` or memory barriers — those are properties of the *register type*, not of the
   access site (§4.2).
+- **Two bounded-wait spellings, one visible distinction.** `poll <cond> within <d> else fault` is a
+  bounded *busy-wait* that does **not** yield the scheduler (used here because `TXE` clears in
+  sub-microseconds). Its sibling `await <cond> within <d>` *suspends*, and **any op that can reach an
+  `await` must be marked `yields`** (§5.2). That is why `write` is not `yields` but `read_temp` (§3.5)
+  is — busy-wait vs. suspend is a type-level choice, never hidden.
 - `op write(...) -> () or fault` is **fallible**: the caller must discharge the fault path or it is
   a compile error (§4.4).
 - `become ready` is the only way to change `when`-state; states are explicit and finite, which is
@@ -232,12 +246,16 @@ board nucleo_f401re {
   }
 
   // peripheral instances are typed, checked against all four device sections
-  uart1 : uart at 0x4000_4400 {
+  usart2 : uart at 0x4000_4400 {           // 0x4000_4400 is USART2 on this SoC — instance named for the part
     config { baud = 115_200 }
     needs  { clock = soc.sysclk, irq = soc.usart2_irq }
   }
 
-  led_user  : gpio.pin = gpio_a.pin(5) as output
+  // GPIO ports are ordinary device instances too — no privileged built-ins (§2)
+  gpio_a : gpio at 0x4002_0000 { needs { clock = soc.sysclk } }
+  gpio_c : gpio at 0x4002_0800 { needs { clock = soc.sysclk } }
+
+  led_user  : gpio.pin = gpio_a.pin(5)  as output
   btn_user  : gpio.pin = gpio_c.pin(13) as input pulling up
 }
 ```
@@ -267,7 +285,8 @@ program blink {
   }
 
   on button.falling {
-    led.toggle()
+    lit = not lit          // keep the shared cell consistent — both reactions now touch `lit`
+    led.set(lit)
   }
 }
 ```
@@ -298,7 +317,9 @@ interface i2c {
 ```
 
 A concrete I²C controller is a *leaf* device that `implements i2c` (its ops bottom out in MMIO).
-A sensor is a *composed* device that `needs` something providing `i2c` — it has **no `regs`**:
+A sensor is a *composed* device that `needs` something providing `i2c` — it has **no `regs`** (the
+`REG_*` names below are the sensor's *remote* register addresses passed as `reg` arguments over the
+bus, **not** local MMIO; `ctrl_bits()`/`compensate()` are pure `comptime`/fixed-point helpers, §4.7):
 
 ```si
 device bme280 implements sensor {
@@ -312,8 +333,8 @@ device bme280 implements sensor {
     oversample : u8 where oversample in 1 ..= 16 = 1
   }
 
-  states { uninit, ready }
-  safe_state = sleep
+  states { uninit, ready, sleep }    // `sleep` is the device typestate, distinct from the `mode` config field
+  safe_state = sleep                 // driven here on fault via a bounded safe op (§5.6)
 
   ops {
     op init() when uninit -> () or fault {
@@ -349,6 +370,27 @@ This one mechanism does an enormous amount of work, and is why it is designed fi
 > down — but the reader should not expect `bme280.read_temp()` to MMIO into the sensor directly. It
 > can't; the sensor has no memory map on this core. See §6.6.
 
+**A bus is a shared resource, so composition implies an arbitration model (D06).** When two composed
+devices (`bme280`, a second sensor) `needs` the same `i2c` controller, the controller is contended,
+and the design makes that explicit rather than hoping handlers never overlap:
+
+- **Transactions are exclusive.** A bus transaction (start→…→stop) is an indivisible unit; the
+  controller serves one at a time. A second reaction's transaction does not interleave at the wire.
+- **Waiting is bounded and queued.** A reaction needing a busy bus *yields* (§5.2) onto a
+  **statically-bounded** per-bus queue; full queue ⇒ the declared overflow policy (§5.1, D02), not
+  unbounded waiting.
+- **Arbitration is deterministic.** Order of service is by reaction priority with a stable tie-break
+  — same as the scheduler — so contention does not introduce nondeterminism.
+- **Per-device speed/mode is type-checked.** Each device's required bus speed/mode is part of the
+  interface's semantic contract (§4.1, D18); incompatible co-tenants on one bus are a compile error.
+- **Bus faults and recovery are explicit.** Arbitration-lost, stuck-SDA/clock-stretch timeout, and
+  the recovery sequence are declared fault codes (§4.4, D14) and a defined recovery op, not silent
+  retries.
+
+This is still the *same* keystone — a controller is just a device whose op surface several consumers
+share — but the resource discipline is named, because "two drivers, one bus" is where naïve
+composition models break in practice (§12).
+
 ### 3.6 A typed overlay / patch
 
 Overlays are **typed structured edits** (`set`, `extend`, `remove`) over named entities — *not*
@@ -357,15 +399,15 @@ agentic graph-edit surface. The two goals collapse into one mechanism.
 
 ```si
 overlay tune_uart for board.nucleo_f401re {
-  set    uart1.config.baud = 9_600
-  extend uart1.needs { dma_tx = soc.dma1.stream6 }
+  set    usart2.config.baud = 9_600
+  extend usart2.needs { dma_tx = soc.dma1.stream6 }
   remove led_user
 }
 ```
 
-Every edit is **type-checked against the target's schema**: `set uart1.config.baud = 9_600` checks
+Every edit is **type-checked against the target's schema**: `set usart2.config.baud = 9_600` checks
 that `baud` is a `config` field and that `9_600` satisfies its `where` constraint; `extend
-uart1.needs { dma_tx = ... }` checks that `dma_tx` is a declared (or extendable) need with a
+usart2.needs { dma_tx = ... }` checks that `dma_tx` is a declared (or extendable) need with a
 matching type; `remove led_user` checks the entity exists and that nothing still references it. A
 malformed overlay fails to compile, the same way malformed code does — there is no "the merge
 applied but the result is nonsense" failure mode that text-based Devicetree overlays have.
@@ -389,15 +431,36 @@ resource** — *not* a Devicetree node with a schema. Its four sections each con
 - `regs` — the memory-mapped layout (leaf devices only). Types here are register/bit-field types
   (§4.2).
 - `config` — typed fields with `where` constraints, checked at instantiation.
-- `needs` — typed *relations* to other devices: `clock`, `irq`, a `bus`, a `dma` channel. These
-  replace phandles. A `needs` is satisfied by a named reference whose type matches.
+- `needs` — typed *relations* to other devices: `clock`, `reset`, `power_domain`, `irq`, a `bus`, a
+  `dma` channel. These replace phandles. A `needs` is satisfied by a named reference whose type
+  matches. **Clock/reset/power are first-class relations, not a flat `clock_source` scalar** (§4.5,
+  D17): a peripheral commonly needs its clock *enabled*, its reset *deasserted*, and its power domain
+  *up* before any op is legal — so these are devices/relations the compiler can order in generated
+  startup (§6.4), not assumed-on globals. v1 *freezes the clock tree after init*; typed dynamic
+  frequency changes are deferred-not-foreclosed (§10).
 - `ops` — verbs, each optionally guarded by `when <state>` and typed for fallibility (§4.4),
   latency (`yields`, §5.2), and capability.
 
-An **interface** is the structural contract a device provides (`implements i2c`) or requires
+**`when`-state is static where provable, runtime-checked otherwise (D07).** When the compiler can
+prove from straight-line control flow that a device is in the required state at a call site (e.g. a
+`become ready` dominates the call), the `when` guard is a **static typestate** check with zero
+runtime cost. Where the state cannot be statically established — across an event boundary, after a
+`yields`, or through a dynamic reference — the guard lowers to a **runtime precondition** whose
+violation is a Layer-3 fault (§5.4), not undefined behaviour. The design goal is to maximise the
+statically-proven fraction; the runtime check is the sound fallback, never silently skipped.
+
+An **interface** is the contract a device provides (`implements i2c`) or requires
 (`needs bus: i2c`). Interfaces are how composition is typed: any device providing `i2c` can satisfy
-any `needs bus: i2c`. This is structural, not nominal — a controller does not need to know about
-the sensors that will use it.
+any `needs bus: i2c` — a controller does not need to know about the sensors that will use it.
+
+**Interfaces are nominal with structural conformance (D18).** Pure structural matching would let a
+bus with the *same op shapes but different semantics* be silently accepted, so an interface is named
+(`implements i2c` is a declared claim, not an accident of matching signatures) **and** carries
+*semantic properties* the compiler and tools can check and version. For `i2c` those properties
+include addressing mode (7- vs 10-bit), maximum bus speed, transaction atomicity (start→stop is one
+indivisible unit), clock-stretching support, and bus-recovery behaviour. A device declares the
+properties it requires; the controller declares what it provides; a mismatch (a 400 kHz-only sensor
+on a 100 kHz-capped controller) is a **compile error**, not a runtime surprise.
 
 **Capabilities** are unforgeable typed values that gate access. A handler can only touch a device
 it has been *granted* (passed a typed reference to). Floating-point requires an `fpu` capability the
@@ -405,6 +468,16 @@ board only provides if the SoC declares an FPU (§4.3). A secure-enclave boundar
 capability boundary." Capabilities are the through-line that keeps the confidential-computing and
 coprocessor deferrals open (§10): they are already in the type model, so adding a boundary later is
 "introduce a new capability," not "retrofit the type system."
+
+> **Threat model — what capabilities do and do not buy (D20).** Capabilities are a *source-level
+> discipline*: inside safe Silica they prevent a handler from touching a device it was not granted,
+> the way a borrow checker prevents aliasing. On bare metal with no MPU/TrustZone/MMU, a compiled
+> capability is **not** a hardware isolation boundary — `raw` (§4.2), an FFI edge (§10), or a
+> hardware fault can step outside it. The honest claim is: *capabilities prevent accidental misuse
+> within well-typed Silica; real security isolation requires hardware support (MPU regions,
+> TrustZone, an enclave) that a capability can be made to **drive** but does not itself provide.*
+> Keeping capabilities clean in the type model is what lets such a hardware boundary later be
+> *attached* to a capability rather than retrofitted.
 
 **How `on`/`every` stay primitive while devices stay un-privileged.** The compiler core knows the
 *binding/trigger* concepts `on` and `every`. It does **not** know what a UART or an NVIC is. A
@@ -431,6 +504,29 @@ across peripherals uses the minimal barrier the target requires. The programmer 
 `volatile` or fences — that is exactly the kind of hidden, easy-to-get-wrong detail the language
 removes. A `raw` escape hatch (§3.5 mention; here at the field level `CR1.raw`) exists for the
 exotic ~5%, and it is *opt-in and visible* — you can grep for `.raw`.
+
+**"Volatile and ordered" is necessary but not sufficient — registers need a real access model
+(D04).** Hardware registers are not just memory that must not be cached; their *semantics* differ
+per field, and getting them wrong silently corrupts state. So a `reg`/`field` declaration carries
+explicit access qualifiers, and the compiler enforces them:
+
+| Qualifier | Meaning | What the compiler does |
+| --- | --- | --- |
+| `ro` / `wo` / `rw` | read-only / write-only / read-write | rejects an illegal direction at compile time |
+| `w1c` | write-1-to-clear | a "clear" lowers to writing `1` to that bit, **never** read-modify-write |
+| `rc` | read-to-clear / read-has-side-effects | the read is treated as an effect; never elided, reordered, or duplicated |
+| `reserved` | reserved bits | preserved across any read-modify-write; never written with arbitrary values |
+| `reset = <v>` | power-on reset value | known statically; feeds the generated startup and the simulator (§7.1) |
+| `width = 8\|16\|32` | required access width | byte/half/word access enforced; no illegal narrowing/widening of the bus access |
+
+This matters most exactly where the simple "RMW everything" model is *wrong*: writing a multi-field
+update to a register that contains a `w1c` status bit would inadvertently clear it; an `rc` data
+register read must not be duplicated by the optimizer; reserved bits must survive. The model also
+states ordering obligations the bare "volatile" claim glosses: a **barrier is required** before
+enabling an interrupt source and around DMA buffer hand-off (the store that arms DMA must not be
+reordered before the buffer is written). The **C backend must not emit C bitfields** for any of this
+(their layout is implementation-defined); register access lowers to explicit masked loads/stores on
+fixed-width volatile pointers (§6.2, D09).
 
 ### 4.3 The number / data model
 
@@ -500,10 +596,19 @@ match uart1.write(b) {
 ```
 
 This is chosen for *learnability* and *agentic regularity* over fine-grained expressiveness: an
-agent (and a human) only ever handles one error shape. A device may *document* which codes its ops
-can produce (useful to tools and to the agent), but the static type stays `fault`. The cost — you
-cannot get the compiler to prove you handled every distinct error variant — is accepted
-deliberately.
+agent (and a human) only ever handles one error shape. The cost — you cannot get the compiler to
+prove you handled every distinct error *variant* — is accepted deliberately.
+
+**But each op must *declare* its possible fault codes (D14).** The runtime type stays the single
+`fault`, yet an op's signature lists the codes it can raise — `op read_reg(...) -> u8 or
+fault{nak, timeout, arblost}` — so the set is *known statically* even though the value is opaque at
+runtime. This buys back what matters without a typed-error zoo: tooling and the agent see exactly
+which failures to expect; the simulator can fault-inject the right set (§7.1); and a fault
+disposition or `match` can be checked for **completeness against the declared codes** and flagged
+when it ignores one a device documents (e.g. silently dropping `crc` on a sensor read). Recovery in
+embedded systems routinely depends on *which* failure occurred — `timeout` vs `nak` vs `exhausted`
+vs `overflow` vs a `when`-precondition violation — so the codes are first-class to docs, tools, and
+disposition validation, while the value stays one regular shape to handle.
 
 **Layer 2 — propagation through the reactive model: fault disposition.** Fallibility composes
 *within* a handler (via `?`), but a handler has **no caller to unwind to** — it was invoked by an
@@ -556,6 +661,18 @@ unit of timing analysis is a *handler segment between yields*, each of which is 
 bounded-loop code (§9.2). Time-as-a-type is therefore not just ergonomics; it is the on-ramp to
 WCET reasoning, and it is foreclosure-checked against it.
 
+**Conversion and jitter are specified, not hand-waved (D15).** Lowering `500ms` to ticks has rules:
+the value is converted at compile time against the board's tick rate; **conversion must be exact, or
+it is a compile error** unless an explicit rounding mode is given (`500ms rounded nearest`), so a
+period the hardware cannot represent fails loudly rather than silently drifting. A periodic `every`
+is **fixed-rate** (the next deadline is computed from the *scheduled* time, not from handler
+completion), so handler execution time does not accumulate as drift. If a periodic handler **overruns**
+its own period, the default is **coalesce** (the missed tick is dropped, not queued — a backlog of
+stale ticks is worse than skipping), and the overrun is observable via the trace ring (§7.1, D13);
+`every ... on fault` and a future `within` deadline (§9.2) let a program choose otherwise. Clock
+*drift* (crystal tolerance, temperature) is a physical fact the type system does not pretend to
+remove (§1, D12); it surfaces as the bound on `instant` accuracy, not as a guarantee.
+
 ### 4.6 Typed literals
 
 Literals carry units and are checked at use: `4K`/`512K`/`64M` (sizes), `115_200`/`16MHz` (rates),
@@ -583,6 +700,25 @@ semaphores, or mutexes in the surface language. A **reaction** is bound to an ev
 `emits`, or a timer for `every`). The runtime is an event-driven scheduler: when an event fires, its
 reaction(s) run. Priorities derive from the event source (an IRQ priority; a timer tick), and the
 compiler knows the full static set of reactions and the cells each touches.
+
+**Scheduler contract (D02).** "Event-driven" is not a specification, so the model fixes the
+following, all statically sized to keep RAM a compile-time constant (§5.3):
+
+- **Bounded queues.** Each event source has a statically-sized pending capacity (often 1). Capacity
+  is part of the program's RAM budget, not a dynamic queue.
+- **Overflow is explicit.** When an event arrives and its pending slot is full, the policy is
+  declared per source — **coalesce** (collapse to one pending — the default for level/periodic
+  sources), **drop-newest**, or **fault** (raise to the Layer-3/overflow handler). There is no
+  silent unbounded growth and no silent loss.
+- **Single live activation per reaction.** A reaction has at most one in-flight activation. If its
+  event re-fires while it is running *or yielded*, the re-fire follows the overflow policy above
+  (default: coalesce). Reactions are **not** re-entrant; there is no stack of suspended activations
+  of the same handler.
+- **Deterministic order.** When several reactions are runnable at once, they run in a deterministic
+  order: by source priority, ties broken by a stable compile-time order. Same inputs ⇒ same order,
+  on metal and in sim (§7.1, D19).
+- **Missed timer ticks** follow the `every` overrun rule (§4.5, D15): coalesced by default, observable
+  via trace (§7.1).
 
 ### 5.2 Run-to-completion vs. suspension — *run-to-completion between yields*
 
@@ -622,9 +758,24 @@ No general heap. Memory comes in **statically-sized** forms the compiler sums at
 - `buffer<N>` / `bytes` — bounded byte storage for DMA and protocol framing.
 
 Handler frames for suspendable handlers (§5.2) are also statically sized and counted. The result:
-**total RAM use is a compile-time constant**, which is what lets the linker script and `.bss`/`.data`
-layout be *generated* (§6.4) and what keeps networking/filesystem buffer needs expressible without a
-heap (§10).
+**total RAM use is a compile-time constant** — but that claim is only true if the *stack* is bounded
+too, so the model bounds it explicitly (D08):
+
+- **Recursion is banned by default** (it is the one easy way to make stack depth unknowable); a
+  bounded, annotated form may be allowed later, but the default keeps depth statically computable.
+- **Local storage is bounded** — no variable-length arrays or unbounded locals; large buffers live
+  in pools/arenas (above), not on the stack.
+- **ISR nesting is accounted.** Because priorities are static (§5.5), the worst-case interrupt
+  nesting depth is computable, and the stack budget includes it.
+- **Suspended-handler frames are counted** as static allocations (one per reaction, sized to its
+  largest live set across a yield), not as live stack.
+- **Backend-generated frames count.** The C/LLVM lowering must not introduce dynamic stack
+  (`alloca`, large temporaries); the SIR→backend contract (§6) bounds call-frame size so the summed
+  stack high-water-mark is itself a compile-time number.
+
+So the honest claim is: **statics + pools + handler frames + a bounded worst-case stack** are summed
+at build time. Stack overflow is then a *budget* failure caught at link time, plus an MPU guard-page
+on parts that have one — not a runtime mystery.
 
 ### 5.4 The three-layer fault model (execution view)
 
@@ -667,6 +818,23 @@ touched by one reaction needs **no** critical section at all, and the compiler p
 reactive-model-native answer to the classic shared-state-with-an-ISR problem, and it is *more*
 necessary under suspension (§5.2), which is why Open Questions 1 and 3 are linked.
 
+**Yield-aware ownership rules (D03).** Suspension makes the priority-ceiling section necessary but
+*not sufficient*: a critical section that spans a `yields` would stall the scheduler, defeating the
+whole point. So:
+
+- **A cell borrow cannot cross a yield.** The ceiling section is confined to a single
+  RTC segment (§5.2); the compiler rejects code that holds a cell reference across an `await`. Read
+  the cell, yield, re-read after resume — the intervening writer is visible, by design.
+- **Multi-statement atomic updates use an explicit construct** — `atomic { ... }` over one or more
+  cells — which is checked to be yield-free and bounded, so "read-modify-write a pair of cells
+  together" has one spelling instead of accidental tearing.
+- **DMA-shared buffers are not cells.** A buffer handed to DMA needs *typed ownership transfer*
+  (the handler gives up access until completion) plus cache-coherency/barrier handling (§4.2, D04),
+  not a priority-ceiling section — masking interrupts does not stop a DMA engine.
+- **NMI and hard-fault contexts are outside cell protection.** Priority ceiling masks maskable
+  interrupts; an NMI or the Layer-3 fault path (§5.4) can run regardless, so state they share must
+  be lock-free/single-word and is called out as such.
+
 ### 5.6 Safe state
 
 Each device **declares its own safe state** (`safe_state = off` for a motor, `= open` for a relief
@@ -676,6 +844,17 @@ to their safe states before deciding what to do next**. The post-safe-state poli
 Safe-state is a first-class part of a device type precisely because "what is safe" is device
 knowledge (a motor off is safe; a valve *open* may be the safe one), not something a generic fault
 handler can infer.
+
+**Safe ops run in a degraded world, so they are constrained (D05).** The fault path may face a wedged
+bus, a clock that is off, or already-corrupt RAM — so "drive everything to safe state" cannot rely on
+the normal machinery. A `safe` op is therefore required to be **bounded** (a hard time/step cap),
+**idempotent** (running it twice is harmless), **non-allocating**, and **preferably non-yielding**
+(it should not depend on the scheduler it may be escaping). A safe op **may itself fail**, and the
+device declares the fallback when it does (e.g. assert a hardware fail-safe line, or fall through to
+reset). Crucially, software safe-state is the *second* line of defence: the design assumes
+**hardware fail-safe** (pull-downs/biasing so the de-energized state is safe) and an independent
+**watchdog** that forces a reset if the fault path itself hangs. Silica models and sequences the
+software part; it does not pretend software alone makes a system safe.
 
 ---
 
@@ -712,6 +891,28 @@ driver layer underneath Silica devices.
 > memory ops, and explicit control flow — nothing that *needs* a C semantic to be meaningful. The
 > LLVM path (below) is the proof obligation that keeps the C backend honest.
 
+The flip side of "C is just a printer" is that the printer must **dodge C's undefined behaviour**,
+or the language's guarantees (checked overflow, fixed widths, ordered MMIO) leak away in codegen
+(D09). The backend emits a strict freestanding subset:
+
+- **Fixed-width types only** (`uint32_t` &c.) — never `int`/`long`; no reliance on host word size or
+  integer-promotion rules.
+- **Explicit checked arithmetic** — overflow checks are emitted as explicit compares; the backend
+  never *relies on* signed-overflow wraparound (which is UB) and never leaves a trap-on-overflow op
+  as a bare `+`.
+- **No C bitfields** — register and bit-field access lowers to explicit mask/shift on volatile
+  fixed-width pointers (§4.2, D04), because C bitfield layout and access width are
+  implementation-defined.
+- **Explicit barriers** — compiler barriers and hardware fences are emitted where the ordering model
+  (§4.2) requires them, rather than trusting `volatile` alone (which orders volatile-vs-volatile but
+  not volatile-vs-ordinary, and implies no hardware fence).
+- **No libc, no dynamic initialization, no hidden runtime** — startup is generated (§6.4); there is
+  no `__attribute__((constructor))`, no `malloc`, no static initializers that run before the
+  generated reset path.
+
+Each of these is also exactly what the LLVM backend (§6.3) does natively, which is why holding the C
+backend to them keeps SIR honest instead of letting C-isms calcify.
+
 ### 6.3 LLVM path (then)
 
 The LLVM backend is what makes "replace Zephyr" structurally real: full control of startup, no libc,
@@ -742,7 +943,7 @@ A leaf device's `regs` lower to MMIO: a field write becomes read-modify-write of
 at `base + offset`, as a volatile access with the register type's ordering. `CR1{ enable = 1,
 rxneie = 1 }` lowers to a single load, mask/set, store. Multi-field writes coalesce; single-field
 writes to a write-1-to-clear register lower correctly because the *register type* declares its
-access semantics. The base address comes from the instance (`uart1 : uart at 0x4000_4400`), so the
+access semantics. The base address comes from the instance (`usart2 : uart at 0x4000_4400`), so the
 same `uart` device type is reused at every instance address with no per-instance code.
 
 ### 6.6 Composed-device lowering
@@ -771,6 +972,16 @@ The simulator is also the path to learning **graph-aware debug info**: the sim *
 knows full language-level state (which reactions exist, each device's `when` state, every cell's
 value), so it is the natural place to prototype the debug model that the on-metal decoder (§5.4) and
 the agent (§7.2) consume.
+
+**The simulator is deterministic by default (D19).** "Same SIR-level program" only helps if a run is
+reproducible, so the sim defines: a **virtual clock** that advances only when the program would wait
+(no wall-clock dependence); **explicit event injection** (inputs, IRQs, bus responses arrive at
+scripted virtual-time points, not whenever the host happens to schedule); a fixed, documented order
+for simultaneous IRQs matching the scheduler's deterministic order (§5.1, D02); modelled **register
+side-effects** (`w1c`/`rc`/reset values from §4.2, D04); and a first-class **fault-injection** API
+keyed to each op's declared fault codes (§4.4, D14). Nondeterminism (jitter, random inputs, race
+exploration) is available but **opt-in and seeded**, so a failing run is always replayable — which is
+what makes the sim usable as CI and as the agent's debug loop rather than a flaky approximation.
 
 ### 7.2 Graph-aware debug info
 
@@ -813,9 +1024,20 @@ IRQ numbers, and clock topologies — free breadth, a bounded problem, and a goo
 mechanical **DTS→Silica transpiler** reads `.dts`/`.dtsi` + bindings and emits `board`/`soc` types
 (§3.3): nodes with `reg`/`interrupts`/`clocks` become typed instances with `at`/`needs irq`/`needs
 clock`; `compatible` strings map to Silica device types where one exists, and to a `raw`-backed
-stub (with a TODO) where one does not yet. The transpiler validates against the Silica type system,
-so a fact that does not type-check (an IRQ with no controller, a clock with no source) surfaces as a
-diagnostic rather than silently passing through.
+stub where one does not yet — **and every stub emits a diagnostic, never a silent pass-through**
+(D10). The transpiler validates against the Silica type system, so a fact that does not type-check
+(an IRQ with no controller, a clock with no source) surfaces as a diagnostic too.
+
+**The DTS facts are much more than reg/irq/clock, so the supported subset is defined explicitly
+(D10).** DTS also encodes `pinctrl` (pad mux — needed even for blink, §16/D16), `resets`, power
+domains, GPIO flags, `interrupt-parent` chains, `#address-cells`/`#size-cells`, `aliases`, `chosen`
+nodes, flash partitions, DMA channels, and bus-specific properties. The Phase-2 transpiler declares,
+per property, whether it is **ingested** (mapped to a typed relation — `reg`, `interrupts`,
+`clocks`, `pinctrl`, `resets`, power domains, GPIO flags, `interrupt-parent`, DMA channels, flash
+partitions, `aliases`/`chosen`), **interpreted-then-discarded** (the cell-size meta-properties), or
+**explicitly rejected with a diagnostic** (anything not yet modelled). The rule mirrors §2: *DTS is
+data we ingest* — but ingestion is a typed, diagnosed mapping with a known coverage list, not a
+best-effort scrape that silently drops what it does not understand.
 
 **Non-goals (framework), explicitly.** Silica does **not** port: `DEVICE_DT_DEFINE` and the device
 init-object model; init levels/priorities; function-pointer driver dispatch; Kconfig conditional
@@ -919,7 +1141,7 @@ barred by the type system or memory model.
 | **REPL / shell** | Not needed to prove the core; additive. | It is additive over the live object model; the external-DSL + simulator (§7.1) lineage already implies an interactive driver. |
 | **FFI / calling C** | No vendor blobs in the toy's open-hardware scope. | Capabilities (§4.1) give a *clean typed boundary*; an `extern` device/op is a capability-gated edge, not a contaminating hole. SIR (§6.1) already separates language from target. |
 | **Bootloader / DFU / OTA** | Out of scope for blink-class goals. | It is "a device that rewrites flash" — a flash `device` with `ops` (§4.1); generated startup (§6.4) already owns the memory map. |
-| **Observability (log/trace/metrics)** | Manual printf is rejected; we want it *derived*, which needs the graph first. | It can be **derived** from the reactive graph + graph-aware debug info (§7.2): events are structured (device+op+code), rendered host-side (no on-device text, §4.3). |
+| **Richer observability (metrics/trace UI)** | Manual printf is rejected; we want it *derived*, which needs the graph first. *Note (D13): a **minimal** structured trace ring is now Phase 0/1 (§11), not deferred — only the richer tooling is.* | It is **derived** from the reactive graph + graph-aware debug info (§7.2): events are structured (device+op+code), rendered host-side (no on-device text, §4.3). |
 | **Multicore (AMP/SMP), DMA, cache coherency** | Single-core blink needs none of it. | DMA = "a device that does work asynchronously" → the same async/`yields` device shape as a completion event (§5.2); cores are capability boundaries (§4.1); SIR/LLVM (§6.3) does not assume single-core. |
 | **MPU/NPU/DSP coprocessors** | Exotic; not needed to prove the model. | A coprocessor = hand-off + completion event → async-device shape (§5.2); access is capability-gated (§4.1). |
 | **Secure enclaves / confidential computing** | No security model in the toy. | "A core with a capability boundary" — motivates keeping capabilities-in-the-type clean (§4.1); adding a boundary is a new capability, not a type-system retrofit. |
@@ -937,9 +1159,15 @@ short without foreclosing the ceiling.
 board, in sim then on metal, via the C backend** (§9.6). Deliverables: minimal grammar + parser;
 `device`/`board`/`program`/`on`/`every`/`cell`; the leaf `gpio` and `timer` device types; the
 atomicity construct (§5.5); SIR + C backend (§6.2); generated startup/linker (§6.4); host simulator
-(§7.1). Target board: a well-documented open part (e.g. RP2040, or an STM32 Nucleo / iCE40-class
-target with full datasheets). Success = identical program runs in sim and on metal, LED blinks, and
-the button reaction shares one `cell` with the timer reaction without a manual critical section.
+(§7.1). **Two items the review (D16/D13) correctly pulls forward into Phase 0, because blink-on-metal
+genuinely needs them:** (a) a **minimal pin/pad model** — pad mux, pull, direction — with
+**duplicate pin ownership a compile error** (you cannot wire `led_user` and an alternate function to
+the same pad); and (b) a **structured trace ring buffer** (fault code, handler id, device id, event
+id, tick timestamp; text rendered host-side, no on-device strings, §4.3) so first bring-up is
+debuggable instead of dark. Target board: a well-documented open part (e.g. RP2040, or an STM32
+Nucleo / iCE40-class target with full datasheets). Success = identical program runs in sim and on
+metal, LED blinks, the button reaction shares one `cell` with the timer reaction without a manual
+critical section, and a forced fault shows up as a decoded trace record.
 
 **Phase 1 — composition + faults.** Add interfaces, the `i2c`/`spi` controller leaf devices, one
 composed sensor (e.g. BME280, §3.5), `yields`/suspension lowering (§5.2), and the three-layer fault
@@ -993,6 +1221,17 @@ Honest failure modes, roughly in order of how much they would hurt:
    *Mitigation:* let the std lib carry the verbosity once so user code stays terse; revisit only if
    the common path is genuinely painful — but do not introduce a two-tier system, which would
    reintroduce exactly the "built-ins can do what your code can't" problem the design rejects.
+7. **The embedded-correctness surface is large, and a clean abstraction can hide a wrong one.** The
+   parts that make this a real embedded language — the register access model (§4.2), bus arbitration
+   (§3.5), scheduler/queue semantics (§5.1), cell-across-yield rules (§5.5), time conversion and
+   overrun (§4.5), stack accounting (§5.3), and the C-UB-free backend subset (§6.2) — are each a
+   place where an elegant surface can quietly encode incorrect hardware behaviour (a clobbered
+   `w1c` bit, a reordered DMA arm, a torn cell, drifting periods). This whole class is what an
+   external review (the GPT-5.5 pass that prompted §§4.2/5.1/5.5/6.2 revisions) flagged as the
+   biggest gap. *Mitigation:* treat these as **normative** parts of the spec, not prose; validate
+   each against a genuinely awkward real part in Phase 0/1 (clock-stretching bus, w1c/rc status
+   registers, an overrunning periodic) rather than only the clean happy path; and keep the simulator
+   (§7.1) modelling the nasty side-effects so they are exercised in CI, not discovered on metal.
 
 ---
 
