@@ -1,0 +1,57 @@
+// blink + button — the canonical reactive-core slice (DESIGN.md §3.4, §9.6).
+//
+// `every 500ms` toggles an LED cell, and `on button.falling` toggles the *same*
+// cell.  Because two reactions touch `lit`, the compiler computes a critical
+// section automatically (priority-ceiling, §5.5) — there is no `disable_irq`
+// anywhere in this source.  The `gpio` device is std-lib (loaded via --std),
+// not a compiler built-in (§2).
+//
+// Run it deterministically in the host simulator:
+//     silicac --sim examples/blink_button.si
+
+board nucleo_f401re {
+  soc stm32f401re {
+    memory {
+      flash : region at 0x0800_0000 size 512K
+      sram  : region at 0x2000_0000 size 96K
+    }
+    clocks {
+      hse    : clock_source = 8MHz
+      sysclk : clock_source = 84MHz
+    }
+    irqs { exti15_10 : irq_line = 40 }
+  }
+
+  gpio_a : gpio at 0x4002_0000 { needs { clock = soc.sysclk } }
+  gpio_c : gpio at 0x4002_0800 { needs { clock = soc.sysclk } }
+
+  led_user : gpio.pin = gpio_a.pin(5)  as output
+  btn_user : gpio.pin = gpio_c.pin(13) as input pulling up
+}
+
+program blink {
+  use board nucleo_f401re as nucleo
+
+  let led    = nucleo.led_user
+  let button = nucleo.btn_user
+
+  cell lit : bool = false
+
+  every 500ms {
+    lit = not lit
+    led.set(lit)
+  }
+
+  on button.falling {
+    lit = not lit
+    led.set(lit)
+  }
+}
+
+// Deterministic scenario: press the button at 1.2s and 1.8s, run 3s of
+// virtual time (§7.1).
+sim blink_demo for blink {
+  inject btn_user.falling at 1200ms
+  inject btn_user.falling at 1800ms
+  run until 3000ms
+}

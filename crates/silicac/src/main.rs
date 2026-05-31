@@ -6,20 +6,13 @@
 //! Pipeline:
 //!   source → lex → parse → resolve → SIR → C backend → cc → binary
 
-// Many AST/SIR/resolver fields and variants are Phase-1+ stubs — parsed and
-// stored for future lowering passes but not yet consumed.  Suppress the
-// resulting dead_code noise so the output stays clean.
-#![allow(dead_code)]
-
-mod ast;
-mod backend;
-mod lexer;
-mod parser;
-mod resolver;
-mod sir;
+use silicac::{backend, lexer, parser, resolver, sim};
 
 use std::path::{Path, PathBuf};
 use std::process;
+
+const USAGE: &str =
+    "usage: silicac <input.si> [-o <output>] [--emit-c] [--sim] [--cc <compiler>] [--std <dir>]";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -27,7 +20,7 @@ fn main() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("silicac: {}", e);
-            eprintln!("usage: silicac <input.si> [-o <output>] [--emit-c] [--cc <compiler>]");
+            eprintln!("{}", USAGE);
             process::exit(1);
         }
     };
@@ -44,7 +37,9 @@ struct Config {
     input: PathBuf,
     output: PathBuf,
     emit_c: bool,
+    sim: bool,
     cc: String,
+    std_dir: PathBuf,
 }
 
 impl Config {
@@ -52,7 +47,9 @@ impl Config {
         let mut input: Option<PathBuf> = None;
         let mut output: Option<PathBuf> = None;
         let mut emit_c = false;
+        let mut sim = false;
         let mut cc = "cc".to_string();
+        let mut std_dir: Option<PathBuf> = None;
 
         let mut i = 0;
         while i < args.len() {
@@ -61,12 +58,15 @@ impl Config {
                     i += 1;
                     output = Some(PathBuf::from(args.get(i).ok_or("-o requires a value")?));
                 }
-                "--emit-c" => {
-                    emit_c = true;
-                }
+                "--emit-c" => emit_c = true,
+                "--sim" => sim = true,
                 "--cc" => {
                     i += 1;
                     cc = args.get(i).ok_or("--cc requires a value")?.clone();
+                }
+                "--std" => {
+                    i += 1;
+                    std_dir = Some(PathBuf::from(args.get(i).ok_or("--std requires a value")?));
                 }
                 arg if !arg.starts_with('-') => {
                     if input.is_some() {
@@ -84,8 +84,9 @@ impl Config {
             // Default output: strip extension, place in current directory.
             Path::new(input.file_stem().unwrap_or_else(|| std::ffi::OsStr::new("out"))).to_path_buf()
         });
+        let std_dir = std_dir.unwrap_or_else(silicac::default_std_dir);
 
-        Ok(Config { input, output, emit_c, cc })
+        Ok(Config { input, output, emit_c, sim, cc, std_dir })
     }
 }
 
@@ -102,10 +103,14 @@ fn run(cfg: &Config) -> Result<(), String> {
     })?;
 
     // ── 3. Parse ──────────────────────────────────────────────────────────────
-    let ast = parser::parse(tokens).map_err(|e| {
+    let mut ast = parser::parse(tokens).map_err(|e| {
         let (line, col) = offset_to_line_col(&src, e.span.start);
         format!("{}:{}:{}: {}", cfg.input.display(), line, col, e.msg)
     })?;
+
+    // ── 3b. Prepend std-lib devices (gpio/timer …) as ordinary items (§2) ──────
+    let std_items = silicac::load_std_items(&cfg.std_dir)?;
+    ast.items.splice(0..0, std_items);
 
     // ── 4. Resolve → SIR ──────────────────────────────────────────────────────
     let sir = resolver::resolve(&ast).map_err(|errs| {
@@ -119,7 +124,14 @@ fn run(cfg: &Config) -> Result<(), String> {
         msgs.join("\n")
     })?;
 
-    // ── 5. C backend ──────────────────────────────────────────────────────────
+    // ── 5a. Host simulator path (§7.1) — a SIR consumer peer to the C backend ──
+    if cfg.sim {
+        let result = sim::run(&sir);
+        print!("{}", result.render(&sir));
+        return Ok(());
+    }
+
+    // ── 5b. C backend ──────────────────────────────────────────────────────────
     let c_src = backend::c::CBackend::new().emit(&sir);
 
     // ── 6. Emit C or compile ──────────────────────────────────────────────────

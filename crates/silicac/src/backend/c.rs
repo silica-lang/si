@@ -145,12 +145,21 @@ impl CBackend {
     fn emit_stmt(&mut self, stmt: &SirStmt) {
         match stmt {
             SirStmt::Intrinsic(intr) => self.emit_intrinsic(intr),
-            SirStmt::Assign { target, value } => {
-                let place = emit_place(target);
-                let val = emit_expr(value);
-                let line = format!("{} = {};", place, val);
-                self.line(&line);
-            }
+            SirStmt::Assign { target, value } => match target {
+                SirPlace::Var(name) => {
+                    let val = emit_expr(value);
+                    self.line(&format!("{} = {};", name, val));
+                }
+                SirPlace::Reg { device, reg_offset, .. } => {
+                    // The MMIO-lowering metal backend is deferred (Phase 3);
+                    // the slice exercises register access through the host
+                    // simulator (`--sim`), which services the same SIR node.
+                    self.line(&format!(
+                        "/* TODO(metal): MMIO store to device {} reg 0x{:x} */",
+                        device, reg_offset
+                    ));
+                }
+            },
             SirStmt::If { cond, then } => {
                 let c = emit_expr(cond);
                 self.line(&format!("if ({}) {{", c));
@@ -160,6 +169,19 @@ impl CBackend {
                 }
                 self.indent -= 1;
                 self.line("}");
+            }
+            SirStmt::Critical { ceiling, body } => {
+                // Metal lowers `ceiling` to a BASEPRI raise/restore (§5.5).  On
+                // the host C path there is nothing to mask; keep the section
+                // visible as a comment and emit the body.
+                self.line(&format!("/* critical-section enter (ceiling {}) */", ceiling));
+                for s in body {
+                    self.emit_stmt(s);
+                }
+                self.line("/* critical-section exit */");
+            }
+            SirStmt::DeviceOp { device, op, .. } => {
+                self.line(&format!("/* TODO(metal): device {} op {} */", device, op));
             }
             SirStmt::Exit(code) => {
                 let c = emit_expr(code);
@@ -320,12 +342,7 @@ fn trigger_comment(trigger: &SirTrigger) -> String {
     match trigger {
         SirTrigger::SysStart => "reaction: on sys.start".into(),
         SirTrigger::EveryNs(ns) => format!("reaction: every {}ns", ns),
-    }
-}
-
-fn emit_place(place: &SirPlace) -> String {
-    match place {
-        SirPlace::Var(name) => name.clone(),
+        SirTrigger::Event(id) => format!("reaction: on event {}", id),
     }
 }
 
@@ -339,6 +356,9 @@ fn emit_expr(expr: &SirExpr) -> String {
             format!("(const uint8_t *)\"{}\"", escaped)
         }
         SirExpr::Load(name) => name.clone(),
+        SirExpr::RegLoad { device, reg_offset, .. } => {
+            format!("0U /* TODO(metal): MMIO load device {} reg 0x{:x} */", device, reg_offset)
+        }
         SirExpr::Not(inner) => format!("(!({}))", emit_expr(inner)),
         SirExpr::BinOp(op, lhs, rhs) => {
             let l = emit_expr(lhs);
@@ -410,8 +430,9 @@ mod tests {
                 body: vec![SirStmt::Intrinsic(SirIntrinsic::HostIoPrintStr(
                     "Hello, World!\n".into(),
                 ))],
+                priority: 0,
             }],
-            vars: vec![],
+            ..Default::default()
         };
         let c = CBackend::new().emit(&module);
         assert!(c.contains("__host_io_print"));

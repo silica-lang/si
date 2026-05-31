@@ -83,6 +83,14 @@ pub struct Module {
 pub enum Item {
     Program(ProgramDef),
     Device(DeviceDef),
+    Board(BoardDef),
+    /// `interface <name> { ... }` — parsed as a thin stub so a top-level
+    /// interface declaration is not a syntax error (§3.5).  The body is not
+    /// consumed by the slice.
+    Interface(InterfaceDef),
+    /// `sim <name> for <program> { inject ...; run until ... }` — the
+    /// deterministic host-simulation script (§7.1).
+    Sim(SimDef),
 }
 
 // ─── Program ─────────────────────────────────────────────────────────────────
@@ -108,9 +116,19 @@ pub enum ProgramItem {
 
 #[derive(Debug, Clone)]
 pub struct UseDecl {
-    pub path: Vec<Ident>,    // e.g. ["board", "nucleo_f401re"]
+    /// What kind of entity is being imported.
+    pub kind: UseKind,
+    pub path: Vec<Ident>,    // e.g. ["nucleo_f401re"]
     pub alias: Ident,
     pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UseKind {
+    /// `use board <name> as <alias>` — imports a board declaration.
+    Board,
+    /// `use <path> as <alias>` — imports an intrinsic device / module.
+    Plain,
 }
 
 #[derive(Debug, Clone)]
@@ -181,9 +199,241 @@ pub struct DeviceDef {
 
 #[derive(Debug, Clone, Default)]
 pub struct DeviceSections {
+    pub regs: Option<RegsSection>,
+    pub config: Option<ConfigSection>,
+    pub needs: Option<NeedsSection>,
     pub ops: Option<OpsSection>,
     pub states: Option<StatesSection>,
     pub safe_state: Option<Ident>,
+    pub emits: Vec<EmitDecl>,
+}
+
+// ─── Device: regs (§4.2) ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct RegsSection {
+    pub regs: Vec<RegDecl>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct RegDecl {
+    pub name: Ident,
+    /// Register storage width, in bits (8/16/32) — from `reg8`/`reg16`/`reg32`.
+    pub width: u8,
+    /// Byte offset from the device's base address.
+    pub offset: u64,
+    pub access: RegAccess,
+    pub fields: Vec<FieldDecl>,
+    pub span: Span,
+}
+
+/// Access semantics of a register or field (§4.2/D04).  Getting these wrong
+/// silently corrupts hardware state, so they are first-class even in the sim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegAccess {
+    Ro,
+    Wo,
+    Rw,
+    /// write-1-to-clear
+    W1c,
+    /// read-to-clear / read-has-side-effects
+    Rc,
+}
+
+#[derive(Debug, Clone)]
+pub struct FieldDecl {
+    pub name: Ident,
+    pub bits: BitSpec,
+    pub access: Option<RegAccess>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum BitSpec {
+    /// `bit[n]`
+    Bit(u8),
+    /// `field[hi:lo]`
+    Range(u8, u8),
+}
+
+// ─── Device: config (§3.2) ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct ConfigSection {
+    pub fields: Vec<ConfigField>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConfigField {
+    pub name: Ident,
+    pub ty: TypeExpr,
+    /// `where <expr>` constraint (parsed, not yet enforced).
+    pub constraint: Option<Expr>,
+    pub default: Option<Expr>,
+    pub span: Span,
+}
+
+// ─── Device: needs (§4.1) ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct NeedsSection {
+    pub needs: Vec<NeedDecl>,
+    pub span: Span,
+}
+
+/// A declared typed relation the device requires (`clock : clock_source`).
+#[derive(Debug, Clone)]
+pub struct NeedDecl {
+    pub name: Ident,
+    pub ty: Ident,
+    pub span: Span,
+}
+
+// ─── Device: emits (§4.1) ──────────────────────────────────────────────────────
+
+/// `emits <name> : event [when <expr>]` — an event source the device exposes
+/// that `on <instance>.<name>` reactions bind to.
+#[derive(Debug, Clone)]
+pub struct EmitDecl {
+    pub name: Ident,
+    pub when: Option<Expr>,
+    pub span: Span,
+}
+
+// ─── Interface (thin stub, §3.5) ───────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct InterfaceDef {
+    pub name: Ident,
+    pub span: Span,
+}
+
+// ─── Board (§3.3) ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct BoardDef {
+    pub name: Ident,
+    pub soc: Option<SocDef>,
+    /// Peripheral instances: `gpio_a : gpio at 0x... { ... }`.
+    pub instances: Vec<Instance>,
+    /// Pad multiplexing groups: `pinctrl { name : pinmux { ... } }`.
+    pub pinctrl: Vec<PinmuxDef>,
+    /// Single-pin bindings: `led_user : gpio.pin = gpio_a.pin(5) as output`.
+    pub pin_bindings: Vec<PinBinding>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct SocDef {
+    pub name: Ident,
+    pub memory: Vec<RegionDecl>,
+    pub clocks: Vec<ClockDecl>,
+    pub irqs: Vec<IrqDecl>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct RegionDecl {
+    pub name: Ident,
+    pub at: u64,
+    pub size: u64,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClockDecl {
+    pub name: Ident,
+    /// `8MHz` or `pll(hse, mul = 84, div = 8)` — left as an expr for the slice.
+    pub init: Expr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct IrqDecl {
+    pub name: Ident,
+    pub num: u32,
+    pub span: Span,
+}
+
+/// A typed peripheral instance on a board.
+#[derive(Debug, Clone)]
+pub struct Instance {
+    pub name: Ident,
+    pub device_ty: Ident,
+    /// MMIO base address (`at 0x...`).
+    pub at: Option<u64>,
+    pub config: Vec<(Ident, Expr)>,
+    /// `needs { clock = soc.sysclk }` — each entry maps a need name to a path.
+    pub needs: Vec<(Ident, Vec<Ident>)>,
+    pub span: Span,
+}
+
+/// `<name> : gpio.pin = <port>.pin(<index>) as <dir> [pulling up|down]`.
+#[derive(Debug, Clone)]
+pub struct PinBinding {
+    pub name: Ident,
+    pub port: Ident,
+    pub index: u64,
+    pub dir: PinDir,
+    pub pull: Pull,
+    pub alt: Option<u32>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinDir {
+    Input,
+    Output,
+    /// Used by a pinmux alternate-function assignment.
+    Alt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pull {
+    None,
+    Up,
+    Down,
+}
+
+/// `pinctrl` group of alternate-function pin assignments.
+#[derive(Debug, Clone)]
+pub struct PinmuxDef {
+    pub name: Ident,
+    pub pins: Vec<PinAssign>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct PinAssign {
+    pub role: Ident,
+    pub port: Ident,
+    pub index: u64,
+    pub alt: Option<u32>,
+    pub pull: Pull,
+    pub span: Span,
+}
+
+// ─── Sim script (§7.1) ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct SimDef {
+    pub name: Ident,
+    /// The program this scenario drives.
+    pub program: Ident,
+    pub injections: Vec<Injection>,
+    /// `run until <duration>` — virtual-time horizon.
+    pub run_until: Option<Duration>,
+    pub span: Span,
+}
+
+/// `inject <device>.<event> at <duration>`.
+#[derive(Debug, Clone)]
+pub struct Injection {
+    pub event: EventRef,
+    pub at: Duration,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone)]

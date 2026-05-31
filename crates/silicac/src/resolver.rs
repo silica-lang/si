@@ -1,33 +1,31 @@
-//! Name resolution and lowering to SIR — Phase 0.
+//! Name resolution and lowering to SIR.
 //!
 //! This pass walks the AST produced by the parser and:
 //!
-//! 1. Resolves identifiers to their definitions (devices, variables, cells,
-//!    intrinsics).
-//! 2. Validates that event references are known (e.g. `sys.start`).
-//! 3. Lowers `program` reactions to `SirReaction` values.
-//! 4. Lowers expressions to `SirExpr`.
+//! 1. Collects device/board/interface type declarations (incl. the std-lib).
+//! 2. Resolves a program's `use board` into concrete [`SirDevice`] instances
+//!    with a resolved register layout, and its pin bindings into typed pin
+//!    references (with a duplicate-pad check — §3.3, Phase-0 gate #2).
+//! 3. Lowers reactions: `every <dur>` → a periodic trigger, `on <pin>.<event>`
+//!    → a resolved event source, pin ops (`led.set(x)`) → target-neutral
+//!    register accesses (§6.5).
+//! 4. Computes the static reaction↔cell access graph and the per-cell
+//!    priority-ceiling critical sections (§5.5).
+//! 5. Resolves a `sim` block's scripted injections to event ids (§7.1).
 //!
-//! Errors carry a `Span` so the caller can print source-location context.
+//! Errors carry a [`Span`] (via [`Diag`]) so the caller can print
+//! source-location context.
 
 use std::collections::HashMap;
 
 use crate::ast::*;
+use crate::diag::Diag;
 use crate::sir::*;
 
 // ─── Error ────────────────────────────────────────────────────────────────────
 
-#[derive(Debug)]
-pub struct ResolveError {
-    pub span: Span,
-    pub msg: String,
-}
-
-impl std::fmt::Display for ResolveError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "error at {}..{}: {}", self.span.start, self.span.end, self.msg)
-    }
-}
+/// Resolver diagnostics share the common [`Diag`] type with the parser.
+pub type ResolveError = Diag;
 
 // ─── Scope ────────────────────────────────────────────────────────────────────
 
@@ -40,6 +38,10 @@ enum Binding {
     Cell(String, SirType),
     /// A host-mode intrinsic device.
     IntrinsicDevice(IntrinsicDevice),
+    /// A `use board <name> as <alias>` import.
+    Board(String),
+    /// A pin alias (`let led = board.led_user`).
+    Pin(PinRef),
     /// A `use` alias pointing to another name.
     #[allow(dead_code)]
     Alias(Vec<String>),
@@ -49,6 +51,18 @@ enum Binding {
 enum IntrinsicDevice {
     HostIo,
     Sys,
+}
+
+/// A resolved reference to one physical pin of a GPIO-like port instance.
+#[derive(Debug, Clone)]
+struct PinRef {
+    /// `SirDevice` id of the owning port instance.
+    port_device: usize,
+    /// Pin index within the port.
+    index: u8,
+    dir: PinDir,
+    /// The port's device *type* name, for looking up its regs / ops / emits.
+    port_type: String,
 }
 
 /// Flat symbol table for one program.
@@ -70,101 +84,146 @@ impl Scope {
     }
 }
 
+/// The resolved board context for the program currently being lowered.
+struct BoardContext {
+    /// Pin-binding name → resolved pin reference (`led_user` → …).
+    pins: HashMap<String, PinRef>,
+}
+
 // ─── Resolver ─────────────────────────────────────────────────────────────────
 
 pub struct Resolver {
-    errors: Vec<ResolveError>,
+    errors: Vec<Diag>,
+    /// Device *types* by name (std-lib + user), e.g. `gpio` → its `DeviceDef`.
+    device_defs: HashMap<String, DeviceDef>,
+    /// Board declarations by name.
+    boards: HashMap<String, BoardDef>,
+
+    // ── output accumulators ──
+    devices: Vec<SirDevice>,
+    events: Vec<SirEvent>,
+    cells: Vec<CellInfo>,
+    injections: Vec<SirInjection>,
+    run_until_ns: Option<u64>,
+
+    /// Device id → device-type name (for reg/op/emit lookups).
+    dev_types: HashMap<usize, String>,
+    /// The board context for the program being resolved.
+    board_ctx: Option<BoardContext>,
+}
+
+impl Default for Resolver {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Resolver {
     pub fn new() -> Self {
-        Resolver { errors: Vec::new() }
+        Resolver {
+            errors: Vec::new(),
+            device_defs: HashMap::new(),
+            boards: HashMap::new(),
+            devices: Vec::new(),
+            events: Vec::new(),
+            cells: Vec::new(),
+            injections: Vec::new(),
+            run_until_ns: None,
+            dev_types: HashMap::new(),
+            board_ctx: None,
+        }
     }
 
     fn err(&mut self, span: Span, msg: impl Into<String>) {
-        self.errors.push(ResolveError { span, msg: msg.into() });
+        self.errors.push(Diag::new(span, msg));
     }
 
     pub fn resolve_module(mut self, module: &Module) -> Result<SirModule, Vec<ResolveError>> {
+        // ── Pre-pass: collect type declarations ──
+        for item in &module.items {
+            match item {
+                Item::Device(d) => {
+                    self.device_defs.insert(d.name.name.clone(), d.clone());
+                }
+                Item::Board(b) => {
+                    self.boards.insert(b.name.name.clone(), b.clone());
+                }
+                _ => {}
+            }
+        }
+
         let mut reactions: Vec<SirReaction> = Vec::new();
         let mut vars: Vec<SirVar> = Vec::new();
 
+        // ── Resolve programs ──
         for item in &module.items {
-            match item {
-                Item::Program(prog) => {
-                    self.resolve_program(prog, &mut reactions, &mut vars);
-                }
-                Item::Device(_) => {
-                    // Device definitions are parsed but not lowered in Phase 0
-                    // (only intrinsic devices are used on the host target).
-                }
+            if let Item::Program(prog) = item {
+                self.resolve_program(prog, &mut reactions, &mut vars);
+            }
+        }
+
+        // ── Resolve sim scripts (after their program, reusing board context) ──
+        for item in &module.items {
+            if let Item::Sim(sim) = item {
+                self.resolve_sim(sim);
             }
         }
 
         if self.errors.is_empty() {
-            Ok(SirModule { reactions, vars })
+            Ok(SirModule {
+                reactions,
+                vars,
+                devices: self.devices,
+                events: self.events,
+                cells: self.cells,
+                injections: self.injections,
+                run_until_ns: self.run_until_ns,
+            })
         } else {
             Err(self.errors)
         }
     }
 
-    fn resolve_program(&mut self, prog: &ProgramDef, out: &mut Vec<SirReaction>, module_vars: &mut Vec<SirVar>) {
+    fn resolve_program(
+        &mut self,
+        prog: &ProgramDef,
+        out: &mut Vec<SirReaction>,
+        module_vars: &mut Vec<SirVar>,
+    ) {
         let mut scope = Scope::new();
-
-        // Pre-populate the scope with host intrinsics always available.
         scope.insert("sys", Binding::IntrinsicDevice(IntrinsicDevice::Sys));
         scope.insert("host_io", Binding::IntrinsicDevice(IntrinsicDevice::HostIo));
 
-        // First pass: register all let/cell declarations so reactions can
-        // reference them (forward-reference support is not needed in Phase 0,
-        // but we at least register them before lowering reactions).
         let mut vars: Vec<SirVar> = Vec::new();
 
+        // First pass: declarations.
         for item in &prog.items {
             match item {
-                ProgramItem::UseDecl(u) => {
-                    // `use host_io as console` etc.
-                    // Resolve the path and bind the alias.
-                    let resolved = self.resolve_use_path(&u.path);
-                    if let Some(binding) = resolved {
-                        scope.insert(&u.alias.name, binding);
-                    } else {
-                        self.err(
-                            u.span,
-                            format!(
-                                "cannot resolve use path '{}'",
-                                u.path.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join(".")
-                            ),
-                        );
-                    }
-                }
+                ProgramItem::UseDecl(u) => self.resolve_use(u, &mut scope),
                 ProgramItem::LetDecl(l) => {
-                    let ty = infer_type_from_expr(&l.init);
-                    let init = self.lower_expr(&l.init, &scope);
-                    scope.insert(&l.name.name, Binding::Local(l.name.name.clone(), ty.clone()));
-                    vars.push(SirVar {
-                        name: l.name.name.clone(),
-                        ty,
-                        init,
-                        is_cell: false,
-                    });
+                    // A `let` whose initialiser names a board pin is a pin alias
+                    // (compile-time), not storage.
+                    if let Some(pin) = self.try_resolve_pin_expr(&l.init, &scope) {
+                        scope.insert(&l.name.name, Binding::Pin(pin));
+                    } else {
+                        let ty = infer_type_from_expr(&l.init);
+                        let init = self.lower_expr(&l.init, &scope);
+                        scope.insert(&l.name.name, Binding::Local(l.name.name.clone(), ty.clone()));
+                        vars.push(SirVar { name: l.name.name.clone(), ty, init, is_cell: false });
+                    }
                 }
                 ProgramItem::CellDecl(c) => {
                     let ty = resolve_type_expr(&c.ty);
                     let init = self.lower_expr(&c.init, &scope);
                     scope.insert(&c.name.name, Binding::Cell(c.name.name.clone(), ty.clone()));
-                    vars.push(SirVar {
-                        name: c.name.name.clone(),
-                        ty,
-                        init,
-                        is_cell: true,
-                    });
+                    vars.push(SirVar { name: c.name.name.clone(), ty, init, is_cell: true });
                 }
                 ProgramItem::Reaction(_) => {}
             }
         }
 
         // Second pass: lower reactions.
+        let first = out.len();
         for item in &prog.items {
             if let ProgramItem::Reaction(r) = item {
                 let id = out.len();
@@ -174,18 +233,152 @@ impl Resolver {
             }
         }
 
-        // Export vars to the module-level collection.
+        // Cell concurrency analysis + critical-section insertion (§5.5).
+        self.analyze_cells(&mut out[first..], &vars);
+
         module_vars.extend(vars);
     }
 
+    // ── use / board ───────────────────────────────────────────────────────────
+
+    fn resolve_use(&mut self, u: &UseDecl, scope: &mut Scope) {
+        match u.kind {
+            UseKind::Board => {
+                let board_name = u.path.last().map(|i| i.name.clone()).unwrap_or_default();
+                if !self.boards.contains_key(&board_name) {
+                    self.err(u.span, format!("unknown board '{}'", board_name));
+                    return;
+                }
+                self.build_board(&board_name, u.span);
+                scope.insert(&u.alias.name, Binding::Board(board_name));
+            }
+            UseKind::Plain => {
+                if let Some(binding) = self.resolve_use_path(&u.path) {
+                    scope.insert(&u.alias.name, binding);
+                } else {
+                    self.err(
+                        u.span,
+                        format!(
+                            "cannot resolve use path '{}'",
+                            u.path.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join(".")
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
     fn resolve_use_path(&mut self, path: &[Ident]) -> Option<Binding> {
-        // Intrinsic devices available by path.
         match path.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().as_slice() {
             ["host_io"] => Some(Binding::IntrinsicDevice(IntrinsicDevice::HostIo)),
             ["sys"] => Some(Binding::IntrinsicDevice(IntrinsicDevice::Sys)),
             _ => None,
         }
     }
+
+    /// Build a board's device instances + pin bindings, populate `self.devices`
+    /// and the `BoardContext`, and run the duplicate-pad check.
+    fn build_board(&mut self, board_name: &str, use_span: Span) {
+        let board = match self.boards.get(board_name) {
+            Some(b) => b.clone(),
+            None => return,
+        };
+
+        let mut pins: HashMap<String, PinRef> = HashMap::new();
+        // instance name → SirDevice id
+        let mut instance_ids: HashMap<String, usize> = HashMap::new();
+
+        // Peripheral instances.
+        for inst in &board.instances {
+            let ty_name = inst.device_ty.name.clone();
+            let regs = match self.device_defs.get(&ty_name) {
+                Some(def) => lower_regs(def),
+                None => {
+                    self.err(
+                        inst.span,
+                        format!("instance '{}' has unknown device type '{}'", inst.name.name, ty_name),
+                    );
+                    Vec::new()
+                }
+            };
+            let id = self.devices.len();
+            self.devices.push(SirDevice {
+                id,
+                name: inst.name.name.clone(),
+                base_addr: inst.at,
+                // The compiler core does not special-case device types by name
+                // (§2): the simulator models every device uniformly as a
+                // register array, so no `kind` is derived from `ty_name`.
+                kind: SirDeviceKind::Generic,
+                regs,
+            });
+            self.dev_types.insert(id, ty_name);
+            instance_ids.insert(inst.name.name.clone(), id);
+        }
+
+        // Pin bindings — with duplicate physical-pad detection (§3.3).
+        let mut pad_owner: HashMap<(String, u64), (String, Span)> = HashMap::new();
+        let mut claim_pad = |errs: &mut Vec<Diag>, port: &str, index: u64, owner: &str, span: Span| {
+            if let Some((prev, _)) = pad_owner.get(&(port.to_string(), index)) {
+                errs.push(Diag::new(
+                    span,
+                    format!(
+                        "physical pad {}.pin({}) is already owned by '{}'; it cannot also be bound to '{}'",
+                        port, index, prev, owner
+                    ),
+                ));
+            } else {
+                pad_owner.insert((port.to_string(), index), (owner.to_string(), span));
+            }
+        };
+
+        for pb in &board.pin_bindings {
+            claim_pad(&mut self.errors, &pb.port.name, pb.index, &pb.name.name, pb.span);
+            match instance_ids.get(&pb.port.name) {
+                Some(&dev_id) => {
+                    let port_type = self
+                        .dev_types
+                        .get(&dev_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    pins.insert(
+                        pb.name.name.clone(),
+                        PinRef { port_device: dev_id, index: pb.index as u8, dir: pb.dir, port_type },
+                    );
+                }
+                None => {
+                    self.err(pb.span, format!("pin '{}' references unknown port '{}'", pb.name.name, pb.port.name));
+                }
+            }
+        }
+
+        // Pinmux pads also claim physical pads (same ownership rule).
+        for mux in &board.pinctrl {
+            for pa in &mux.pins {
+                let owner = format!("{}.{}", mux.name.name, pa.role.name);
+                claim_pad(&mut self.errors, &pa.port.name, pa.index, &owner, pa.span);
+            }
+        }
+
+        let _ = use_span;
+        self.board_ctx = Some(BoardContext { pins });
+    }
+
+    /// If `expr` is `<board-alias>.<pin-binding>`, resolve it to a [`PinRef`].
+    fn try_resolve_pin_expr(&mut self, expr: &Expr, scope: &Scope) -> Option<PinRef> {
+        if let ExprKind::Field(base, field) = &expr.kind {
+            if let Some(root) = expr_root_ident(base) {
+                if let Some(Binding::Board(_)) = scope.lookup(root) {
+                    if let Some(ctx) = &self.board_ctx {
+                        return ctx.pins.get(&field.name).cloned();
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    // ── Reactions & triggers ────────────────────────────────────────────────
 
     fn lower_reaction(
         &mut self,
@@ -194,72 +387,93 @@ impl Resolver {
         scope: &Scope,
         vars: &[SirVar],
     ) -> Option<SirReaction> {
-        let trigger = match &r.trigger {
+        let (trigger, priority) = match &r.trigger {
             Trigger::On(event_ref) => {
-                self.lower_event_trigger(event_ref, scope)?
+                let t = self.lower_event_trigger(event_ref, scope)?;
+                let prio = match t {
+                    SirTrigger::SysStart => 0,
+                    _ => 2, // device/IRQ events outrank periodic timers (§5.1)
+                };
+                (t, prio)
             }
-            Trigger::Every(dur) => SirTrigger::EveryNs(dur.to_ns()),
+            Trigger::Every(dur) => (SirTrigger::EveryNs(dur.to_ns()), 1),
         };
 
         let body = self.lower_block(&r.body, scope, vars);
-
-        Some(SirReaction { id, trigger, body })
+        Some(SirReaction { id, trigger, body, priority })
     }
 
-    fn lower_event_trigger(
-        &mut self,
-        event_ref: &EventRef,
-        scope: &Scope,
-    ) -> Option<SirTrigger> {
-        // Resolve the device expression to a binding.
-        let device_name = expr_root_ident(&event_ref.device);
-        let event_name = &event_ref.event.name;
-
-        let device_name = match device_name {
+    fn lower_event_trigger(&mut self, event_ref: &EventRef, scope: &Scope) -> Option<SirTrigger> {
+        let device_name = match expr_root_ident(&event_ref.device) {
             Some(n) => n,
             None => {
                 self.err(event_ref.span, "event device must be a simple identifier");
                 return None;
             }
         };
+        let event_name = &event_ref.event.name;
 
-        match scope.lookup(device_name) {
-            Some(Binding::IntrinsicDevice(IntrinsicDevice::Sys)) => {
-                match event_name.as_str() {
-                    "start" => Some(SirTrigger::SysStart),
-                    other => {
-                        self.err(
-                            event_ref.span,
-                            format!("unknown sys event '{}'; known events: start", other),
-                        );
-                        None
-                    }
+        match scope.lookup(device_name).cloned() {
+            Some(Binding::IntrinsicDevice(IntrinsicDevice::Sys)) => match event_name.as_str() {
+                "start" => Some(SirTrigger::SysStart),
+                other => {
+                    self.err(event_ref.span, format!("unknown sys event '{}'; known: start", other));
+                    None
                 }
+            },
+            Some(Binding::Pin(pin)) => {
+                let ev = self.resolve_pin_event(&pin, event_name, event_ref.span)?;
+                Some(SirTrigger::Event(ev))
             }
-            Some(other) => {
-                self.err(
-                    event_ref.span,
-                    format!("'{}' is not an event-emitting device ({:?})", device_name, other),
-                );
+            Some(_) => {
+                self.err(event_ref.span, format!("'{}' is not an event-emitting device", device_name));
                 None
             }
             None => {
-                self.err(
-                    event_ref.span,
-                    format!("undefined device '{}'", device_name),
-                );
+                self.err(event_ref.span, format!("undefined device '{}'", device_name));
                 None
             }
         }
     }
 
+    /// Check that the pin's device type declares the named `emits` event, and
+    /// intern a [`SirEvent`] for `(device, name, index)`.
+    fn resolve_pin_event(&mut self, pin: &PinRef, event_name: &str, span: Span) -> Option<usize> {
+        let declared = self
+            .device_defs
+            .get(&pin.port_type)
+            .map(|d| d.sections.emits.iter().any(|e| e.name.name == event_name))
+            .unwrap_or(false);
+        if !declared {
+            self.err(
+                span,
+                format!("device type '{}' does not emit event '{}'", pin.port_type, event_name),
+            );
+            return None;
+        }
+        Some(self.intern_event(pin.port_device, event_name, pin.index))
+    }
+
+    fn intern_event(&mut self, device: usize, name: &str, index: u8) -> usize {
+        if let Some(ev) = self
+            .events
+            .iter()
+            .find(|e| e.device == device && e.name == name && e.pin_index == Some(index))
+        {
+            return ev.id;
+        }
+        let id = self.events.len();
+        self.events.push(SirEvent { id, name: name.to_string(), device, pin_index: Some(index) });
+        id
+    }
+
+    // ── Statements & expressions ──────────────────────────────────────────────
+
     fn lower_block(&mut self, block: &Block, scope: &Scope, vars: &[SirVar]) -> Vec<SirStmt> {
-        // Build a local scope for this block (extends the outer scope).
         let mut local_scope = Scope::new();
         for (name, binding) in &scope.bindings {
             local_scope.insert(name, binding.clone());
         }
-
         let mut stmts = Vec::new();
         for stmt in &block.stmts {
             if let Some(s) = self.lower_stmt(stmt, &mut local_scope, vars) {
@@ -269,40 +483,20 @@ impl Resolver {
         stmts
     }
 
-    fn lower_stmt(
-        &mut self,
-        stmt: &Stmt,
-        scope: &mut Scope,
-        _vars: &[SirVar],
-    ) -> Option<SirStmt> {
+    fn lower_stmt(&mut self, stmt: &Stmt, scope: &mut Scope, _vars: &[SirVar]) -> Option<SirStmt> {
         match stmt {
             Stmt::Expr(expr) => self.lower_expr_stmt(expr, scope),
             Stmt::Let(l) => {
                 let ty = infer_type_from_expr(&l.init);
                 let value = self.lower_expr(&l.init, scope);
                 scope.insert(&l.name.name, Binding::Local(l.name.name.clone(), ty));
-                Some(SirStmt::Assign {
-                    target: SirPlace::Var(l.name.name.clone()),
-                    value,
-                })
+                Some(SirStmt::Assign { target: SirPlace::Var(l.name.name.clone()), value })
             }
-            Stmt::Become(state, span) => {
-                // `become <state>` — not lowered in Phase 0, emit nothing but
-                // record it for later phases.
-                // TODO Phase 1: generate typestate transition.
-                let _ = (state, span);
-                None
-            }
+            Stmt::Become(_, _) => None, // typestate transition — Phase 1
             Stmt::Return(expr, _) => {
-                // In Phase 0 all ops are host intrinsics; return is a no-op at
-                // the top level.  Inside a device op body it terminates the op.
                 if let Some(e) = expr {
                     let val = self.lower_expr(e, scope);
-                    // Emit an assignment to a synthetic return variable.
-                    Some(SirStmt::Assign {
-                        target: SirPlace::Var("__ret".into()),
-                        value: val,
-                    })
+                    Some(SirStmt::Assign { target: SirPlace::Var("__ret".into()), value: val })
                 } else {
                     None
                 }
@@ -314,10 +508,8 @@ impl Resolver {
         }
     }
 
-    /// Lower an expression used as a statement (i.e. a call or assignment).
     fn lower_expr_stmt(&mut self, expr: &Expr, scope: &mut Scope) -> Option<SirStmt> {
         match &expr.kind {
-            // Assignment: `x = value` or `x += value`
             ExprKind::Assign(lhs, rhs) => {
                 let place = self.expr_to_place(lhs, scope)?;
                 let value = self.lower_expr(rhs, scope);
@@ -327,16 +519,13 @@ impl Resolver {
                 let place = self.expr_to_place(lhs, scope)?;
                 let lhs_val = self.lower_expr(lhs, scope);
                 let rhs_val = self.lower_expr(rhs, scope);
-                let sir_op = ast_binop_to_sir(*op);
-                let combined = SirExpr::BinOp(sir_op, Box::new(lhs_val), Box::new(rhs_val));
+                let combined = SirExpr::BinOp(ast_binop_to_sir(*op), Box::new(lhs_val), Box::new(rhs_val));
                 Some(SirStmt::Assign { target: place, value: combined })
             }
-            // A call expression: `device.op(args)` or `intrinsic.op(args)`.
             ExprKind::Call { callee, args, named: _ } => {
-                // Decode `<device>.<method>(<args>)` pattern.
                 if let ExprKind::Field(dev_expr, method) = &callee.kind {
                     if let Some(device_name) = expr_root_ident(dev_expr) {
-                        match scope.lookup(device_name) {
+                        match scope.lookup(device_name).cloned() {
                             Some(Binding::IntrinsicDevice(IntrinsicDevice::HostIo)) => {
                                 return self.lower_host_io_call(method, args, scope);
                             }
@@ -344,31 +533,23 @@ impl Resolver {
                                 self.err(expr.span, "sys device has no callable ops");
                                 return None;
                             }
+                            Some(Binding::Pin(pin)) => {
+                                return self.lower_pin_call(&pin, method, args, expr.span, scope);
+                            }
                             None => {
-                                self.err(
-                                    dev_expr.span,
-                                    format!("undefined device '{}'", device_name),
-                                );
+                                self.err(dev_expr.span, format!("undefined device '{}'", device_name));
                                 return None;
                             }
                             _ => {
-                                // TODO Phase 1: user-defined device calls.
-                                self.err(
-                                    dev_expr.span,
-                                    format!(
-                                        "'{}' is not a device (user-defined devices not yet supported in Phase 0)",
-                                        device_name
-                                    ),
-                                );
+                                self.err(dev_expr.span, format!("'{}' is not a callable device", device_name));
                                 return None;
                             }
                         }
                     }
                 }
-                self.err(expr.span, "unsupported call expression form in Phase 0");
+                self.err(expr.span, "unsupported call expression form");
                 None
             }
-            // Any other expression used as a statement — just lower and discard.
             _ => {
                 self.lower_expr(expr, scope);
                 None
@@ -376,19 +557,64 @@ impl Resolver {
         }
     }
 
-    fn lower_host_io_call(
+    /// Lower a pin op call (`led.set(x)`) to a register access (§6.5).
+    ///
+    /// The op→register mapping is data-driven: a pin op with parameters is a
+    /// *write* (targets the port's writable data register); a parameterless op
+    /// returning a value is a *read* (its input register).  The bit is the
+    /// bound pin index.  This keeps the register addresses as std-lib data and
+    /// uses only the op's *shape* — the compiler core has no `gpio` knowledge.
+    fn lower_pin_call(
         &mut self,
+        pin: &PinRef,
         method: &Ident,
         args: &[Expr],
+        span: Span,
         scope: &Scope,
     ) -> Option<SirStmt> {
+        let op = self.find_op(&pin.port_type, &method.name).cloned();
+        let op = match op {
+            Some(o) => o,
+            None => {
+                self.err(span, format!("device type '{}' has no op '{}'", pin.port_type, method.name));
+                return None;
+            }
+        };
+
+        if op.params.is_empty() {
+            // A read op as a statement has no effect; ignore (reads are used as
+            // values, handled in `lower_expr`).
+            self.err(span, format!("op '{}' returns a value; use it in an expression", method.name));
+            return None;
+        }
+
+        // Write op → store the (first) argument into the output register bit.
+        let reg = match self.find_output_reg(&pin.port_type) {
+            Some(r) => r,
+            None => {
+                self.err(span, format!("device type '{}' has no writable data register", pin.port_type));
+                return None;
+            }
+        };
+        let value = self.lower_expr(&args[0], scope);
+        let place = SirPlace::Reg {
+            device: pin.port_device,
+            reg_offset: reg.0,
+            width: reg.1,
+            field_mask: 1u64 << pin.index,
+            field_shift: pin.index,
+            access: reg.2,
+        };
+        Some(SirStmt::Assign { target: place, value })
+    }
+
+    fn lower_host_io_call(&mut self, method: &Ident, args: &[Expr], scope: &Scope) -> Option<SirStmt> {
         match method.name.as_str() {
             "print" => {
                 if args.len() != 1 {
                     self.err(method.span, "host_io.print takes exactly 1 argument");
                     return None;
                 }
-                // Fast path: string literal → HostIoPrintStr (no runtime bytes needed).
                 if let ExprKind::StringLit(s) = &args[0].kind {
                     return Some(SirStmt::Intrinsic(SirIntrinsic::HostIoPrintStr(s.clone())));
                 }
@@ -414,43 +640,46 @@ impl Resolver {
             ExprKind::BoolLit(b) => SirExpr::Bool(*b),
             ExprKind::IntLit(n) => SirExpr::U64(*n),
             ExprKind::StringLit(s) => SirExpr::Bytes(s.as_bytes().to_vec()),
-            ExprKind::Ident(ident) => {
-                match scope.lookup(&ident.name) {
-                    Some(Binding::Local(name, _)) | Some(Binding::Cell(name, _)) => {
-                        SirExpr::Load(name.clone())
-                    }
-                    _ => {
-                        // May be an unresolved name; emit a load and record error.
-                        self.err(ident.span, format!("undefined variable '{}'", ident.name));
-                        SirExpr::Load(ident.name.clone())
-                    }
+            ExprKind::Ident(ident) => match scope.lookup(&ident.name) {
+                Some(Binding::Local(name, _)) | Some(Binding::Cell(name, _)) => SirExpr::Load(name.clone()),
+                _ => {
+                    self.err(ident.span, format!("undefined variable '{}'", ident.name));
+                    SirExpr::Load(ident.name.clone())
                 }
-            }
-            ExprKind::Not(inner) => {
-                let inner_sir = self.lower_expr(inner, scope);
-                SirExpr::Not(Box::new(inner_sir))
-            }
+            },
+            ExprKind::Not(inner) => SirExpr::Not(Box::new(self.lower_expr(inner, scope))),
             ExprKind::BinOp { op, lhs, rhs } => {
                 let l = self.lower_expr(lhs, scope);
                 let r = self.lower_expr(rhs, scope);
                 SirExpr::BinOp(ast_binop_to_sir(*op), Box::new(l), Box::new(r))
             }
-            ExprKind::Assign(_lhs, rhs) => {
-                // As an expression (not statement), this returns the rhs value.
-                // The assignment side-effect is not captured here.
-                self.lower_expr(rhs, scope)
-            }
+            ExprKind::Assign(_lhs, rhs) => self.lower_expr(rhs, scope),
             ExprKind::CompoundAssign(_, _, rhs) => self.lower_expr(rhs, scope),
-            ExprKind::Try(inner) => {
-                // `?` propagation — Phase 0: just lower the inner expression.
-                // TODO Phase 1: insert fault propagation logic.
-                self.lower_expr(inner, scope)
+            ExprKind::Try(inner) => self.lower_expr(inner, scope), // fault `?` — Phase 1
+            ExprKind::Call { callee, args: _, named: _ } => {
+                // A pin *read* op used as a value (`pin.get()`).
+                if let ExprKind::Field(dev_expr, method) = &callee.kind {
+                    if let Some(root) = expr_root_ident(dev_expr) {
+                        if let Some(Binding::Pin(pin)) = scope.lookup(root).cloned() {
+                            if let Some(reg) = self.find_input_reg(&pin.port_type) {
+                                let _ = method;
+                                return SirExpr::RegLoad {
+                                    device: pin.port_device,
+                                    reg_offset: reg.0,
+                                    width: reg.1,
+                                    field_mask: 1u64 << pin.index,
+                                    field_shift: pin.index,
+                                    access: reg.2,
+                                };
+                            }
+                        }
+                    }
+                }
+                self.err(expr.span, "call/field expression not supported as a value here");
+                SirExpr::U64(0)
             }
-            ExprKind::Field(_, _) | ExprKind::Call { .. } => {
-                // Field access / call as value — Phase 0 only supports these as
-                // statements.  If they appear as a value expression (e.g. storing
-                // the return of a device call), flag it for now.
-                self.err(expr.span, "call/field expressions as values not yet supported");
+            ExprKind::Field(_, _) => {
+                self.err(expr.span, "field expression not supported as a value here");
                 SirExpr::U64(0)
             }
         }
@@ -473,9 +702,192 @@ impl Resolver {
             }
         }
     }
+
+    // ── Device-type register / op lookups (data-driven, §2) ───────────────────
+
+    fn find_op<'a>(&'a self, ty: &str, name: &str) -> Option<&'a OpDecl> {
+        let def = self.device_defs.get(ty)?;
+        let ops = def.sections.ops.as_ref()?;
+        ops.items.iter().find_map(|it| {
+            let OpsItem::Op(o) = it;
+            (o.name.name == name).then_some(o)
+        })
+    }
+
+    /// The port's writable data register: `(offset, width, access)`.
+    fn find_output_reg(&self, ty: &str) -> Option<(u64, u8, SirRegAccess)> {
+        let def = self.device_defs.get(ty)?;
+        let regs = def.sections.regs.as_ref()?;
+        regs.regs
+            .iter()
+            .find(|r| matches!(r.access, RegAccess::Rw | RegAccess::Wo))
+            .map(|r| (r.offset, r.width, map_access(r.access)))
+    }
+
+    /// The port's readable input register: `(offset, width, access)`.
+    fn find_input_reg(&self, ty: &str) -> Option<(u64, u8, SirRegAccess)> {
+        let def = self.device_defs.get(ty)?;
+        let regs = def.sections.regs.as_ref()?;
+        regs.regs
+            .iter()
+            .find(|r| matches!(r.access, RegAccess::Ro))
+            .map(|r| (r.offset, r.width, map_access(r.access)))
+    }
+
+    // ── Cell concurrency analysis (§5.5) ──────────────────────────────────────
+
+    /// Build the static reaction↔cell access graph, compute each cell's
+    /// priority ceiling, and wrap shared-cell accesses in `SirStmt::Critical`.
+    fn analyze_cells(&mut self, reactions: &mut [SirReaction], vars: &[SirVar]) {
+        let cell_names: Vec<String> =
+            vars.iter().filter(|v| v.is_cell).map(|v| v.name.clone()).collect();
+        if cell_names.is_empty() {
+            return;
+        }
+
+        // touched_by[cell] = reactions that read or write it; ceiling = max prio.
+        let mut touched: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut ceiling: HashMap<String, u8> = HashMap::new();
+        for r in reactions.iter() {
+            for cell in &cell_names {
+                if stmts_touch_cell(&r.body, cell) {
+                    touched.entry(cell.clone()).or_default().push(r.id);
+                    let c = ceiling.entry(cell.clone()).or_insert(0);
+                    *c = (*c).max(r.priority);
+                }
+            }
+        }
+
+        // Shared = touched by ≥2 reactions → needs a critical section.
+        let shared: HashMap<String, u8> = touched
+            .iter()
+            .filter(|(_, rs)| rs.len() >= 2)
+            .map(|(name, _)| (name.clone(), ceiling[name]))
+            .collect();
+
+        // Wrap each shared-cell access in a priority-ceiling critical section.
+        for r in reactions.iter_mut() {
+            let body = std::mem::take(&mut r.body);
+            r.body = body
+                .into_iter()
+                .map(|stmt| {
+                    let ceil = shared
+                        .iter()
+                        .filter(|(cell, _)| stmt_touches_cell(&stmt, cell))
+                        .map(|(_, &c)| c)
+                        .max();
+                    match ceil {
+                        Some(c) => SirStmt::Critical { ceiling: c, body: vec![stmt] },
+                        None => stmt,
+                    }
+                })
+                .collect();
+        }
+
+        // Record the analysis (§5.5): single-owner cells proved section-free.
+        for cell in &cell_names {
+            let by = touched.get(cell).cloned().unwrap_or_default();
+            self.cells.push(CellInfo {
+                name: cell.clone(),
+                ceiling: ceiling.get(cell).copied().unwrap_or(0),
+                single_owner: by.len() == 1,
+                touched_by: by,
+            });
+        }
+    }
+
+    // ── Sim script ────────────────────────────────────────────────────────────
+
+    fn resolve_sim(&mut self, sim: &SimDef) {
+        for inj in &sim.injections {
+            // The sim references board pin-binding names directly (e.g.
+            // `btn_user.falling`), resolved via the program's board context.
+            let device_name = match expr_root_ident(&inj.event.device) {
+                Some(n) => n.to_string(),
+                None => {
+                    self.err(inj.span, "injected event device must be a simple identifier");
+                    continue;
+                }
+            };
+            let pin = match self.board_ctx.as_ref().and_then(|c| c.pins.get(&device_name).cloned()) {
+                Some(p) => p,
+                None => {
+                    self.err(inj.span, format!("unknown pin '{}' in sim injection", device_name));
+                    continue;
+                }
+            };
+            if let Some(ev) = self.resolve_pin_event(&pin, &inj.event.event.name, inj.span) {
+                self.injections.push(SirInjection { at_ns: inj.at.to_ns(), event: ev });
+            }
+        }
+        if let Some(d) = sim.run_until {
+            self.run_until_ns = Some(d.to_ns());
+        }
+    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+fn map_access(a: RegAccess) -> SirRegAccess {
+    match a {
+        RegAccess::Ro => SirRegAccess::Ro,
+        RegAccess::Wo => SirRegAccess::Wo,
+        RegAccess::Rw => SirRegAccess::Rw,
+        RegAccess::W1c => SirRegAccess::W1c,
+        RegAccess::Rc => SirRegAccess::Rc,
+    }
+}
+
+fn lower_regs(def: &DeviceDef) -> Vec<SirReg> {
+    match &def.sections.regs {
+        Some(rs) => rs
+            .regs
+            .iter()
+            .map(|r| SirReg {
+                name: r.name.name.clone(),
+                offset: r.offset,
+                width: r.width,
+                access: map_access(r.access),
+                reset: 0,
+            })
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Does any statement in `stmts` read or write the named cell?
+fn stmts_touch_cell(stmts: &[SirStmt], cell: &str) -> bool {
+    stmts.iter().any(|s| stmt_touches_cell(s, cell))
+}
+
+fn stmt_touches_cell(stmt: &SirStmt, cell: &str) -> bool {
+    match stmt {
+        SirStmt::Assign { target, value } => {
+            place_touches_cell(target, cell) || expr_touches_cell(value, cell)
+        }
+        SirStmt::If { cond, then } => expr_touches_cell(cond, cell) || stmts_touch_cell(then, cell),
+        SirStmt::Critical { body, .. } => stmts_touch_cell(body, cell),
+        SirStmt::Exit(e) => expr_touches_cell(e, cell),
+        SirStmt::Intrinsic(intr) => match intr {
+            SirIntrinsic::HostIoPrint(e) => expr_touches_cell(e, cell),
+            _ => false,
+        },
+        SirStmt::DeviceOp { args, .. } => args.iter().any(|a| expr_touches_cell(a, cell)),
+    }
+}
+
+fn place_touches_cell(place: &SirPlace, cell: &str) -> bool {
+    matches!(place, SirPlace::Var(n) if n == cell)
+}
+
+fn expr_touches_cell(expr: &SirExpr, cell: &str) -> bool {
+    match expr {
+        SirExpr::Load(n) => n == cell,
+        SirExpr::Not(inner) => expr_touches_cell(inner, cell),
+        SirExpr::BinOp(_, l, r) => expr_touches_cell(l, cell) || expr_touches_cell(r, cell),
+        _ => false,
+    }
+}
 
 /// Extract the root identifier name from an expression like `foo` or `foo.bar`.
 fn expr_root_ident(expr: &Expr) -> Option<&str> {
@@ -486,7 +898,7 @@ fn expr_root_ident(expr: &Expr) -> Option<&str> {
     }
 }
 
-/// Minimal type inference for initialiser expressions (Phase 0).
+/// Minimal type inference for initialiser expressions.
 fn infer_type_from_expr(expr: &Expr) -> SirType {
     match &expr.kind {
         ExprKind::BoolLit(_) => SirType::Bool,
@@ -510,9 +922,9 @@ fn resolve_type_expr(ty: &TypeExpr) -> SirType {
             "s64" | "i64" => SirType::S64,
             "bool" => SirType::Bool,
             "bytes" => SirType::Bytes,
-            _ => SirType::U32, // unknown — default to u32 for now
+            _ => SirType::U32,
         },
-        TypeKind::Unit => SirType::U8, // unit is zero-sized; use u8 as placeholder
+        TypeKind::Unit => SirType::U8,
         TypeKind::Bytes => SirType::Bytes,
         _ => SirType::U32,
     }
@@ -540,4 +952,179 @@ fn ast_binop_to_sir(op: BinOp) -> SirBinOp {
 
 pub fn resolve(module: &Module) -> Result<SirModule, Vec<ResolveError>> {
     Resolver::new().resolve_module(module)
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::lex;
+    use crate::parser::parse;
+
+    /// A self-contained gpio device + board prelude reused by the tests.
+    const PRELUDE: &str = r#"
+device gpio {
+    regs {
+        IDR : reg32 at 0x10 access ro {}
+        ODR : reg32 at 0x14 access rw {}
+    }
+    needs { clock : clock_source }
+    ops {
+        op set(level: bool) -> () {}
+        op get() -> bool {}
+    }
+    emits falling : event
+}
+
+board demo_board {
+    soc demo_soc {
+        clocks { sysclk : clock_source = 8MHz }
+    }
+    gpio_a : gpio at 0x4002_0000 { needs { clock = soc.sysclk } }
+    gpio_c : gpio at 0x4002_0800 { needs { clock = soc.sysclk } }
+    led_user : gpio.pin = gpio_a.pin(5)  as output
+    btn_user : gpio.pin = gpio_c.pin(13) as input pulling up
+}
+"#;
+
+    fn resolve_src(src: &str) -> Result<SirModule, Vec<ResolveError>> {
+        let tokens = lex(src).expect("lex failed");
+        let ast = parse(tokens).expect("parse failed");
+        resolve(&ast)
+    }
+
+    fn count_criticals(stmts: &[SirStmt]) -> usize {
+        stmts
+            .iter()
+            .map(|s| match s {
+                SirStmt::Critical { body, .. } => 1 + count_criticals(body),
+                SirStmt::If { then, .. } => count_criticals(then),
+                _ => 0,
+            })
+            .sum()
+    }
+
+    #[test]
+    fn blink_button_resolves_with_shared_cell() {
+        let src = format!(
+            "{PRELUDE}
+program blink {{
+    use board demo_board as dev
+    let led = dev.led_user
+    let button = dev.btn_user
+    cell lit : bool = false
+    every 500ms {{ lit = not lit  led.set(lit) }}
+    on button.falling {{ lit = not lit  led.set(lit) }}
+}}
+sim blink_demo for blink {{
+    inject btn_user.falling at 1200ms
+    run until 3000ms
+}}
+"
+        );
+        let sir = resolve_src(&src).expect("resolve failed");
+
+        // Two reactions: every (id 0) + on button.falling (id 1).
+        assert_eq!(sir.reactions.len(), 2);
+        assert!(matches!(sir.reactions[0].trigger, SirTrigger::EveryNs(500_000_000)));
+        assert!(matches!(sir.reactions[1].trigger, SirTrigger::Event(_)));
+        assert_eq!(sir.reactions[0].priority, 1);
+        assert_eq!(sir.reactions[1].priority, 2);
+
+        // `lit` is shared (touched by both), ceiling = button priority (2),
+        // not a single owner (§5.5).
+        let lit = sir.cells.iter().find(|c| c.name == "lit").expect("lit cell");
+        assert_eq!(lit.ceiling, 2);
+        assert!(!lit.single_owner);
+        assert_eq!(lit.touched_by.len(), 2);
+
+        // Both statements in each reaction touch `lit` → both wrapped in a
+        // critical section.  (`lit = not lit` writes; `led.set(lit)` reads.)
+        assert_eq!(count_criticals(&sir.reactions[0].body), 2);
+        assert_eq!(count_criticals(&sir.reactions[1].body), 2);
+
+        // The injection resolved to the same event the `on` reaction binds.
+        assert_eq!(sir.injections.len(), 1);
+        if let SirTrigger::Event(ev) = sir.reactions[1].trigger {
+            assert_eq!(sir.injections[0].event, ev);
+        }
+        assert_eq!(sir.run_until_ns, Some(3_000_000_000));
+
+        // The LED write lowered to a register access on the ODR (rw) register
+        // at offset 0x14, bit 5 — a target-neutral MMIO node (§6.5).
+        assert!(find_reg_write(&sir.reactions[0].body, 0x14, 5));
+    }
+
+    fn find_reg_write(stmts: &[SirStmt], offset: u64, bit: u8) -> bool {
+        stmts.iter().any(|s| match s {
+            SirStmt::Assign { target: SirPlace::Reg { reg_offset, field_shift, .. }, .. } => {
+                *reg_offset == offset && *field_shift == bit
+            }
+            SirStmt::Critical { body, .. } => find_reg_write(body, offset, bit),
+            _ => false,
+        })
+    }
+
+    #[test]
+    fn single_owner_cell_needs_no_critical_section() {
+        let src = format!(
+            "{PRELUDE}
+program blink {{
+    use board demo_board as dev
+    let led = dev.led_user
+    cell lit : bool = false
+    every 500ms {{ lit = not lit  led.set(lit) }}
+}}
+"
+        );
+        let sir = resolve_src(&src).expect("resolve failed");
+        let lit = sir.cells.iter().find(|c| c.name == "lit").expect("lit cell");
+        assert!(lit.single_owner);
+        assert_eq!(lit.touched_by.len(), 1);
+        // No critical section is inserted for a proven single-owner cell.
+        assert_eq!(count_criticals(&sir.reactions[0].body), 0);
+    }
+
+    #[test]
+    fn duplicate_pad_is_a_compile_error() {
+        // Two pin bindings claiming the same physical pad gpio_a.pin(5).
+        let src = r#"
+device gpio {
+    regs { ODR : reg32 at 0x14 access rw {} }
+    ops { op set(level: bool) -> () {} }
+    emits falling : event
+}
+board demo_board {
+    gpio_a : gpio at 0x4002_0000 {}
+    led_user : gpio.pin = gpio_a.pin(5) as output
+    other    : gpio.pin = gpio_a.pin(5) as output
+}
+program p {
+    use board demo_board as dev
+    let led = dev.led_user
+}
+"#;
+        let errs = resolve_src(src).expect_err("expected a duplicate-pad error");
+        assert!(
+            errs.iter().any(|e| e.msg.contains("already owned")),
+            "expected a duplicate-pad diagnostic, got: {:?}",
+            errs.iter().map(|e| &e.msg).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn unknown_event_is_a_compile_error() {
+        let src = format!(
+            "{PRELUDE}
+program p {{
+    use board demo_board as dev
+    let button = dev.btn_user
+    on button.rising {{ }}
+}}
+"
+        );
+        let errs = resolve_src(&src).expect_err("expected unknown-event error");
+        assert!(errs.iter().any(|e| e.msg.contains("does not emit event 'rising'")));
+    }
 }

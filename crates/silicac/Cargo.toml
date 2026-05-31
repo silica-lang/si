@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "Silica language compiler — Phase 0"
 
+[lib]
+name = "silicac"
+path = "src/lib.rs"
+
 [[bin]]
 name = "silicac"
 path = "src/main.rs"

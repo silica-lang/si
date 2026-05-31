@@ -1,0 +1,33 @@
+// std-lib GPIO port — an ordinary `device`, privileged in no way (§2).
+//
+// The compiler core has no `gpio` keyword: this is parsed through the same path
+// as any user device, and its register *addresses* are data declared here, not
+// baked into the compiler.  A board binds individual pins of an instance
+// (`led_user : gpio.pin = gpio_a.pin(5) as output`); the resolver lowers a pin
+// op to a register access using the op's *shape* and the register's access
+// role — output ops target the writable data register (ODR), reads/events the
+// readable one (IDR) — so the bit is the bound pin index (§6.5).
+//
+// Offsets follow the STM32F4 GPIO block.  The slice models the two data
+// registers it needs; MODER/BSRR and per-pin mode programming are a Phase-1
+// addition (the sim sets direction from the pin binding).
+
+device gpio {
+  regs {
+    IDR : reg32 at 0x10 access ro {}   // input data register
+    ODR : reg32 at 0x14 access rw {}   // output data register
+  }
+
+  needs {
+    clock : clock_source
+  }
+
+  ops {
+    op set(level: bool) -> () {}       // write the pin's output bit
+    op get() -> bool {}                // read the pin's input bit
+  }
+
+  // A high→low transition on the pin's input.  `on <pin>.falling { ... }` binds
+  // a reaction here; the host simulator injects it at scripted virtual times.
+  emits falling : event
+}

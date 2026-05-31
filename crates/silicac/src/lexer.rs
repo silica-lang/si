@@ -240,6 +240,34 @@ pub fn lex(src: &str) -> Result<Vec<Spanned<Token>>, LexError> {
             continue;
         }
 
+        // Hexadecimal literals: `0x4002_0000` (used for MMIO base addresses /
+        // register offsets).  No unit suffix is permitted after hex.
+        if bytes[i] == b'0'
+            && i + 1 < len
+            && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X')
+        {
+            i += 2; // skip `0x`
+            let mut hex_str = String::new();
+            while i < len && (bytes[i].is_ascii_hexdigit() || bytes[i] == b'_') {
+                if bytes[i] != b'_' {
+                    hex_str.push(bytes[i] as char);
+                }
+                i += 1;
+            }
+            if hex_str.is_empty() {
+                return Err(LexError {
+                    offset: start,
+                    msg: "expected hex digits after '0x'".into(),
+                });
+            }
+            let value = u64::from_str_radix(&hex_str, 16).map_err(|_| LexError {
+                offset: start,
+                msg: format!("integer overflow in hex literal '0x{}'", hex_str),
+            })?;
+            tokens.push(Spanned::new(Token::IntLit(value), start, i));
+            continue;
+        }
+
         // Numbers (integer / duration / size / frequency).
         if bytes[i].is_ascii_digit() {
             let mut num_str = String::new();
@@ -400,9 +428,11 @@ fn keyword_or_ident(word: String) -> Token {
         "emits" => Token::KwEmits,
         "as" => Token::KwAs,
         "for" => Token::KwFor,
-        "set" => Token::KwSet,
-        "extend" => Token::KwExtend,
-        "remove" => Token::KwRemove,
+        // `set`/`extend`/`remove` are overlay-edit verbs (Phase 2) but also
+        // natural op names (`gpio.set`).  Keep them plain identifiers and let
+        // the overlay parser match them contextually, the way `safe_state` and
+        // `inject` are matched — otherwise `op set(...)` and `led.set(...)`
+        // would fail to parse.
         "overlay" => Token::KwOverlay,
         "use" => Token::KwUse,
         "implements" => Token::KwImpl,
