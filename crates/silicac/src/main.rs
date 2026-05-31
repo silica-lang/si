@@ -6,6 +6,11 @@
 //! Pipeline:
 //!   source → lex → parse → resolve → SIR → C backend → cc → binary
 
+// Many AST/SIR/resolver fields and variants are Phase-1+ stubs — parsed and
+// stored for future lowering passes but not yet consumed.  Suppress the
+// resulting dead_code noise so the output stays clean.
+#![allow(dead_code)]
+
 mod ast;
 mod backend;
 mod lexer;

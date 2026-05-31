@@ -22,7 +22,6 @@ pub enum Token {
     KwWithin,
     KwCell,
     KwLet,
-    KwBe,     // `become`
     KwBecome,
     KwWhen,
     KwReturn,
