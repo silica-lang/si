@@ -1,0 +1,9 @@
+[package]
+name = "silicac"
+version = "0.1.0"
+edition = "2021"
+description = "Silica language compiler — Phase 0"
+
+[[bin]]
+name = "silicac"
+path = "src/main.rs"

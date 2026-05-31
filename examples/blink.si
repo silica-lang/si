@@ -1,0 +1,15 @@
+// Silica blink simulation — Phase 0
+// Demonstrates the `every` periodic reaction on the host.
+// Compile: silicac blink.si -o blink
+// Run:     ./blink    (Ctrl-C to stop)
+
+program blink {
+    cell lit : bool = false
+
+    every 500ms {
+        lit = not lit
+        host_io.print("[tick] LED: ")
+        host_io.print("toggled\n")
+        host_io.flush()
+    }
+}
