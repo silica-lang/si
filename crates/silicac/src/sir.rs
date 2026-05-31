@@ -31,6 +31,26 @@ pub struct SirModule {
     pub injections: Vec<SirInjection>,
     /// Virtual-time horizon from `run until <dur>` (None ⇒ run until idle).
     pub run_until_ns: Option<u64>,
+    /// SoC memory regions (flash/RAM), for the generated linker script (§6.4).
+    pub memory: Vec<SirRegion>,
+}
+
+/// A named memory region with a base address and size, from `board.soc.memory`.
+#[derive(Debug, Clone)]
+pub struct SirRegion {
+    pub name: String,
+    pub origin: u64,
+    pub size: u64,
+}
+
+impl SirRegion {
+    /// Heuristic: the executable region (lowest origin / contains the reset
+    /// vector) is flash; the region at the SRAM origin is RAM.  Used by the
+    /// linker-script generator (§6.4).
+    pub fn is_ram(&self) -> bool {
+        // ARMv7-M SRAM is the 0x2000_0000 bit-band region.
+        (self.origin & 0xF000_0000) == 0x2000_0000
+    }
 }
 
 // ─── Reactions ────────────────────────────────────────────────────────────────
@@ -271,6 +291,16 @@ impl SirType {
             SirType::S32 => "int32_t",
             SirType::S64 => "int64_t",
             SirType::Bytes => "const uint8_t *",
+        }
+    }
+
+    /// Storage size in bytes — used to sum the static RAM footprint (§5.3).
+    pub fn byte_size(&self) -> u64 {
+        match self {
+            SirType::Bool | SirType::U8 | SirType::S8 => 1,
+            SirType::U16 | SirType::S16 => 2,
+            SirType::U32 | SirType::S32 | SirType::Bytes => 4,
+            SirType::U64 | SirType::S64 => 8,
         }
     }
 }

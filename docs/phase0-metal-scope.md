@@ -92,11 +92,22 @@ Toolchain: `arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -nostartfiles -T <generate
 
 | Stage | Deliverable | Renode checkpoint |
 | --- | --- | --- |
-| **A** | `--target` flag; linker-script + vector-table + reset generation; RAM-budget gate; metal `main` runs `sys.start` then idles | firmware links & boots in Renode |
+| **A** ✅ | `--target` flag; linker-script + vector-table + reset generation; RAM-budget gate; metal `main` runs `sys.start` then idles | firmware links & boots in Renode |
 | **B** | `SirPlace::Reg`→MMIO with barriers; `std/nrf_gpio.si`; init sets `DIR`/`PIN_CNF` | LED driven once at boot — observed on the pin |
 | **C** | `every`→SysTick (std device + handler + vector entry) | LED **blinks** periodically |
 | **D** | `on falling`→GPIOTE+NVIC vector; `Critical`→BASEPRI | full **blink+button**, shared cell, injected presses |
 | **E** | Renode `.resc` + Robot test asserting the sim-identical sequence; README docs | **automated metal gate** in CI |
+
+## Progress
+
+**Stage A — done** (verified in Renode). `silicac --target metal-nrf52840
+examples/boot_nrf52840.si -o boot.elf` generates the linker script from
+`board.soc.memory`, a vector table + reset/startup (`.data` copy, `.bss` zero,
+`sys.start` dispatch, WFI idle), and the freestanding C (no libc). Booting the
+ELF in Renode: `value` reads back `0x2A` after `sys.start` (proving startup +
+`.data` init + reaction dispatch), CPU idles in WFI. RAM-budget gate (#1) reports
+`2052 B of 262144 B`. Covered by `tests/metal_codegen.rs` (hermetic) and
+end-to-end with `arm-none-eabi-gcc` + Renode 1.16.1.
 
 ## How the Phase-0 gates close
 

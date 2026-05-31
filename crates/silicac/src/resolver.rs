@@ -106,6 +106,7 @@ pub struct Resolver {
     cells: Vec<CellInfo>,
     injections: Vec<SirInjection>,
     run_until_ns: Option<u64>,
+    memory: Vec<SirRegion>,
 
     /// Device id → device-type name (for reg/op/emit lookups).
     dev_types: HashMap<usize, String>,
@@ -133,6 +134,7 @@ impl Resolver {
             cells: Vec::new(),
             injections: Vec::new(),
             run_until_ns: None,
+            memory: Vec::new(),
             dev_types: HashMap::new(),
             board_ctx: None,
             program_ctx: HashMap::new(),
@@ -183,6 +185,7 @@ impl Resolver {
                 cells: self.cells,
                 injections: self.injections,
                 run_until_ns: self.run_until_ns,
+                memory: self.memory,
             })
         } else {
             Err(self.errors)
@@ -294,6 +297,17 @@ impl Resolver {
             Some(b) => b.clone(),
             None => return,
         };
+
+        // SoC memory regions → linker script (§6.4).
+        if let Some(soc) = &board.soc {
+            for region in &soc.memory {
+                self.memory.push(SirRegion {
+                    name: region.name.name.clone(),
+                    origin: region.at,
+                    size: region.size,
+                });
+            }
+        }
 
         let mut pins: HashMap<String, PinRef> = HashMap::new();
         // instance name → SirDevice id

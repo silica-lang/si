@@ -1,0 +1,28 @@
+// Stage-A metal boot test (on-metal backend, nRF52840).
+//
+// Minimal board (just the SoC memory map) + a program whose `on sys.start`
+// reaction writes a cell.  Proves the generated reset/startup runs: vector
+// table -> Reset_Handler -> .data copy / .bss zero -> sys.start dispatch ->
+// cell write in RAM, then idle.  Verified by booting in Renode and reading the
+// cell back from RAM.
+//
+//   silicac --target metal-nrf52840 examples/boot_nrf52840.si -o boot.elf
+
+board nrf52840_dk {
+  soc nrf52840 {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+  }
+}
+
+program boot_test {
+  use board nrf52840_dk as dev
+
+  cell value : u32 = 7
+
+  on sys.start {
+    value = 42
+  }
+}
