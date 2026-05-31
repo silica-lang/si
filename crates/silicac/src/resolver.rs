@@ -107,6 +107,7 @@ pub struct Resolver {
     injections: Vec<SirInjection>,
     run_until_ns: Option<u64>,
     memory: Vec<SirRegion>,
+    pins: Vec<SirPin>,
 
     /// Device id → device-type name (for reg/op/emit lookups).
     dev_types: HashMap<usize, String>,
@@ -135,6 +136,7 @@ impl Resolver {
             injections: Vec::new(),
             run_until_ns: None,
             memory: Vec::new(),
+            pins: Vec::new(),
             dev_types: HashMap::new(),
             board_ctx: None,
             program_ctx: HashMap::new(),
@@ -186,6 +188,7 @@ impl Resolver {
                 injections: self.injections,
                 run_until_ns: self.run_until_ns,
                 memory: self.memory,
+                pins: self.pins,
             })
         } else {
             Err(self.errors)
@@ -368,8 +371,19 @@ impl Resolver {
                         .unwrap_or_default();
                     pins.insert(
                         pb.name.name.clone(),
-                        PinRef { port_device: dev_id, index: pb.index as u8, dir: pb.dir, port_type },
+                        PinRef { port_device: dev_id, index: pb.index as u8, dir: pb.dir, port_type: port_type.clone() },
                     );
+                    // Record for generated startup pin configuration (§6.4).
+                    if let Some((off, w)) = self.find_dir_reg(&port_type) {
+                        self.pins.push(SirPin {
+                            device: dev_id,
+                            index: pb.index as u8,
+                            output: pb.dir == PinDir::Output,
+                            pull_up: pb.pull == Pull::Up,
+                            dir_reg_offset: off,
+                            dir_reg_width: w,
+                        });
+                    }
                 }
                 None => {
                     self.err(pb.span, format!("pin '{}' references unknown port '{}'", pb.name.name, pb.port.name));
@@ -787,6 +801,20 @@ impl Resolver {
             .iter()
             .find(|r| matches!(r.access, RegAccess::Rw | RegAccess::Wo))
             .map(|r| (r.offset, r.width, map_access(r.access)))
+    }
+
+    /// The port's direction register: a writable register distinct from the
+    /// output *data* register (for nrf_gpio: `DIR`, vs the `OUT` data reg).
+    /// Heuristic for the slice — a faithful model would tag the register's role
+    /// or drive direction from a device init op; documented as a Phase-1 swap.
+    fn find_dir_reg(&self, ty: &str) -> Option<(u64, u8)> {
+        let out = self.find_output_reg(ty)?;
+        let def = self.device_defs.get(ty)?;
+        let regs = def.sections.regs.as_ref()?;
+        regs.regs
+            .iter()
+            .find(|r| matches!(r.access, RegAccess::Rw | RegAccess::Wo) && r.offset != out.0)
+            .map(|r| (r.offset, r.width))
     }
 
     /// The port's readable input register: `(offset, width, access)`.

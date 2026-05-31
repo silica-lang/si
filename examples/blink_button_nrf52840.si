@@ -1,0 +1,52 @@
+// blink + button on the nRF52840-DK (on-metal target).  Same reactive program
+// as examples/blink_button.si, retargeted to nRF hardware: LED1 = P0.13,
+// Button1 = P0.11, GPIO port `gpio0` (nrf_gpio std device).
+//
+//   silicac --target metal-nrf52840 examples/blink_button_nrf52840.si -o blink.elf
+//   silicac --sim                    examples/blink_button_nrf52840.si
+//
+// Stage status: B drives the LED at sys.start (one MMIO write, observed on the
+// pin); C wires `every` to SysTick (blink); D wires `on falling` to GPIOTE/NVIC.
+
+board nrf52840_dk {
+  soc nrf52840 {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+  }
+
+  gpio0 : nrf_gpio at 0x5000_0000
+
+  led_user : nrf_gpio.pin = gpio0.pin(13) as output
+  btn_user : nrf_gpio.pin = gpio0.pin(11) as input pulling up
+}
+
+program blink {
+  use board nrf52840_dk as dev
+
+  let led    = dev.led_user
+  let button = dev.btn_user
+
+  cell lit : bool = false
+
+  on sys.start {
+    led.set(true)
+  }
+
+  every 500ms {
+    lit = not lit
+    led.set(lit)
+  }
+
+  on button.falling {
+    lit = not lit
+    led.set(lit)
+  }
+}
+
+sim blink_demo for blink {
+  inject btn_user.falling at 1200ms
+  inject btn_user.falling at 1800ms
+  run until 3000ms
+}

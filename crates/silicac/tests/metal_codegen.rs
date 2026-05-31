@@ -90,6 +90,37 @@ program p {
     assert!(err.contains("RAM budget exceeded"), "got: {err}");
 }
 
+const GPIO: &str = r#"
+board b {
+  soc s { memory { flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K } }
+  gpio0 : nrf_gpio at 0x5000_0000
+  led : nrf_gpio.pin = gpio0.pin(13) as output
+}
+program p {
+  use board b as dev
+  let led = dev.led
+  on sys.start { led.set(true) }
+}
+"#;
+
+#[test]
+fn reg_access_lowers_to_ordered_mmio_with_barriers() {
+    // Validation gate #3 (§4.2/§6.2): register access is a volatile masked
+    // store bracketed by barriers, and output-pin direction is configured at
+    // startup.
+    let sir = compile(GPIO);
+    let src = c::CBackend::with_target(Target::MetalNrf52840).emit(&sir);
+
+    assert!(src.contains("#define __DMB()"), "barrier macro defined");
+    // OUT register of gpio0 @ 0x5000_0000 + 0x504.
+    assert!(src.contains("0x50000504UL"), "MMIO store to OUT:\n{src}");
+    assert!(src.contains("volatile uint32_t *__p"), "volatile pointer access");
+    assert!(src.contains("__DMB();"), "ordering barrier around the store");
+    // Direction config writes DIR @ +0x514.
+    assert!(src.contains("configure output pin directions"));
+    assert!(src.contains("0x50000514UL"), "DIR config write:\n{src}");
+}
+
 #[test]
 fn host_target_still_emits_hosted_main() {
     // The host path is unchanged: it still produces a libc `main`, proving the

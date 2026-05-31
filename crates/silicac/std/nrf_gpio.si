@@ -1,0 +1,24 @@
+// std-lib GPIO port for the Nordic nRF52 family — an ordinary `device` (§2).
+//
+// Nordic's GPIO differs from the STM32 shape in std/gpio.si: the data registers
+// are OUT (read/write output) and IN (read-only input), with the register block
+// at offset 0x500 from the port base (so an instance is declared `at 0x5000_0000`
+// and OUT lands at absolute 0x5000_0504, matching Renode's NRF52840_GPIO model).
+//
+// `set(level)` lowers to a read-modify-write of OUT bit <pin>; `falling` is wired
+// through GPIOTE in a later stage.  DIR selects direction (1 = output).
+
+device nrf_gpio {
+  regs {
+    OUT : reg32 at 0x504 access rw {}   // output data (RMW per-bit)
+    IN  : reg32 at 0x510 access ro {}   // input data
+    DIR : reg32 at 0x514 access rw {}   // direction: 1 = output
+  }
+
+  ops {
+    op set(level: bool) -> () {}
+    op get() -> bool {}
+  }
+
+  emits falling : event
+}

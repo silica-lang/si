@@ -93,7 +93,7 @@ Toolchain: `arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -nostartfiles -T <generate
 | Stage | Deliverable | Renode checkpoint |
 | --- | --- | --- |
 | **A** ✅ | `--target` flag; linker-script + vector-table + reset generation; RAM-budget gate; metal `main` runs `sys.start` then idles | firmware links & boots in Renode |
-| **B** | `SirPlace::Reg`→MMIO with barriers; `std/nrf_gpio.si`; init sets `DIR`/`PIN_CNF` | LED driven once at boot — observed on the pin |
+| **B** ✅ | `SirPlace::Reg`→MMIO with barriers; `std/nrf_gpio.si`; init sets `DIR` | LED driven once at boot — observed on the pin |
 | **C** | `every`→SysTick (std device + handler + vector entry) | LED **blinks** periodically |
 | **D** | `on falling`→GPIOTE+NVIC vector; `Critical`→BASEPRI | full **blink+button**, shared cell, injected presses |
 | **E** | Renode `.resc` + Robot test asserting the sim-identical sequence; README docs | **automated metal gate** in CI |
@@ -108,6 +108,15 @@ ELF in Renode: `value` reads back `0x2A` after `sys.start` (proving startup +
 `.data` init + reaction dispatch), CPU idles in WFI. RAM-budget gate (#1) reports
 `2052 B of 262144 B`. Covered by `tests/metal_codegen.rs` (hermetic) and
 end-to-end with `arm-none-eabi-gcc` + Renode 1.16.1.
+
+**Stage B — done** (verified in Renode). `SirPlace::Reg` lowers to ordered
+volatile MMIO with `__DMB()` barriers (gate #3); `std/nrf_gpio.si` is the nRF
+GPIO device; the generated startup configures output-pin direction (`DIR`)
+before `sys.start`. On `examples/blink_button_nrf52840.si`, `sys.start`'s
+`led.set(true)` drives P0.13: Renode's `OUT` (`0x5000_0504`) reads back `0x2000`
+after boot (was `0x0`). The *same* program runs under `--sim` (mock registers).
+Direction-register selection is a documented heuristic (a writable register
+distinct from the data register) to be replaced by per-pin config ops.
 
 ## How the Phase-0 gates close
 

@@ -33,6 +33,22 @@ pub struct SirModule {
     pub run_until_ns: Option<u64>,
     /// SoC memory regions (flash/RAM), for the generated linker script (§6.4).
     pub memory: Vec<SirRegion>,
+    /// Resolved pin bindings, for generated startup pin configuration (§6.4).
+    pub pins: Vec<SirPin>,
+}
+
+/// A board pin binding (`led_user : gpio.pin = gpio_a.pin(5) as output`),
+/// resolved for startup configuration: the generated reset handler sets each
+/// output pin's direction before running `sys.start`.
+#[derive(Debug, Clone)]
+pub struct SirPin {
+    pub device: usize,
+    pub index: u8,
+    pub output: bool,
+    pub pull_up: bool,
+    /// Offset + width of the device's direction register (1 = output).
+    pub dir_reg_offset: u64,
+    pub dir_reg_width: u8,
 }
 
 /// A named memory region with a base address and size, from `board.soc.memory`.
