@@ -1,0 +1,23 @@
+// std-lib timer — modelled so "`every` is implemented over an ordinary timer
+// device" (§3.4/§4.1) is not foreclosed.  The slice's `every <dur>` lowers to a
+// fixed-rate virtual-time trigger directly (the sim owns the clock), so this
+// device is not yet wired to `every`; it exists to keep the design honest and
+// as a Phase-1 hook (allocate a compare channel from this device).
+
+device timer {
+  regs {
+    CNT : reg32 at 0x00 access ro {}   // free-running counter
+    ARR : reg32 at 0x04 access rw {}   // auto-reload (period)
+  }
+
+  needs {
+    clock : clock_source
+  }
+
+  ops {
+    op start() -> () {}
+    op stop()  -> () {}
+  }
+
+  emits tick : event
+}

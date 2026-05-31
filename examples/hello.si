@@ -1,0 +1,10 @@
+// Silica hello world — Phase 0
+// Compile: silicac hello.si -o hello
+// Run:     ./hello
+
+program hello {
+    on sys.start {
+        host_io.print("Hello from Silica!\n")
+        host_io.flush()
+    }
+}
