@@ -84,7 +84,8 @@ impl Scope {
     }
 }
 
-/// The resolved board context for the program currently being lowered.
+/// The resolved board context for one program.
+#[derive(Clone)]
 struct BoardContext {
     /// Pin-binding name → resolved pin reference (`led_user` → …).
     pins: HashMap<String, PinRef>,
@@ -108,8 +109,11 @@ pub struct Resolver {
 
     /// Device id → device-type name (for reg/op/emit lookups).
     dev_types: HashMap<usize, String>,
-    /// The board context for the program being resolved.
+    /// The board context for the program *currently* being resolved.
     board_ctx: Option<BoardContext>,
+    /// Per-program board context, so a `sim` block resolves against its own
+    /// program's board rather than whichever program was lowered last.
+    program_ctx: HashMap<String, BoardContext>,
 }
 
 impl Default for Resolver {
@@ -131,6 +135,7 @@ impl Resolver {
             run_until_ns: None,
             dev_types: HashMap::new(),
             board_ctx: None,
+            program_ctx: HashMap::new(),
         }
     }
 
@@ -237,6 +242,12 @@ impl Resolver {
         self.analyze_cells(&mut out[first..], &vars);
 
         module_vars.extend(vars);
+
+        // Stash this program's board context so its `sim` block resolves against
+        // the right board (the field is reused for the next program).
+        if let Some(ctx) = self.board_ctx.take() {
+            self.program_ctx.insert(prog.name.name.clone(), ctx);
+        }
     }
 
     // ── use / board ───────────────────────────────────────────────────────────
@@ -588,7 +599,22 @@ impl Resolver {
             return None;
         }
 
-        // Write op → store the (first) argument into the output register bit.
+        // A write-shaped pin op takes exactly its argument; reject wrong arity
+        // (and avoid indexing `args[0]` blindly).
+        if args.len() != op.params.len() {
+            self.err(
+                span,
+                format!(
+                    "op '{}' takes {} argument(s), got {}",
+                    method.name,
+                    op.params.len(),
+                    args.len()
+                ),
+            );
+            return None;
+        }
+
+        // Write op → store the argument into the output register bit.
         let reg = match self.find_output_reg(&pin.port_type) {
             Some(r) => r,
             None => {
@@ -656,21 +682,46 @@ impl Resolver {
             ExprKind::Assign(_lhs, rhs) => self.lower_expr(rhs, scope),
             ExprKind::CompoundAssign(_, _, rhs) => self.lower_expr(rhs, scope),
             ExprKind::Try(inner) => self.lower_expr(inner, scope), // fault `?` — Phase 1
-            ExprKind::Call { callee, args: _, named: _ } => {
-                // A pin *read* op used as a value (`pin.get()`).
+            ExprKind::Call { callee, args, named: _ } => {
+                // A pin *read* op used as a value (`pin.get()`).  Only a
+                // read-shaped op (declared, parameterless) lowers to a register
+                // read — using the op name and arity, so `led.set(true)` in
+                // value position is diagnosed, not silently turned into a read.
                 if let ExprKind::Field(dev_expr, method) = &callee.kind {
                     if let Some(root) = expr_root_ident(dev_expr) {
                         if let Some(Binding::Pin(pin)) = scope.lookup(root).cloned() {
-                            if let Some(reg) = self.find_input_reg(&pin.port_type) {
-                                let _ = method;
-                                return SirExpr::RegLoad {
-                                    device: pin.port_device,
-                                    reg_offset: reg.0,
-                                    width: reg.1,
-                                    field_mask: 1u64 << pin.index,
-                                    field_shift: pin.index,
-                                    access: reg.2,
-                                };
+                            match self.find_op(&pin.port_type, &method.name).cloned() {
+                                None => {
+                                    self.err(
+                                        expr.span,
+                                        format!("device type '{}' has no op '{}'", pin.port_type, method.name),
+                                    );
+                                    return SirExpr::U64(0);
+                                }
+                                Some(op) if !op.params.is_empty() || !args.is_empty() => {
+                                    self.err(
+                                        expr.span,
+                                        format!("op '{}' is not a value-returning read op", method.name),
+                                    );
+                                    return SirExpr::U64(0);
+                                }
+                                Some(_) => {
+                                    if let Some(reg) = self.find_input_reg(&pin.port_type) {
+                                        return SirExpr::RegLoad {
+                                            device: pin.port_device,
+                                            reg_offset: reg.0,
+                                            width: reg.1,
+                                            field_mask: 1u64 << pin.index,
+                                            field_shift: pin.index,
+                                            access: reg.2,
+                                        };
+                                    }
+                                    self.err(
+                                        expr.span,
+                                        format!("device type '{}' has no readable input register", pin.port_type),
+                                    );
+                                    return SirExpr::U64(0);
+                                }
                             }
                         }
                     }
@@ -799,6 +850,18 @@ impl Resolver {
     // ── Sim script ────────────────────────────────────────────────────────────
 
     fn resolve_sim(&mut self, sim: &SimDef) {
+        // Resolve against *this sim's* program's board context, not whichever
+        // program happened to be lowered last.
+        let ctx = match self.program_ctx.get(&sim.program.name) {
+            Some(c) => c.clone(),
+            None => {
+                self.err(
+                    sim.span,
+                    format!("sim '{}' targets unknown program '{}'", sim.name.name, sim.program.name),
+                );
+                return;
+            }
+        };
         for inj in &sim.injections {
             // The sim references board pin-binding names directly (e.g.
             // `btn_user.falling`), resolved via the program's board context.
@@ -809,7 +872,7 @@ impl Resolver {
                     continue;
                 }
             };
-            let pin = match self.board_ctx.as_ref().and_then(|c| c.pins.get(&device_name).cloned()) {
+            let pin = match ctx.pins.get(&device_name).cloned() {
                 Some(p) => p,
                 None => {
                     self.err(inj.span, format!("unknown pin '{}' in sim injection", device_name));
@@ -1109,6 +1172,46 @@ program p {
         assert!(
             errs.iter().any(|e| e.msg.contains("already owned")),
             "expected a duplicate-pad diagnostic, got: {:?}",
+            errs.iter().map(|e| &e.msg).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn pin_write_with_wrong_arity_is_a_compile_error() {
+        let src = format!(
+            "{PRELUDE}
+program p {{
+    use board demo_board as dev
+    let led = dev.led_user
+    every 500ms {{ led.set() }}
+}}
+"
+        );
+        let errs = resolve_src(&src).expect_err("expected arity error");
+        assert!(
+            errs.iter().any(|e| e.msg.contains("op 'set' takes 1 argument(s), got 0")),
+            "got: {:?}",
+            errs.iter().map(|e| &e.msg).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn pin_write_used_as_a_value_is_a_compile_error() {
+        // `led.set(true)` in value position must be diagnosed, not silently
+        // lowered to an input-register read.
+        let src = format!(
+            "{PRELUDE}
+program p {{
+    use board demo_board as dev
+    let led = dev.led_user
+    every 500ms {{ let x = led.set(true) }}
+}}
+"
+        );
+        let errs = resolve_src(&src).expect_err("expected value-position error");
+        assert!(
+            errs.iter().any(|e| e.msg.contains("not a value-returning read op")),
+            "got: {:?}",
             errs.iter().map(|e| &e.msg).collect::<Vec<_>>()
         );
     }
