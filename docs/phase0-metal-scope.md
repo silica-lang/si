@@ -95,7 +95,7 @@ Toolchain: `arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -nostartfiles -T <generate
 | **A** ✅ | `--target` flag; linker-script + vector-table + reset generation; RAM-budget gate; metal `main` runs `sys.start` then idles | firmware links & boots in Renode |
 | **B** ✅ | `SirPlace::Reg`→MMIO with barriers; `std/nrf_gpio.si`; init sets `DIR` | LED driven once at boot — observed on the pin |
 | **C** ✅ | `every`→SysTick (handler + vector entry + startup config) | LED **blinks** periodically |
-| **D** | `on falling`→GPIOTE+NVIC vector; `Critical`→BASEPRI | full **blink+button**, shared cell, injected presses |
+| **D** ✅ | `on falling`→GPIOTE+NVIC vector; `Critical`→BASEPRI | full **blink+button**, shared cell, injected presses |
 | **E** | Renode `.resc` + Robot test asserting the sim-identical sequence; README docs | **automated metal gate** in CI |
 
 ## Progress
@@ -129,6 +129,19 @@ interrupts; the vector table gains the SysTick entry (#15). On
 must be pinned to 64 MHz in the Stage-E harness for sim≡metal *timing* (the
 *sequence* already matches). SysTick is programmed at its architectural SCS
 address (it is part of the Cortex-M core, not a board peripheral).
+
+**Stage D — done** (verified in Renode). `on <pin>.falling` lowers to a GPIOTE
+channel (event mode, HiToLo) + an NVIC vector entry (#22 = IRQ 6); the generated
+`GPIOTE_IRQHandler` clears the event and dispatches the bound reactions. Input
+pins get `PIN_CNF` (connect + pull-up). The `Critical` node lowers to a real
+**BASEPRI** raise/restore at the priority ceiling (§5.5): the timer (SysTick) and
+button (GPIOTE) are given *distinct* NVIC priorities (button more urgent), so the
+shared-`lit` access genuinely masks the racing interrupt. Verified: an isolated
+button example toggles the LED per press (`OUT` 0↔0x2000); the full blink+button
+runs with SysTick + GPIOTE + BASEPRI coexisting, blinks, responds to injected
+presses, and never faults. GPIOTE register details are nRF-specific to this
+target (SIR stays neutral); a GPIOTE std-device with full event routing is a
+documented refinement.
 
 ## How the Phase-0 gates close
 

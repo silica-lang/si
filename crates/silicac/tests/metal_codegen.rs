@@ -184,6 +184,59 @@ program p { use board b as dev  every 500ms { } }
     assert!(err.contains("24 bits"), "got: {err}");
 }
 
+const BLINK_BTN: &str = r#"
+board b {
+  soc s {
+    memory { flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+  gpio0 : nrf_gpio at 0x5000_0000
+  led_user : nrf_gpio.pin = gpio0.pin(13) as output
+  btn_user : nrf_gpio.pin = gpio0.pin(11) as input pulling up
+}
+program p {
+  use board b as dev
+  let led = dev.led_user
+  let button = dev.btn_user
+  cell lit : bool = false
+  every 500ms { lit = not lit  led.set(lit) }
+  on button.falling { lit = not lit  led.set(lit) }
+}
+"#;
+
+#[test]
+fn on_event_emits_gpiote_handler_and_nvic_config() {
+    let sir = compile(BLINK_BTN);
+    let src = c::CBackend::with_target(Target::MetalNrf52840).emit(&sir);
+
+    // GPIOTE IRQ handler + vector entry (#22 = 16 + GPIOTE IRQ 6).
+    assert!(src.contains("void GPIOTE_IRQHandler(void)"));
+    assert!(src.contains("22 GPIOTE"));
+    assert!(src.contains("(void *)&GPIOTE_IRQHandler"));
+    // GPIOTE channel config: event mode, pin 11, HiToLo polarity (0x20b01).
+    assert!(src.contains("0x20b01UL"), "GPIOTE CONFIG:\n{src}");
+    // NVIC enable of IRQ 6 (bit 6 = 0x40) + input pull-up (PIN_CNF).
+    assert!(src.contains("0xE000E100UL = 0x40UL"), "NVIC ISER0");
+    assert!(src.contains("PIN_CNF"), "input pull config");
+}
+
+#[test]
+fn shared_cell_critical_lowers_to_basepri_ceiling() {
+    // `lit` is shared by the timer and the button (different priorities), so the
+    // critical section masks to the ceiling via BASEPRI (§5.5).
+    let sir = compile(BLINK_BTN);
+    let src = c::CBackend::with_target(Target::MetalNrf52840).emit(&sir);
+
+    assert!(src.contains("#define __set_BASEPRI"));
+    assert!(src.contains("__bp_saved = __get_BASEPRI()"), "save BASEPRI");
+    assert!(src.contains("__set_BASEPRI(0x20U)"), "raise to ceiling (button prio)");
+    assert!(src.contains("__set_BASEPRI(__bp_saved)"), "restore BASEPRI");
+    // Distinct interrupt priorities so the ceiling is meaningful: GPIOTE (button)
+    // more urgent (0x20) than SysTick (timer, 0x40).
+    assert!(src.contains("0x20U; /* NVIC IPR IRQ6 priority */"));
+    assert!(src.contains("0x40U; /* SysTick priority */"));
+}
+
 #[test]
 fn host_target_still_emits_hosted_main() {
     // The host path is unchanged: it still produces a libc `main`, proving the

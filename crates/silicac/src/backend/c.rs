@@ -24,6 +24,9 @@ pub struct CBackend {
     target: Target,
     /// device id → MMIO base address (populated at the start of `emit`).
     device_bases: HashMap<usize, u64>,
+    /// Max reaction priority in the module, for the priority-ceiling → BASEPRI
+    /// mapping (§5.5).
+    max_priority: u8,
 }
 
 impl CBackend {
@@ -32,7 +35,24 @@ impl CBackend {
     }
 
     pub fn with_target(target: Target) -> Self {
-        CBackend { buf: String::new(), indent: 0, target, device_bases: HashMap::new() }
+        CBackend {
+            buf: String::new(),
+            indent: 0,
+            target,
+            device_bases: HashMap::new(),
+            max_priority: 0,
+        }
+    }
+
+    /// nRF52840 has 3 NVIC priority bits; priorities occupy the top 3 bits.
+    const PRIO_SHIFT: u8 = 5;
+
+    /// Map an abstract reaction priority (higher = more urgent) to a hardware
+    /// BASEPRI/NVIC byte (lower number = more urgent), starting at level 1 so a
+    /// ceiling is never 0 (BASEPRI 0 disables masking).  §5.5.
+    fn basepri_byte(&self, our_priority: u8) -> u8 {
+        let level = (self.max_priority - our_priority) + 1;
+        level << Self::PRIO_SHIFT
     }
 
     /// Emit a complete C translation unit from a `SirModule` and return it as
@@ -43,6 +63,7 @@ impl CBackend {
                 self.device_bases.insert(dev.id, base);
             }
         }
+        self.max_priority = module.reactions.iter().map(|r| r.priority).max().unwrap_or(0);
         match self.target {
             Target::Host => {
                 self.emit_header(module);
@@ -210,16 +231,35 @@ impl CBackend {
                 self.indent -= 1;
                 self.line("}");
             }
-            SirStmt::Critical { ceiling, body } => {
-                // Metal lowers `ceiling` to a BASEPRI raise/restore (§5.5).  On
-                // the host C path there is nothing to mask; keep the section
-                // visible as a comment and emit the body.
-                self.line(&format!("/* critical-section enter (ceiling {}) */", ceiling));
-                for s in body {
-                    self.emit_stmt(s);
+            SirStmt::Critical { ceiling, body } => match self.target {
+                Target::MetalNrf52840 => {
+                    // Priority-ceiling protocol (§5.5): raise BASEPRI to the
+                    // ceiling so no cell-sharing reaction can preempt the access,
+                    // then restore.  Masks exactly the racing interrupts.
+                    let bp = self.basepri_byte(*ceiling);
+                    self.line(&format!("{{ /* critical-section: raise to ceiling {} (BASEPRI 0x{:02x}) */", ceiling, bp));
+                    self.indent += 1;
+                    self.line("uint32_t __bp_saved = __get_BASEPRI();");
+                    self.line(&format!("__set_BASEPRI(0x{:02x}U);", bp));
+                    self.line("__DMB();");
+                    for s in body {
+                        self.emit_stmt(s);
+                    }
+                    self.line("__DMB();");
+                    self.line("__set_BASEPRI(__bp_saved);");
+                    self.indent -= 1;
+                    self.line("}");
                 }
-                self.line("/* critical-section exit */");
-            }
+                Target::Host => {
+                    // No interrupts to mask on the host; the simulator services
+                    // the section. Keep it visible as a comment.
+                    self.line(&format!("/* critical-section enter (ceiling {}) */", ceiling));
+                    for s in body {
+                        self.emit_stmt(s);
+                    }
+                    self.line("/* critical-section exit */");
+                }
+            },
             SirStmt::DeviceOp { device, op, .. } => {
                 self.line(&format!("/* TODO(metal): device {} op {} */", device, op));
             }
@@ -406,16 +446,28 @@ impl CBackend {
         self.line("#define __DSB() __asm__ volatile(\"dsb 0xf\" ::: \"memory\")");
         self.line("#define __DMB() __asm__ volatile(\"dmb 0xf\" ::: \"memory\")");
         self.line("");
+        self.line("/* BASEPRI access for priority-ceiling critical sections (§5.5). */");
+        self.line("#define __set_BASEPRI(v) __asm__ volatile(\"msr basepri, %0\" :: \"r\"((uint32_t)(v)) : \"memory\")");
+        self.line("static inline uint32_t __get_BASEPRI(void) { uint32_t __r; __asm__ volatile(\"mrs %0, basepri\" : \"=r\"(__r)); return __r; }");
+        self.line("");
         self.line("/* Symbols provided by the generated linker script (§6.4). */");
         self.line("extern uint32_t _estack;");
         self.line("extern uint32_t _sidata, _sdata, _edata, _sbss, _ebss;");
     }
 
     /// Emit the vector table + reset/startup (§6.4): copy `.data`, zero `.bss`,
-    /// configure output pins, run `sys.start`, program SysTick for `every`
-    /// reactions, then idle in WFI.  `every` reactions are dispatched from the
-    /// generated `SysTick_Handler` (§4.5); `on` events are wired in Stage D.
+    /// configure pins, run `sys.start`, program SysTick (`every`) and GPIOTE/NVIC
+    /// (`on <pin>.falling`), then idle in WFI.  `every` is dispatched from
+    /// `SysTick_Handler` (§4.5); `on` events from `GPIOTE_IRQHandler` (§4.1).
+    ///
+    /// GPIOTE/NVIC register details are nRF-specific and live in this nRF52840
+    /// target (SIR stays neutral); SysTick/NVIC are at architectural SCS
+    /// addresses.  Modelling GPIOTE as a std device with full event routing is a
+    /// documented refinement.
     fn emit_metal_startup(&mut self, module: &SirModule) {
+        const GPIOTE_BASE: u64 = 0x4000_6000;
+        const GPIOTE_IRQN: usize = 6;
+
         let systick = match systick_plan(module) {
             Ok(p) => p,
             Err(e) => {
@@ -423,6 +475,30 @@ impl CBackend {
                 None
             }
         };
+
+        // Collect `on <pin>.falling` bindings → one GPIOTE channel per event.
+        // (channel, port_base, pin, hw_priority_byte, [reaction ids])
+        let mut events: Vec<(usize, u64, u8, u8, Vec<usize>)> = Vec::new();
+        for ev in &module.events {
+            let rs: Vec<usize> = module
+                .reactions
+                .iter()
+                .filter(|r| matches!(r.trigger, SirTrigger::Event(e) if e == ev.id))
+                .map(|r| r.id)
+                .collect();
+            if rs.is_empty() {
+                continue;
+            }
+            let prio = module
+                .reactions
+                .iter()
+                .filter(|r| rs.contains(&r.id))
+                .map(|r| r.priority)
+                .max()
+                .unwrap_or(self.max_priority);
+            let base = self.device_bases.get(&ev.device).copied().unwrap_or(0);
+            events.push((events.len(), base, ev.pin_index.unwrap_or(0), self.basepri_byte(prio), rs));
+        }
 
         self.line("/* default handler for unused vectors */");
         self.line("static void __default_handler(void) { for (;;) {} }");
@@ -448,27 +524,61 @@ impl CBackend {
             self.indent -= 1;
             self.line("}");
         }
+
+        // GPIOTE handler: clear the channel event, dispatch the bound reactions.
+        if !events.is_empty() {
+            self.emit_newline();
+            self.line("/* on <pin>.falling -> GPIOTE IRQ dispatch (§4.1) */");
+            self.line("void GPIOTE_IRQHandler(void) {");
+            self.indent += 1;
+            for (ch, _base, _pin, _prio, rs) in &events {
+                let events_in = GPIOTE_BASE + 0x100 + 4 * (*ch as u64);
+                self.line(&format!("if (*(volatile uint32_t *)0x{:08x}UL != 0U) {{", events_in));
+                self.indent += 1;
+                self.line(&format!("*(volatile uint32_t *)0x{:08x}UL = 0U; /* clear EVENTS_IN[{}] */", events_in, ch));
+                for id in rs {
+                    self.line(&format!("{}();", reaction_fn_name(*id)));
+                }
+                self.indent -= 1;
+                self.line("}");
+            }
+            self.indent -= 1;
+            self.line("}");
+        }
         self.emit_newline();
 
-        // Vector table up to SysTick (#15).
+        // Vector table: system exceptions + external IRQs up to the highest used.
         self.line("/* Cortex-M vector table — placed at flash base by the linker (§6.4). */");
         self.line("__attribute__((section(\".vectors\"), used))");
         self.line("const void *const __vectors[] = {");
         self.indent += 1;
         let systick_entry = if systick.is_some() { "SysTick_Handler" } else { "__default_handler" };
-        let entries: [(&str, &str); 16] = [
-            ("&_estack", "0  initial SP"),
-            ("Reset_Handler", "1  reset"),
-            ("__default_handler", "2  NMI"),
-            ("__default_handler", "3  HardFault"),
-            ("0", "4  reserved"), ("0", "5"), ("0", "6"), ("0", "7"),
-            ("0", "8"), ("0", "9"), ("0", "10"),
-            ("__default_handler", "11 SVCall"),
-            ("0", "12"), ("0", "13"),
-            ("__default_handler", "14 PendSV"),
-            (systick_entry, "15 SysTick"),
+        let mut entries: Vec<(String, String)> = vec![
+            ("&_estack".into(), "0  initial SP".into()),
+            ("Reset_Handler".into(), "1  reset".into()),
+            ("__default_handler".into(), "2  NMI".into()),
+            ("__default_handler".into(), "3  HardFault".into()),
         ];
-        for (sym, comment) in entries {
+        for i in 4..=10 {
+            entries.push(("0".into(), format!("{}  reserved", i)));
+        }
+        entries.push(("__default_handler".into(), "11 SVCall".into()));
+        entries.push(("0".into(), "12".into()));
+        entries.push(("0".into(), "13".into()));
+        entries.push(("__default_handler".into(), "14 PendSV".into()));
+        entries.push((systick_entry.into(), "15 SysTick".into()));
+        // External IRQs (index 16 + n).  Extend to GPIOTE if any events.
+        if !events.is_empty() {
+            for irq in 0..=GPIOTE_IRQN {
+                let (sym, note) = if irq == GPIOTE_IRQN {
+                    ("GPIOTE_IRQHandler".to_string(), format!("{} GPIOTE", 16 + irq))
+                } else {
+                    ("__default_handler".to_string(), format!("{} IRQ{}", 16 + irq, irq))
+                };
+                entries.push((sym, note));
+            }
+        }
+        for (sym, comment) in &entries {
             let cast = if sym == "0" { "0".to_string() } else { format!("(void *)&{}", strip_amp(sym)) };
             self.line(&format!("{:<28} /* {} */", format!("{},", cast), comment));
         }
@@ -485,7 +595,7 @@ impl CBackend {
         self.line("for (dst = &_sbss; dst < &_ebss; ) { *dst++ = 0U; }");
         self.emit_newline();
 
-        // Device init: configure output-pin directions (§6.4).
+        // Device init: output-pin directions (§6.4).
         let outputs: Vec<&SirPin> = module.pins.iter().filter(|p| p.output).collect();
         if !outputs.is_empty() {
             self.line("/* configure output pin directions */");
@@ -498,6 +608,21 @@ impl CBackend {
                 for l in stmt {
                     self.line(&l);
                 }
+            }
+            self.emit_newline();
+        }
+
+        // Input pins with a pull resistor → PIN_CNF (nRF: 0x700 + 4*pin).
+        let pulls: Vec<&SirPin> = module.pins.iter().filter(|p| !p.output && p.pull_up).collect();
+        if !pulls.is_empty() {
+            self.line("/* configure input pins: connect buffer + pull-up (PIN_CNF) */");
+            for pin in pulls {
+                let base = self.device_bases.get(&pin.device).copied().unwrap_or(0);
+                let addr = base + 0x700 + 4 * pin.index as u64;
+                self.line(&format!(
+                    "*(volatile uint32_t *)0x{:08x}UL = 0xCUL; /* PIN_CNF[{}]: input, pull-up */",
+                    addr, pin.index
+                ));
             }
             self.emit_newline();
         }
@@ -518,12 +643,38 @@ impl CBackend {
 
         // Program SysTick (architectural system timer at the SCS, §4.5).
         if let Some(plan) = &systick {
-            self.line("/* SysTick: 1ms base tick, interrupt enabled (§4.5) */");
+            self.line("/* SysTick: 1ms base tick (§4.5) */");
             self.line(&format!("*(volatile uint32_t *)0xE000E014UL = {}UL; /* SYST_RVR */", plan.reload));
             self.line("*(volatile uint32_t *)0xE000E018UL = 0UL;        /* SYST_CVR */");
             self.line("__DSB();");
             self.line("*(volatile uint32_t *)0xE000E010UL = 0x7UL;      /* SYST_CSR: ENABLE|TICKINT|CLKSOURCE */");
-            self.line("__asm__ volatile(\"cpsie i\");");
+            // SysTick exception priority (SHPR3 byte [31:24]) for the ceiling (§5.5).
+            let sys_prio = systick_priority(module).map(|p| self.basepri_byte(p)).unwrap_or(0);
+            self.line(&format!("*(volatile uint8_t *)0xE000ED23UL = 0x{:02x}U; /* SysTick priority */", sys_prio));
+            self.emit_newline();
+        }
+
+        // Configure GPIOTE channels + NVIC for `on` events (§4.1, §5.5).
+        if !events.is_empty() {
+            self.line("/* GPIOTE channels (falling edge) + NVIC enable for `on` events */");
+            for (ch, base, pin, prio, _rs) in &events {
+                let cfg = GPIOTE_BASE + 0x510 + 4 * (*ch as u64);
+                let intenset = GPIOTE_BASE + 0x304;
+                // CONFIG: MODE=event(1) | PSEL(pin) | POLARITY=HiToLo(2).  Port 0
+                // for the slice's single GPIO instance (multi-port is a refinement).
+                let port = if *base == 0x5000_0300 { 1u64 } else { 0u64 };
+                let config = 1u64 | ((*pin as u64) << 8) | (port << 13) | (2u64 << 16);
+                self.line(&format!("*(volatile uint32_t *)0x{:08x}UL = 0x{:x}UL; /* GPIOTE CONFIG[{}] */", cfg, config, ch));
+                self.line(&format!("*(volatile uint32_t *)0x{:08x}UL = 0x{:x}UL; /* GPIOTE INTENSET IN[{}] */", intenset, 1u64 << ch, ch));
+                self.line(&format!("*(volatile uint8_t *)0x{:08x}UL = 0x{:02x}U; /* NVIC IPR IRQ{} priority */", 0xE000_E400u64 + GPIOTE_IRQN as u64, prio, GPIOTE_IRQN));
+            }
+            self.line(&format!("*(volatile uint32_t *)0xE000E100UL = 0x{:x}UL; /* NVIC ISER0: enable GPIOTE */", 1u64 << GPIOTE_IRQN));
+            self.emit_newline();
+        }
+
+        if systick.is_some() || !events.is_empty() {
+            self.line("__DSB();");
+            self.line("__asm__ volatile(\"cpsie i\"); /* enable interrupts */");
             self.emit_newline();
         }
 
@@ -748,6 +899,17 @@ pub fn systick_plan(module: &SirModule) -> Result<Option<SysTickPlan>, String> {
         thresholds.push((id, ns / SYSTICK_BASE_NS));
     }
     Ok(Some(SysTickPlan { reload, thresholds }))
+}
+
+/// The abstract priority of the module's periodic (`every`) reactions, used to
+/// set the SysTick exception priority for the ceiling protocol (§5.5).
+fn systick_priority(module: &SirModule) -> Option<u8> {
+    module
+        .reactions
+        .iter()
+        .filter(|r| matches!(r.trigger, SirTrigger::EveryNs(_)))
+        .map(|r| r.priority)
+        .max()
 }
 
 /// Generate the linker script from the board's memory regions (§6.4).
