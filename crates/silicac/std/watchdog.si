@@ -1,0 +1,20 @@
+// std-lib hardware watchdog (§5.6/SIL-006).  A board declares one as an ordinary
+// device; the compiler recognizes it by the `watchdog` interface (no privilege —
+// it is identified structurally, not by name).  The **scheduler owns feeding it**:
+// the generated event loop feeds it only on a clean return to idle, so a reaction
+// that hangs (or overruns its budget) starves the watchdog and triggers a reset.
+
+interface watchdog {}
+
+device wdt implements watchdog {
+  regs {
+    // Modelled for the metal increment; the sim drives the watchdog from the
+    // scheduler.  Writing the reload key feeds it.
+    CR  : reg32 at 0x00 access rw {}
+    RLR : reg32 at 0x04 access rw {}
+    KR  : reg32 at 0x08 access wo {}
+  }
+  config {
+    timeout : duration = 100ms
+  }
+}

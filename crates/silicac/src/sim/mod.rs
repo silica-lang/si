@@ -53,6 +53,8 @@ pub enum TraceKind {
     Coalesced { reaction: usize },
     /// A device was driven to its safe state on an unrecovered fault (§5.6).
     SafeState { device: usize, state: String },
+    /// The scheduler-fed hardware watchdog fired — a reaction starved it (§5.6).
+    WatchdogReset { timeout_ns: u64 },
 }
 
 #[derive(Debug, Default)]
@@ -117,6 +119,9 @@ impl SimResult {
                 TraceKind::SafeState { device, state } => {
                     format!("[{:>8.3}ms]   SAFE-STATE: {} -> {} (§5.6)", ms, name_of(*device), state)
                 }
+                TraceKind::WatchdogReset { timeout_ns } => {
+                    format!("[{:>8.3}ms] WATCHDOG RESET — handler starved the watchdog ({}ms timeout, §5.6)", ms, timeout_ns / 1_000_000)
+                }
             };
             out.push_str(&line);
             out.push('\n');
@@ -143,6 +148,8 @@ enum Payload {
         propagate: bool,
         outcome: Result<u64, String>,
     },
+    /// The hardware watchdog deadline for arming generation `gen` (§5.6).
+    WdtTimeout { gen: u64 },
 }
 
 struct QItem {
@@ -167,6 +174,14 @@ struct Activation {
 
 // ─── Simulator ──────────────────────────────────────────────────────────────────
 
+/// The result of a mock bus transaction.
+enum BusOutcome {
+    /// Wedged: never completes (no resume scheduled) — exercises the watchdog.
+    Hang,
+    /// Completes after a latency, with data or a fault code.
+    Done(u64, Result<u64, String>),
+}
+
 /// Virtual-time latency the mock bus model gives a transaction (§7.1).
 const BUS_LATENCY_NS: u64 = 2_000;
 /// Fixed data a successful mock bus read returns.
@@ -186,6 +201,12 @@ struct Sim<'m> {
     in_flight: Vec<bool>,
     /// Index into `module.bus_fault_queue` (transactions failed so far).
     bus_fault_idx: usize,
+    /// Bus transactions left to hang (wedged bus, §5.6 watchdog demo).
+    bus_hangs_left: u32,
+    /// Watchdog (§5.6/SIL-006): the active arming generation (None = fed/idle),
+    /// and a monotonic generation so stale timeout events are ignored.
+    wdt_active: Option<u64>,
+    wdt_gen: u64,
     /// Event queue + deterministic tie-break counter.
     queue: Vec<QItem>,
     seq: u64,
@@ -207,6 +228,9 @@ pub fn run(module: &SirModule) -> SimResult {
         cell_names,
         in_flight: vec![false; module.reactions.len()],
         bus_fault_idx: 0,
+        bus_hangs_left: module.bus_hangs,
+        wdt_active: None,
+        wdt_gen: 0,
         queue: Vec::new(),
         seq: 0,
         trace: Vec::new(),
@@ -315,8 +339,49 @@ impl<'m> Sim<'m> {
                 Payload::Resume { act, device, op, dst, propagate, outcome } => {
                     self.resume(act, device, op, dst, propagate, outcome);
                 }
+                Payload::WdtTimeout { gen } => {
+                    // Fire a reset only if this is still the active arming — a
+                    // later feed (clean idle) would have superseded it (§5.6).
+                    if self.wdt_active == Some(gen) {
+                        let timeout = self.module.watchdog_timeout_ns.unwrap_or(0);
+                        self.trace.push(TraceRecord {
+                            at_ns: self.now,
+                            kind: TraceKind::WatchdogReset { timeout_ns: timeout },
+                        });
+                        self.stop = true; // hardware master reset
+                    }
+                    continue; // a watchdog tick is not a reaction; no idle check
+                }
+            }
+            // The scheduler feeds the watchdog on a clean return to idle (§5.6).
+            if !self.any_in_flight() {
+                self.disarm_watchdog();
             }
         }
+    }
+
+    fn any_in_flight(&self) -> bool {
+        self.in_flight.iter().any(|&b| b)
+    }
+
+    /// Arm the watchdog when the scheduler leaves idle (a reaction starts): it
+    /// will reset unless fed (a clean return to idle) before the timeout.
+    fn arm_watchdog(&mut self) {
+        if let Some(t) = self.module.watchdog_timeout_ns {
+            self.wdt_gen += 1;
+            let gen = self.wdt_gen;
+            self.wdt_active = Some(gen);
+            let seq = self.next_seq();
+            // Lowest priority: any reaction work scheduled at the same instant
+            // (e.g. a resume that returns to idle exactly at the deadline) runs
+            // first and feeds/disarms the watchdog before this check (§5.6).
+            self.queue.push(QItem { at_ns: self.now + t, priority: 0, seq, payload: Payload::WdtTimeout { gen } });
+        }
+    }
+
+    /// Feed/disarm the watchdog on a clean return to idle (§5.6).
+    fn disarm_watchdog(&mut self) {
+        self.wdt_active = None;
     }
 
     fn next_seq(&mut self) -> u64 {
@@ -342,6 +407,10 @@ impl<'m> Sim<'m> {
             self.trace.push(TraceRecord { at_ns: self.now, kind: TraceKind::Coalesced { reaction: idx } });
             return;
         }
+        // Leaving idle: arm the watchdog (§5.6) for this in-flight period.
+        if !self.any_in_flight() {
+            self.arm_watchdog();
+        }
         self.in_flight[idx] = true;
         let source = trigger_desc(&self.module.reactions[idx].trigger);
         self.trace.push(TraceRecord {
@@ -365,28 +434,35 @@ impl<'m> Sim<'m> {
                 SirStmt::BusXfer { device, op, args, dst, propagate, .. } => {
                     let argvals: Vec<u64> = args.iter().map(|a| self.eval_expr(a, &act.locals)).collect();
                     let _ = argvals; // args drive a real controller on metal; the mock is value-fixed
-                    let (latency, outcome) = self.service_bus();
                     self.trace.push(TraceRecord {
                         at_ns: self.now,
                         kind: TraceKind::BusStart { device: *device, op: op.clone() },
                     });
                     act.pc += 1; // resume after this transaction
-                    let seq = self.next_seq();
-                    let priority = module.reactions[act.reaction].priority;
-                    self.queue.push(QItem {
-                        at_ns: self.now + latency,
-                        priority,
-                        seq,
-                        payload: Payload::Resume {
-                            act,
-                            device: *device,
-                            op: op.clone(),
-                            dst: dst.clone(),
-                            propagate: *propagate,
-                            outcome,
-                        },
-                    });
-                    return; // suspend — the scheduler runs other work meanwhile
+                    match self.service_bus() {
+                        // Wedged bus: the transaction never completes, so the
+                        // handler stays in-flight forever — the watchdog catches
+                        // it (§5.6).  No resume is scheduled.
+                        BusOutcome::Hang => return,
+                        BusOutcome::Done(latency, outcome) => {
+                            let seq = self.next_seq();
+                            let priority = module.reactions[act.reaction].priority;
+                            self.queue.push(QItem {
+                                at_ns: self.now + latency,
+                                priority,
+                                seq,
+                                payload: Payload::Resume {
+                                    act,
+                                    device: *device,
+                                    op: op.clone(),
+                                    dst: dst.clone(),
+                                    propagate: *propagate,
+                                    outcome,
+                                },
+                            });
+                            return; // suspend — the scheduler runs other work meanwhile
+                        }
+                    }
                 }
                 stmt => {
                     self.eval_stmt(stmt, &mut act.locals);
@@ -476,15 +552,19 @@ impl<'m> Sim<'m> {
         self.stop = true;
     }
 
-    /// The mock bus model (§7.1): a fixed latency + either the fault at the head
-    /// of the injected queue, or success with fixed data.
-    fn service_bus(&mut self) -> (u64, Result<u64, String>) {
+    /// The mock bus model (§7.1): a wedged transaction (hang), a fault from the
+    /// injected queue, or success with fixed data after a fixed latency.
+    fn service_bus(&mut self) -> BusOutcome {
+        if self.bus_hangs_left > 0 {
+            self.bus_hangs_left -= 1;
+            return BusOutcome::Hang;
+        }
         if self.bus_fault_idx < self.module.bus_fault_queue.len() {
             let code = self.module.bus_fault_queue[self.bus_fault_idx].clone();
             self.bus_fault_idx += 1;
-            (BUS_LATENCY_NS, Err(code))
+            BusOutcome::Done(BUS_LATENCY_NS, Err(code))
         } else {
-            (BUS_LATENCY_NS, Ok(BUS_DATA))
+            BusOutcome::Done(BUS_LATENCY_NS, Ok(BUS_DATA))
         }
     }
 
