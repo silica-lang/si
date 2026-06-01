@@ -10,7 +10,7 @@
 //!
 //! Output is a single `.c` file.  The caller invokes `cc` to compile it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 use crate::backend::Target;
@@ -25,6 +25,12 @@ pub struct CBackend {
     target: Target,
     /// device id → MMIO base address (populated at the start of `emit`).
     device_bases: HashMap<usize, u64>,
+    /// device id → (register name → absolute MMIO address), for `BusXfer`
+    /// lowering that resolves a controller's declared registers by name.
+    device_regs: HashMap<usize, HashMap<String, u64>>,
+    /// Names of module-level variables (cells + `let`s); used to tell a reaction
+    /// temporary (needs a local C declaration) from a global.
+    global_vars: HashSet<String>,
     /// Max reaction priority in the module, for the priority-ceiling → BASEPRI
     /// mapping (§5.5).
     max_priority: u8,
@@ -41,6 +47,8 @@ impl CBackend {
             indent: 0,
             target,
             device_bases: HashMap::new(),
+            device_regs: HashMap::new(),
+            global_vars: HashSet::new(),
             max_priority: 0,
         }
     }
@@ -62,8 +70,11 @@ impl CBackend {
         for dev in &module.devices {
             if let Some(base) = dev.base_addr {
                 self.device_bases.insert(dev.id, base);
+                let regs = dev.regs.iter().map(|r| (r.name.clone(), base + r.offset)).collect();
+                self.device_regs.insert(dev.id, regs);
             }
         }
+        self.global_vars = module.vars.iter().map(|v| v.name.clone()).collect();
         self.max_priority = module.reactions.iter().map(|r| r.priority).max().unwrap_or(0);
         match self.target {
             Target::Host => {
@@ -80,6 +91,7 @@ impl CBackend {
                 self.emit_newline();
                 self.emit_globals(module);
                 self.emit_newline();
+                self.emit_drive_safe(module);
                 self.emit_reaction_fns(module);
                 self.emit_newline();
                 self.emit_metal_startup(module);
@@ -188,11 +200,211 @@ impl CBackend {
         self.line(&format!("/* {} */", comment));
         self.line(&format!("static void {}(void) {{", fn_name));
         self.indent += 1;
-        for stmt in &reaction.body {
-            self.emit_stmt(stmt);
+        if self.target == Target::MetalNrf52840 {
+            // Declare reaction-local temporaries (`__busN`, `__rN`, op-inlining
+            // `__argN`, …) that the sim keeps in its activation frame; globals
+            // (cells / module `let`s) are declared module-wide already.
+            for name in self.collect_reaction_temps(reaction) {
+                self.line(&format!("uint32_t {} = 0U;", name));
+            }
+        }
+        if self.target == Target::MetalNrf52840 && reaction.yields {
+            // A yielding reaction lowers to a real bus transaction + the §4.4
+            // fault disposition; the sim's run-to-completion suspend/resume is
+            // approximated by a bounded busy-wait (interleaving fidelity is the
+            // next increment — see docs/phase0-metal-scope.md).
+            self.emit_yielding_reaction_metal(reaction);
+        } else {
+            for stmt in &reaction.body {
+                self.emit_stmt(stmt);
+            }
         }
         self.indent -= 1;
         self.line("}");
+    }
+
+    /// Lower a yielding reaction (one or more `BusXfer`s) on metal: declare its
+    /// temporaries, then walk the body, lowering each `BusXfer` to a bounded
+    /// poll and applying the reaction's Layer-2 disposition on a propagated
+    /// fault.  A `retry` disposition wraps the whole body in a bounded loop;
+    /// `safe` drives the safe state; `skip`/`escalate` drop the activation.
+    fn emit_yielding_reaction_metal(&mut self, reaction: &SirReaction) {
+        // Temporaries are declared by `emit_reaction_fn`; this adds the bus
+        // fault flag shared by the transaction lowering and disposition.
+        self.line("uint8_t __faulted = 0U;");
+
+        let is_retry = matches!(reaction.disposition, SirDisposition::Retry { .. });
+        if is_retry {
+            self.line("for (uint32_t __retry = 0U; ; __retry++) {");
+            self.indent += 1;
+            // The sim clears activation locals on each retry (§4.4); reset the
+            // temps so a re-run never reads a stale value from a prior attempt.
+            for name in self.collect_reaction_temps(reaction) {
+                self.line(&format!("{} = 0U;", name));
+            }
+        }
+        for stmt in &reaction.body {
+            match stmt {
+                SirStmt::BusXfer { device, op, args, dst, propagate, .. } => {
+                    for l in self.emit_bus_xfer_metal(*device, op, args, dst) {
+                        self.line(&l);
+                    }
+                    if *propagate {
+                        self.line("if (__faulted) {");
+                        self.indent += 1;
+                        self.emit_disposition_terminal(reaction.disposition);
+                        self.indent -= 1;
+                        self.line("}");
+                    }
+                    // A non-propagating fault leaves `dst` at 0 (set by the
+                    // lowering) and falls through, matching the sim.
+                }
+                other => self.emit_stmt(other),
+            }
+        }
+        if is_retry {
+            self.line("return; /* clean completion exits the retry loop */");
+            self.indent -= 1;
+            self.line("}");
+        }
+    }
+
+    /// Reaction-local temporaries: every `SirPlace::Var` assignment target and
+    /// `BusXfer` destination that is not a module-level global, in first-seen
+    /// order (deduped).
+    fn collect_reaction_temps(&self, reaction: &SirReaction) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        self.collect_temps_in(&reaction.body, &mut seen, &mut out);
+        out
+    }
+
+    /// Recurse over a statement list (including `If`/`Critical` bodies) adding
+    /// each non-global `Var` assignment target and `BusXfer` destination.
+    fn collect_temps_in(&self, stmts: &[SirStmt], seen: &mut HashSet<String>, out: &mut Vec<String>) {
+        for stmt in stmts {
+            match stmt {
+                SirStmt::Assign { target: SirPlace::Var(name), .. } => self.add_temp(name, seen, out),
+                SirStmt::BusXfer { dst, .. } => self.add_temp(dst, seen, out),
+                SirStmt::If { then, .. } => self.collect_temps_in(then, seen, out),
+                SirStmt::Critical { body, .. } => self.collect_temps_in(body, seen, out),
+                _ => {}
+            }
+        }
+    }
+
+    fn add_temp(&self, name: &str, seen: &mut HashSet<String>, out: &mut Vec<String>) {
+        if !self.global_vars.contains(name) && seen.insert(name.to_string()) {
+            out.push(name.to_string());
+        }
+    }
+
+    /// Lower one `read_reg`/`write_reg` `BusXfer` to a bounded-poll transaction
+    /// over the controller's declared registers (CR/SR/SA/RA/DR, resolved by
+    /// name).  Sets `dst` from DR on success; sets `__faulted` on any error bit
+    /// or a poll overrun (→ timeout), mirroring the sim's bus outcome.
+    fn emit_bus_xfer_metal(&self, device: usize, op: &str, args: &[SirExpr], dst: &str) -> Vec<String> {
+        let regs = match self.device_regs.get(&device) {
+            Some(r) => r,
+            None => return vec![format!("#error \"i2c controller device {} has no MMIO base\"", device)],
+        };
+        let addr_of = |name: &str| regs.get(name).copied();
+        let (Some(cr), Some(sr), Some(sa), Some(ra), Some(dr)) =
+            (addr_of("CR"), addr_of("SR"), addr_of("SA"), addr_of("RA"), addr_of("DR"))
+        else {
+            return vec![format!(
+                "#error \"i2c controller device {} is missing a CR/SR/SA/RA/DR register\"",
+                device
+            )];
+        };
+        let is_read = op == "read_reg";
+        if !is_read && op != "write_reg" {
+            return vec![format!("#error \"unsupported i2c op '{}' (expected read_reg/write_reg)\"", op)];
+        }
+        // read_reg(addr, reg); write_reg(addr, reg, val).
+        let addr_arg = args.first().map(|a| self.emit_expr(a)).unwrap_or_else(|| "0U".into());
+        let reg_arg = args.get(1).map(|a| self.emit_expr(a)).unwrap_or_else(|| "0U".into());
+        let val_arg = args.get(2).map(|a| self.emit_expr(a));
+
+        let mut out = vec![format!(
+            "{{ /* i2c {} → {}: bounded-poll transaction (§3.5/§5.2) */",
+            op, dst
+        )];
+        out.push("    __faulted = 0U;".into());
+        out.push(format!("    *(volatile uint32_t *)0x{:08x}UL = (uint32_t)({}); /* SA */", sa, addr_arg));
+        out.push(format!("    *(volatile uint32_t *)0x{:08x}UL = (uint32_t)({}); /* RA */", ra, reg_arg));
+        if let Some(val) = &val_arg {
+            out.push(format!("    *(volatile uint32_t *)0x{:08x}UL = (uint32_t)({}); /* DR (write) */", dr, val));
+        }
+        out.push("    __DMB();".into());
+        let cr_kick = if is_read { "__I2C_CR_START | __I2C_CR_DIR_RD" } else { "__I2C_CR_START" };
+        out.push(format!("    *(volatile uint32_t *)0x{:08x}UL = ({}); /* CR: kick */", cr, cr_kick));
+        out.push("    __DMB();".into());
+        out.push("    uint32_t __sr = 0U, __spins = 0U;".into());
+        out.push("    for (;;) {".into());
+        out.push(format!("        __sr = *(volatile uint32_t *)0x{:08x}UL; /* SR */", sr));
+        out.push("        if (__sr & __I2C_SR_DONE) break;".into());
+        out.push("        if (__sr & __I2C_SR_ERR) break;".into());
+        out.push("        if (++__spins > __I2C_POLL_BOUND) { __sr = __I2C_SR_TIMEOUT; break; }".into());
+        out.push("    }".into());
+        if is_read {
+            out.push("    if (__sr & __I2C_SR_DONE) {".into());
+            out.push(format!("        {} = *(volatile uint32_t *)0x{:08x}UL; /* DR (read result) */", dst, dr));
+            out.push("    } else { __faulted = 1U; }".into());
+        } else {
+            out.push(format!("    if (__sr & __I2C_SR_DONE) {{ {} = 0U; }} else {{ __faulted = 1U; }}", dst));
+        }
+        out.push("}".into());
+        out
+    }
+
+    /// Emit the terminal control flow for a Layer-2 disposition inside the
+    /// `if (__faulted)` block of a propagated bus fault (§4.4/§5.4), mirroring
+    /// the simulator's `dispose`.
+    fn emit_disposition_terminal(&mut self, disp: SirDisposition) {
+        match disp {
+            SirDisposition::Retry { max } => {
+                self.line(&format!("if (__retry < {}U) continue; /* retry */", max));
+                self.line("return; /* retries exhausted → escalate */");
+            }
+            SirDisposition::Skip => self.line("return; /* skip: drop this activation */"),
+            SirDisposition::Safe => {
+                // Mask interrupts before holding so no other reaction can run —
+                // the sim's `drive_safe` halts the whole machine (`stop = true`).
+                self.line("__drive_safe();");
+                self.line("__asm__ volatile(\"cpsid i\"); /* no further reactions */");
+                self.line("for (;;) { __asm__ volatile(\"wfi\"); } /* hold in safe state */");
+            }
+            SirDisposition::Escalate => self.line("return; /* escalate → Layer-3 */"),
+        }
+    }
+
+    /// Emit `__drive_safe()` (§5.6): drive every device with a declared safe op
+    /// to its safe state by running its bounded, non-yielding register writes.
+    /// Reuses the ordered-MMIO store lowering.
+    fn emit_drive_safe(&mut self, module: &SirModule) {
+        // Emit the function whenever it can be called — a `safe` disposition
+        // references it even if no device declares a safe state (in which case
+        // the body is empty, matching the sim's no-op `drive_safe`).
+        let has_safe_disp = module
+            .reactions
+            .iter()
+            .any(|r| matches!(r.disposition, SirDisposition::Safe));
+        if module.safe_seqs.is_empty() && !has_safe_disp {
+            return;
+        }
+        self.line("/* Safe-state drive (§5.6): bounded, non-yielding register writes. */");
+        self.line("static void __drive_safe(void) {");
+        self.indent += 1;
+        for seq in &module.safe_seqs {
+            self.line(&format!("/* device {} → safe state '{}' */", seq.device, seq.state));
+            for stmt in &seq.body {
+                self.emit_stmt(stmt);
+            }
+        }
+        self.indent -= 1;
+        self.line("}");
+        self.emit_newline();
     }
 
     fn emit_stmt(&mut self, stmt: &SirStmt) {
@@ -274,10 +486,11 @@ impl CBackend {
                 }
             },
             SirStmt::BusXfer { device, op, dst, .. } => {
-                // Metal lowering of yielding bus transactions (state-machine
-                // switch + controller MMIO) is increment 2; the sim services
-                // these (§7.1).
-                self.line(&format!("/* TODO(metal): bus xfer device {} op {} -> {} (increment 2) */", device, op, dst));
+                // On metal, a yielding reaction is lowered as a whole by
+                // `emit_yielding_reaction_metal` (which handles the transaction
+                // + disposition), so this arm is only reached on the host, where
+                // the simulator (`--sim`) services the transfer (§7.1).
+                self.line(&format!("/* host: sim services bus xfer device {} op {} -> {} */", device, op, dst));
             }
             SirStmt::Exit(code) => {
                 let c = self.emit_expr(code);
@@ -603,7 +816,7 @@ impl CBackend {
         self.line("}");
     }
 
-    fn emit_header_metal(&mut self, _module: &SirModule) {
+    fn emit_header_metal(&mut self, module: &SirModule) {
         self.line("/* Generated by silicac — do not edit.  Freestanding metal target (§6.2/§6.4). */");
         self.line("#include <stdint.h>");
         self.line("");
@@ -611,6 +824,18 @@ impl CBackend {
         self.line("#define __DSB() __asm__ volatile(\"dsb 0xf\" ::: \"memory\")");
         self.line("#define __DMB() __asm__ volatile(\"dmb 0xf\" ::: \"memory\")");
         self.line("");
+        if module_has_bus_xfer(module) {
+            self.line("/* I²C controller bit protocol (§3.5) — see std/i2c_controller.si.  The");
+            self.line("   register *addresses* come from the device's declared regs; these are the");
+            self.line("   bit conventions the bounded-poll `BusXfer` lowering encodes. */");
+            self.line("#define __I2C_CR_START 0x1U          /* CR.start */");
+            self.line("#define __I2C_CR_DIR_RD 0x2U         /* CR.dir = read */");
+            self.line("#define __I2C_SR_DONE 0x1U           /* SR.done */");
+            self.line("#define __I2C_SR_ERR 0xEU            /* SR.nak | arblost | timeout */");
+            self.line("#define __I2C_SR_TIMEOUT 0x8U        /* SR.timeout (synthesised on poll overrun) */");
+            self.line("#define __I2C_POLL_BOUND 1000000U    /* bounded busy-wait → timeout fault (§5.2/§5.6) */");
+            self.line("");
+        }
         self.line("/* BASEPRI access for priority-ceiling critical sections (§5.5). */");
         self.line("#define __set_BASEPRI(v) __asm__ volatile(\"msr basepri, %0\" :: \"r\"((uint32_t)(v)) : \"memory\")");
         self.line("static inline uint32_t __get_BASEPRI(void) { uint32_t __r; __asm__ volatile(\"mrs %0, basepri\" : \"=r\"(__r)); return __r; }");
@@ -909,6 +1134,14 @@ fn trigger_comment(trigger: &SirTrigger) -> String {
         SirTrigger::EveryNs(ns) => format!("reaction: every {}ns", ns),
         SirTrigger::Event(id) => format!("reaction: on event {}", id),
     }
+}
+
+/// True if any reaction body contains a yielding bus transaction.
+fn module_has_bus_xfer(module: &SirModule) -> bool {
+    module
+        .reactions
+        .iter()
+        .any(|r| r.body.iter().any(|s| matches!(s, SirStmt::BusXfer { .. })))
 }
 
 fn expr_to_c_literal(expr: &SirExpr) -> String {

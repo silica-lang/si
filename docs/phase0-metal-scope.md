@@ -173,9 +173,29 @@ Closing the sim≡metal gap for the Phase-1 keystone (composition + yields). Don
   in `tests/metal_codegen.rs`. `SirStmt::DeviceOp` now emits `#error` on metal
   rather than a silent no-op.
 
-Remaining: **`SirStmt::BusXfer`** (yielding I²C transaction) on metal, which needs
-the nRF52840 **TWIM** sequence (the abstract `CR/SR/DR` controller model is the
-sim's view) plus disposition lowering — tracked as the next increment.
+- **`SirStmt::BusXfer` → bounded-poll I²C transaction + fault disposition** — a
+  composed-device read (`sensor.read_temp()` → `i2c read_reg`) lowers to a
+  transaction over the controller's *declared* registers (`CR/SR/SA/RA/DR`,
+  resolved by name from the device's `regs`; the bit conventions are documented
+  on the fields in `std/i2c_controller.si` and encoded in the backend — the same
+  nRF-target/SIR-neutral split GPIOTE/SysTick use). The reaction's Layer-2
+  disposition is lowered to match the simulator's `dispose`: `retry(max)` wraps
+  the body in a bounded loop, `safe` runs the emitted `__drive_safe()` (each
+  device's bounded safe-op register writes) then holds, `skip`/`escalate` drop
+  the activation. Reaction-local temporaries (`__busN`, op-inlining `__rN`/`__argN`)
+  are now declared as C locals. `examples/sensor_i2c.si` and `examples/safe_state.si`
+  build and link with `arm-none-eabi-gcc`; covered by
+  `bus_xfer_lowers_to_bounded_poll_over_declared_registers`,
+  `propagated_bus_fault_lowers_to_the_reaction_disposition`, and
+  `safe_disposition_drives_safe_state_on_metal`.
+
+  *Limitation:* the bounded busy-wait approximates the sim's run-to-completion
+  suspend/resume but does **not** reproduce §5.2 *interleaving* (other reactions
+  cannot run mid-poll); a wedged bus still starves the watchdog (§5.6), and a
+  poll overrun synthesises a `timeout` fault. Trace-order parity via a real
+  state-machine + I²C-IRQ resume is the next increment. End-to-end Renode
+  validation of the transfer additionally needs a matching mock I²C controller
+  (the std `CR/SR/DR` protocol), tracked separately.
 
 ## How the Phase-0 gates close
 
