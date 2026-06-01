@@ -281,6 +281,38 @@ program p {
 }
 
 #[test]
+fn reg_load_lowers_to_volatile_masked_read() {
+    // A register *read* (`button.get()` on an input pin) lowers to a volatile
+    // MMIO load masked/shifted to the field — the read counterpart of the store
+    // lowering, matching the simulator's `(reg & mask) >> shift` exactly. No
+    // read-modify-write and no `0U` stub.
+    let src = r#"
+board b {
+  soc s {
+    memory { flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+  gpio0 : nrf_gpio at 0x5000_0000
+  btn : nrf_gpio.pin = gpio0.pin(11) as input pulling up
+}
+program p {
+  use board b as dev
+  let button = dev.btn
+  cell state : bool = false
+  every 500ms { state = button.get() }
+}
+"#;
+    let sir = compile(src);
+    let out = c::CBackend::with_target(Target::MetalNrf52840).emit(&sir);
+    // IN register of gpio0 @ 0x5000_0000 + 0x510, pin 11 → mask 0x800, shift 11.
+    assert!(out.contains("*(volatile uint32_t *)0x50000510UL"), "volatile MMIO read of IN:\n{out}");
+    assert!(out.contains("& 0x800UL"), "field mask for pin 11:\n{out}");
+    assert!(out.contains(">> 11"), "field shift for pin 11:\n{out}");
+    // The metal stub must be gone.
+    assert!(!out.contains("TODO(metal): MMIO load"), "RegLoad stub must be lowered:\n{out}");
+}
+
+#[test]
 fn missing_mmio_base_is_a_hard_error() {
     // A device instance without `at <addr>` must not silently lower to address 0.
     let src = r#"

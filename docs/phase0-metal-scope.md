@@ -57,7 +57,7 @@ The nRF GPIO layout differs from the STM32-shaped `std/gpio.si` (it uses `OUT`/`
 
 ### 2. SIR → MMIO lowering (gate #3)
 
-`SirPlace::Reg` / `SirExpr::RegLoad` (currently TODO comments in `backend/c.rs`) lower to
+`SirPlace::Reg` (Stage B) and `SirExpr::RegLoad` (Phase-1 metal lowering) lower to
 volatile masked load/store on fixed-width pointers, with `__DSB()`/`__DMB()` fences around
 register-write blocks and before IRQ enable (§4.2/§6.2). No C bitfields; fixed-width types
 only.
@@ -160,6 +160,22 @@ All five stages done; the §9.6 "identical program in sim and on metal" criterio
 is met and automated. This takes Phase 0 to ~95%; the remaining item is the
 Layer-3 forced-fault → decoded-trace decoder (§5.4), tracked as the out-of-scope
 note below.
+
+### Phase-1 metal lowering (in progress)
+
+Closing the sim≡metal gap for the Phase-1 keystone (composition + yields). Done:
+
+- **`SirExpr::RegLoad` → volatile masked MMIO read** — the read counterpart of the
+  Stage-B store lowering. A register read (e.g. `button.get()`) now emits
+  `((((uint32_t)(*(volatile uint32_t *)<addr>UL)) & <mask>UL) >> <shift>)`, matching
+  the simulator's `(reg & field_mask) >> field_shift` exactly (no RMW, so a `w1c`
+  status bit is undisturbed). Covered by `reg_load_lowers_to_volatile_masked_read`
+  in `tests/metal_codegen.rs`. `SirStmt::DeviceOp` now emits `#error` on metal
+  rather than a silent no-op.
+
+Remaining: **`SirStmt::BusXfer`** (yielding I²C transaction) on metal, which needs
+the nRF52840 **TWIM** sequence (the abstract `CR/SR/DR` controller model is the
+sim's view) plus disposition lowering — tracked as the next increment.
 
 ## How the Phase-0 gates close
 

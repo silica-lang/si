@@ -200,7 +200,7 @@ impl CBackend {
             SirStmt::Intrinsic(intr) => self.emit_intrinsic(intr),
             SirStmt::Assign { target, value } => match target {
                 SirPlace::Var(name) => {
-                    let val = emit_expr(value);
+                    let val = self.emit_expr(value);
                     self.line(&format!("{} = {};", name, val));
                 }
                 place @ SirPlace::Reg { device, reg_offset, .. } => {
@@ -223,7 +223,7 @@ impl CBackend {
                 }
             },
             SirStmt::If { cond, then } => {
-                let c = emit_expr(cond);
+                let c = self.emit_expr(cond);
                 self.line(&format!("if ({}) {{", c));
                 self.indent += 1;
                 for s in then {
@@ -261,9 +261,18 @@ impl CBackend {
                     self.line("/* critical-section exit */");
                 }
             },
-            SirStmt::DeviceOp { device, op, .. } => {
-                self.line(&format!("/* TODO(metal): device {} op {} */", device, op));
-            }
+            SirStmt::DeviceOp { device, op, .. } => match self.target {
+                // The resolver currently inlines composed-device ops down to
+                // register accesses / `BusXfer`, so this node is not emitted on
+                // the keystone path.  If a non-inlined dispatch path ever does
+                // emit it, refuse loudly rather than silently no-op on metal.
+                Target::MetalNrf52840 => {
+                    self.line(&format!("#error \"device op {} on device {} not yet lowered on metal\"", op, device));
+                }
+                Target::Host => {
+                    self.line(&format!("/* host: sim services device {} op {} */", device, op));
+                }
+            },
             SirStmt::BusXfer { device, op, dst, .. } => {
                 // Metal lowering of yielding bus transactions (state-machine
                 // switch + controller MMIO) is increment 2; the sim services
@@ -271,7 +280,7 @@ impl CBackend {
                 self.line(&format!("/* TODO(metal): bus xfer device {} op {} -> {} (increment 2) */", device, op, dst));
             }
             SirStmt::Exit(code) => {
-                let c = emit_expr(code);
+                let c = self.emit_expr(code);
                 self.line(&format!("exit((int)({}));", c));
             }
         }
@@ -305,7 +314,7 @@ impl CBackend {
                     }
                     _ => {
                         // Variable-length bytes — emit a helper call.
-                        let e = emit_expr(expr);
+                        let e = self.emit_expr(expr);
                         self.line(&format!("/* TODO: dynamic bytes print: {} */", e));
                     }
                 }
@@ -431,7 +440,7 @@ impl CBackend {
             _ => return vec![format!("#error \"unsupported register width {} (expected 8/16/32)\"", width)],
         };
         let addr = base + offset;
-        let v = emit_expr(value);
+        let v = self.emit_expr(value);
         // Field math is computed in uint32_t then narrowed to the register width.
         let field = format!("(((uint32_t)({}) << {}) & 0x{:x}UL)", v, shift, mask);
         let mut out = vec![format!("{{ /* MMIO store: device {} reg 0x{:x} ({}-bit, §4.2 ordered) */", device, offset, width)];
@@ -454,6 +463,93 @@ impl CBackend {
         }
         out.push("}".into());
         out
+    }
+
+    /// Emit a `SirExpr` as a C expression string.  Target-aware so that a
+    /// `RegLoad` can resolve the owning device's MMIO base; recurses through
+    /// `self` so a nested `RegLoad` (e.g. `reg + 1`) is lowered the same way.
+    fn emit_expr(&self, expr: &SirExpr) -> String {
+        match expr {
+            SirExpr::Bool(b) => if *b { "1U".into() } else { "0U".into() },
+            SirExpr::U64(n) => format!("{}ULL", n),
+            SirExpr::Bytes(bytes) => {
+                // Bytes as a cast-to-const-pointer string literal.
+                let escaped = c_escape_bytes(bytes);
+                format!("(const uint8_t *)\"{}\"", escaped)
+            }
+            SirExpr::Load(name) => name.clone(),
+            SirExpr::RegLoad { device, reg_offset, width, field_mask, field_shift, access } => {
+                self.emit_reg_load(*device, *reg_offset, *width, *field_mask, *field_shift, *access)
+            }
+            SirExpr::Not(inner) => format!("(!({}))", self.emit_expr(inner)),
+            SirExpr::BinOp(op, lhs, rhs) => {
+                let l = self.emit_expr(lhs);
+                let r = self.emit_expr(rhs);
+                let op_str = match op {
+                    SirBinOp::Add => "+",
+                    SirBinOp::Sub => "-",
+                    SirBinOp::Mul => "*",
+                    SirBinOp::Div => "/",
+                    SirBinOp::Rem => "%",
+                    SirBinOp::And => "&&",
+                    SirBinOp::Or => "||",
+                    SirBinOp::EqEq => "==",
+                    SirBinOp::NotEq => "!=",
+                    SirBinOp::Lt => "<",
+                    SirBinOp::Le => "<=",
+                    SirBinOp::Gt => ">",
+                    SirBinOp::Ge => ">=",
+                };
+                format!("({} {} {})", l, op_str, r)
+            }
+        }
+    }
+
+    /// Lower a `SirExpr::RegLoad` to a C expression: the read counterpart of
+    /// `emit_mmio_store` (§4.2/§6.2).  On metal this is a volatile MMIO read
+    /// masked and shifted to the field, matching the simulator exactly
+    /// (`(reg & field_mask) >> field_shift`, `sim/mod.rs`).  A pure read is not
+    /// a read-modify-write, so a `w1c` status bit in the same register is never
+    /// disturbed; it needs no barrier in expression position.
+    fn emit_reg_load(
+        &self,
+        device: usize,
+        offset: u64,
+        width: u8,
+        mask: u64,
+        shift: u8,
+        access: SirRegAccess,
+    ) -> String {
+        match self.target {
+            Target::Host => {
+                // On the host the register has no MMIO meaning; the simulator
+                // (`--sim`) services this same SIR node.  Mirror the host Store
+                // arm: read as 0 with a visible note.
+                format!("0U /* host: no MMIO; sim services device {} reg 0x{:x} */", device, offset)
+            }
+            Target::MetalNrf52840 => {
+                let Some(&base) = self.device_bases.get(&device) else {
+                    return format!(
+                        "0U /* #error device {} has no MMIO base address (instance needs `at <addr>`) */",
+                        device
+                    );
+                };
+                let cty = match width {
+                    8 => "uint8_t",
+                    16 => "uint16_t",
+                    32 => "uint32_t",
+                    _ => return format!("0U /* #error unsupported register width {} (expected 8/16/32) */", width),
+                };
+                let addr = base + offset;
+                // `Rc` (read-clears) registers have a read side effect; this
+                // expression reads exactly once, matching the sim.
+                let note = if matches!(access, SirRegAccess::Rc) { " /* Rc: read-clears */" } else { "" };
+                format!(
+                    "((((uint32_t)(*(volatile {ct} *)0x{addr:08x}UL)) & 0x{mask:x}UL) >> {shift}){note}",
+                    ct = cty, addr = addr, mask = mask, shift = shift, note = note
+                )
+            }
+        }
     }
 
     /// Emit the Layer-3 fault decoder (§5.4): the address-ownership table (no
@@ -812,43 +908,6 @@ fn trigger_comment(trigger: &SirTrigger) -> String {
         SirTrigger::SysStart => "reaction: on sys.start".into(),
         SirTrigger::EveryNs(ns) => format!("reaction: every {}ns", ns),
         SirTrigger::Event(id) => format!("reaction: on event {}", id),
-    }
-}
-
-fn emit_expr(expr: &SirExpr) -> String {
-    match expr {
-        SirExpr::Bool(b) => if *b { "1U".into() } else { "0U".into() },
-        SirExpr::U64(n) => format!("{}ULL", n),
-        SirExpr::Bytes(bytes) => {
-            // Bytes as a cast-to-const-pointer string literal.
-            let escaped = c_escape_bytes(bytes);
-            format!("(const uint8_t *)\"{}\"", escaped)
-        }
-        SirExpr::Load(name) => name.clone(),
-        SirExpr::RegLoad { device, reg_offset, .. } => {
-            format!("0U /* TODO(metal): MMIO load device {} reg 0x{:x} */", device, reg_offset)
-        }
-        SirExpr::Not(inner) => format!("(!({}))", emit_expr(inner)),
-        SirExpr::BinOp(op, lhs, rhs) => {
-            let l = emit_expr(lhs);
-            let r = emit_expr(rhs);
-            let op_str = match op {
-                SirBinOp::Add => "+",
-                SirBinOp::Sub => "-",
-                SirBinOp::Mul => "*",
-                SirBinOp::Div => "/",
-                SirBinOp::Rem => "%",
-                SirBinOp::And => "&&",
-                SirBinOp::Or => "||",
-                SirBinOp::EqEq => "==",
-                SirBinOp::NotEq => "!=",
-                SirBinOp::Lt => "<",
-                SirBinOp::Le => "<=",
-                SirBinOp::Gt => ">",
-                SirBinOp::Ge => ">=",
-            };
-            format!("({} {} {})", l, op_str, r)
-        }
     }
 }
 
