@@ -225,10 +225,11 @@ impl Resolver {
             }
         }
 
-        // ── Check `implements` conformance (§4.1/D18) ──
+        // ── Check `implements` conformance (§4.1/D18) + register layout ──
         for item in &module.items {
             if let Item::Device(d) = item {
                 self.check_conformance(d);
+                self.check_regs(d);
             }
         }
 
@@ -498,9 +499,13 @@ impl Resolver {
         }
 
         // Lower each instance's safe op (§5.6), if its type declares one.
-        for (_, inst) in instances.iter() {
-            if let Some(seq) = self.lower_safe_seq(inst.device, &inst.ty) {
-                self.safe_seqs.push(seq);
+        // Iterate `board.instances` (a Vec) for a deterministic order (§7.1/D19),
+        // not the `instances` HashMap.
+        for inst in &board.instances {
+            if let Some(target) = instances.get(&inst.name.name).cloned() {
+                if let Some(seq) = self.lower_safe_seq(target.device, &target.ty) {
+                    self.safe_seqs.push(seq);
+                }
             }
         }
 
@@ -659,6 +664,29 @@ impl Resolver {
             }
         }
         codes
+    }
+
+    /// Validate register field bit-specs against the register width (§4.2): a
+    /// `bit[n]` or `field[hi:lo]` must fit in the register and have `hi >= lo`.
+    fn check_regs(&mut self, d: &DeviceDef) {
+        let Some(regs) = d.sections.regs.as_ref() else { return };
+        for reg in &regs.regs {
+            for f in &reg.fields {
+                let bad = match f.bits {
+                    BitSpec::Bit(n) => n as u16 >= reg.width as u16,
+                    BitSpec::Range(hi, lo) => hi < lo || hi as u16 >= reg.width as u16,
+                };
+                if bad {
+                    self.err(
+                        f.span,
+                        format!(
+                            "field '{}' does not fit in {}-bit register '{}'",
+                            f.name.name, reg.width, reg.name.name
+                        ),
+                    );
+                }
+            }
+        }
     }
 
     /// Does `ty` implement interface `iface` (a declared `implements`)?
@@ -1013,16 +1041,30 @@ impl Resolver {
     /// (it must not depend on the scheduler it may be escaping).
     fn lower_safe_seq(&mut self, device: usize, ty: &str) -> Option<SafeSeq> {
         let def = self.device_defs.get(ty)?.clone();
-        let state = def.sections.safe_state.as_ref()?.name.clone();
-        let op = self.find_op(ty, "safe").cloned()?;
+        let state = def.sections.safe_state.clone();
+        let op = self.find_op(ty, "safe").cloned();
+        // `safe_state` and a `safe` op go together (§5.6); one without the other
+        // is a mistake, not silent no-op.
+        match (&state, &op) {
+            (None, None) => return None, // device has no safe behaviour
+            (Some(_), None) => {
+                self.err(def.name.span, format!("device '{}' declares `safe_state` but has no `safe` op (§5.6)", ty));
+                return None;
+            }
+            (None, Some(o)) => {
+                self.err(o.span, format!("device '{}' has a `safe` op but no `safe_state` (§5.6)", ty));
+                return None;
+            }
+            (Some(_), Some(_)) => {}
+        }
+        let op = op.unwrap();
         if op.yields {
             self.err(op.span, "a `safe` op may not yield (§5.6: it must not depend on the scheduler)");
             return None;
         }
         let mut inner = Scope::new();
-        for (name, ri) in self.reg_infos(device, ty) {
-            inner.insert(&name, Binding::Reg(ri));
-        }
+        // needs before regs — same order as `lower_op_call`, so name resolution
+        // is consistent between safe and non-safe ops.
         if let Some(needs) = self.instance_needs.get(&device).cloned() {
             for (name, val) in needs {
                 if let NeedVal::Device(r) = val {
@@ -1030,11 +1072,20 @@ impl Resolver {
                 }
             }
         }
+        for (name, ri) in self.reg_infos(device, ty) {
+            inner.insert(&name, Binding::Reg(ri));
+        }
         let mut body = Vec::new();
         for stmt in &op.body.stmts {
             self.lower_stmt(stmt, &mut inner, &[], &mut body);
         }
-        Some(SafeSeq { device, state, body })
+        // §5.6: a safe op must not yield even *indirectly* (via a yielding sub-op
+        // that lowered to a bus transaction).
+        if body_yields(&body) {
+            self.err(op.span, "a `safe` op may not yield, even indirectly via a bus transaction (§5.6)");
+            return None;
+        }
+        Some(SafeSeq { device, state: state.unwrap().name, body })
     }
 
     /// Lower a pin op call (`led.set(x)`) to a register access (§6.5).
@@ -1415,11 +1466,18 @@ impl Resolver {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Mask + shift for a register field bit-spec.
+/// Mask + shift for a register field bit-spec.  Shift-safe: out-of-range or
+/// inverted bit-specs (validated/diagnosed in `check_regs`) degrade to a 0 mask
+/// rather than panicking, since bit indices are user input.
 fn bitspec_mask_shift(b: BitSpec) -> (u64, u8) {
     match b {
-        BitSpec::Bit(n) => (1u64 << n, n),
-        BitSpec::Range(hi, lo) => ((((1u64 << (hi - lo + 1)) - 1) << lo), lo),
+        BitSpec::Bit(n) => (1u64.checked_shl(n as u32).unwrap_or(0), n),
+        BitSpec::Range(hi, lo) if hi >= lo => {
+            let width = (hi - lo + 1) as u32;
+            let span = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
+            (span.checked_shl(lo as u32).unwrap_or(0), lo)
+        }
+        BitSpec::Range(_, lo) => (0, lo),
     }
 }
 

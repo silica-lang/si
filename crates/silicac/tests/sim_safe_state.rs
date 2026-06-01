@@ -62,6 +62,54 @@ fn safe_disposition_drives_the_actuator_to_its_safe_state() {
 }
 
 #[test]
+fn safe_state_without_a_safe_op_is_an_error() {
+    let src = r#"
+device m {
+  regs { CTRL : reg32 at 0x00 access rw {} }
+  safe_state = off
+  ops { op run() -> () {} }
+}
+board rig { soc s { memory { flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K } } m0 : m at 0x5001_0000 }
+program p { use board rig as r  let x = r.m0  on sys.start { } }
+"#;
+    let errs = resolve_str(src).expect_err("expected a mismatched-safe-decl error");
+    assert!(errs.iter().any(|e| e.msg.contains("declares `safe_state` but has no `safe` op")),
+        "got: {:?}", errs.iter().map(|e| &e.msg).collect::<Vec<_>>());
+}
+
+#[test]
+fn a_safe_op_may_not_yield_indirectly() {
+    // The safe op isn't flagged `yields`, but its body calls a yielding bus op.
+    let src = r#"
+device evil {
+  needs { bus : i2c }
+  safe_state = off
+  ops { op safe() -> () { let x = bus.read_reg(0, 0)? } }
+}
+board rig {
+  soc s { memory { flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K } clocks { sysclk : clock_source = 64MHz } }
+  i2c0 : i2c_controller at 0x4000_3000 { needs { clock = soc.sysclk } }
+  d0   : evil { needs { bus = i2c0 } }
+}
+program p { use board rig as r  let x = r.d0  on sys.start { } }
+"#;
+    let errs = resolve_str(src).expect_err("expected an indirect-yield error");
+    assert!(errs.iter().any(|e| e.msg.contains("may not yield, even indirectly")),
+        "got: {:?}", errs.iter().map(|e| &e.msg).collect::<Vec<_>>());
+}
+
+#[test]
+fn out_of_range_register_field_is_an_error() {
+    let src = r#"
+device d { regs { R : reg8 at 0x00 access rw { f : bit[12] } } }
+program p { on sys.start { } }
+"#;
+    let errs = resolve_str(src).expect_err("expected an out-of-range field error");
+    assert!(errs.iter().any(|e| e.msg.contains("does not fit in 8-bit register")),
+        "got: {:?}", errs.iter().map(|e| &e.msg).collect::<Vec<_>>());
+}
+
+#[test]
 fn a_safe_op_may_not_yield() {
     let src = r#"
 device bad {
