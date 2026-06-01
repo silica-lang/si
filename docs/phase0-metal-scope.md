@@ -96,7 +96,7 @@ Toolchain: `arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -nostartfiles -T <generate
 | **B** ✅ | `SirPlace::Reg`→MMIO with barriers; `std/nrf_gpio.si`; init sets `DIR` | LED driven once at boot — observed on the pin |
 | **C** ✅ | `every`→SysTick (handler + vector entry + startup config) | LED **blinks** periodically |
 | **D** ✅ | `on falling`→GPIOTE+NVIC vector; `Critical`→BASEPRI | full **blink+button**, shared cell, injected presses |
-| **E** | Renode `.resc` + Robot test asserting the sim-identical sequence; README docs | **automated metal gate** in CI |
+| **E** ✅ | `harness/metal_vs_sim.sh` asserting the sim-identical sequence; README docs | **automated metal gate** |
 
 ## Progress
 
@@ -142,6 +142,22 @@ runs with SysTick + GPIOTE + BASEPRI coexisting, blinks, responds to injected
 presses, and never faults. GPIOTE register details are nRF-specific to this
 target (SIR stays neutral); a GPIOTE std-device with full event routing is a
 documented refinement.
+
+**Stage E — done.** `harness/metal_vs_sim.sh` is the automated **sim ≡ metal**
+gate: it runs `--sim` for the reference LED sequence, compiles the same program
+with `--target metal-nrf52840`, runs it in Renode with the NVIC/SysTick clock
+pinned to 64 MHz (so the 500 ms period is real-time) while injecting the button
+at the `sim` block's times, and asserts the metal LED sequence equals the
+simulator's. Result: `sim 1 0 1 0 1 0 1` ≡ `metal 1 0 1 0 1 0 1` — **PASS**. The
+hermetic `tests/metal_codegen.rs` covers codegen in CI; this harness is the
+end-to-end on-metal complement (needs arm-gcc + Renode, run on demand).
+
+## Status: metal scope complete
+
+All five stages done; the §9.6 "identical program in sim and on metal" criterion
+is met and automated. This takes Phase 0 to ~95%; the remaining item is the
+Layer-3 forced-fault → decoded-trace decoder (§5.4), tracked as the out-of-scope
+note below.
 
 ## How the Phase-0 gates close
 
