@@ -105,7 +105,11 @@ pub struct Resolver {
     events: Vec<SirEvent>,
     cells: Vec<CellInfo>,
     injections: Vec<SirInjection>,
+    fault_injections: Vec<SirFaultInjection>,
     run_until_ns: Option<u64>,
+    memory: Vec<SirRegion>,
+    pins: Vec<SirPin>,
+    core_hz: u64,
 
     /// Device id → device-type name (for reg/op/emit lookups).
     dev_types: HashMap<usize, String>,
@@ -114,6 +118,9 @@ pub struct Resolver {
     /// Per-program board context, so a `sim` block resolves against its own
     /// program's board rather than whichever program was lowered last.
     program_ctx: HashMap<String, BoardContext>,
+    /// Boards already built, so a board used by more than one program (or used
+    /// twice) does not append its devices/memory/pins to the module twice.
+    boards_built: HashMap<String, BoardContext>,
 }
 
 impl Default for Resolver {
@@ -132,10 +139,15 @@ impl Resolver {
             events: Vec::new(),
             cells: Vec::new(),
             injections: Vec::new(),
+            fault_injections: Vec::new(),
             run_until_ns: None,
+            memory: Vec::new(),
+            pins: Vec::new(),
+            core_hz: 0,
             dev_types: HashMap::new(),
             board_ctx: None,
             program_ctx: HashMap::new(),
+            boards_built: HashMap::new(),
         }
     }
 
@@ -182,7 +194,11 @@ impl Resolver {
                 events: self.events,
                 cells: self.cells,
                 injections: self.injections,
+                fault_injections: self.fault_injections,
                 run_until_ns: self.run_until_ns,
+                memory: self.memory,
+                pins: self.pins,
+                core_hz: self.core_hz,
             })
         } else {
             Err(self.errors)
@@ -290,10 +306,40 @@ impl Resolver {
     /// Build a board's device instances + pin bindings, populate `self.devices`
     /// and the `BoardContext`, and run the duplicate-pad check.
     fn build_board(&mut self, board_name: &str, use_span: Span) {
+        // If this board was already built (another program uses it), reuse its
+        // context instead of appending its devices/memory/pins to the module
+        // again.
+        if let Some(ctx) = self.boards_built.get(board_name) {
+            self.board_ctx = Some(ctx.clone());
+            return;
+        }
         let board = match self.boards.get(board_name) {
             Some(b) => b.clone(),
             None => return,
         };
+
+        // SoC memory regions → linker script (§6.4).
+        if let Some(soc) = &board.soc {
+            for region in &soc.memory {
+                self.memory.push(SirRegion {
+                    name: region.name.name.clone(),
+                    origin: region.at,
+                    size: region.size,
+                });
+            }
+            // Core clock → `every` tick lowering (§4.5).  Prefer a clock named
+            // `sysclk`, else the first clock; only constant frequencies are read.
+            let pick = soc
+                .clocks
+                .iter()
+                .find(|c| c.name.name == "sysclk")
+                .or_else(|| soc.clocks.first());
+            if let Some(clk) = pick {
+                if let ExprKind::IntLit(hz) = clk.init.kind {
+                    self.core_hz = hz;
+                }
+            }
+        }
 
         let mut pins: HashMap<String, PinRef> = HashMap::new();
         // instance name → SirDevice id
@@ -354,8 +400,19 @@ impl Resolver {
                         .unwrap_or_default();
                     pins.insert(
                         pb.name.name.clone(),
-                        PinRef { port_device: dev_id, index: pb.index as u8, dir: pb.dir, port_type },
+                        PinRef { port_device: dev_id, index: pb.index as u8, dir: pb.dir, port_type: port_type.clone() },
                     );
+                    // Record for generated startup pin configuration (§6.4).
+                    if let Some((off, w)) = self.find_dir_reg(&port_type) {
+                        self.pins.push(SirPin {
+                            device: dev_id,
+                            index: pb.index as u8,
+                            output: pb.dir == PinDir::Output,
+                            pull_up: pb.pull == Pull::Up,
+                            dir_reg_offset: off,
+                            dir_reg_width: w,
+                        });
+                    }
                 }
                 None => {
                     self.err(pb.span, format!("pin '{}' references unknown port '{}'", pb.name.name, pb.port.name));
@@ -372,7 +429,9 @@ impl Resolver {
         }
 
         let _ = use_span;
-        self.board_ctx = Some(BoardContext { pins });
+        let ctx = BoardContext { pins };
+        self.boards_built.insert(board_name.to_string(), ctx.clone());
+        self.board_ctx = Some(ctx);
     }
 
     /// If `expr` is `<board-alias>.<pin-binding>`, resolve it to a [`PinRef`].
@@ -775,6 +834,20 @@ impl Resolver {
             .map(|r| (r.offset, r.width, map_access(r.access)))
     }
 
+    /// The port's direction register: a writable register distinct from the
+    /// output *data* register (for nrf_gpio: `DIR`, vs the `OUT` data reg).
+    /// Heuristic for the slice — a faithful model would tag the register's role
+    /// or drive direction from a device init op; documented as a Phase-1 swap.
+    fn find_dir_reg(&self, ty: &str) -> Option<(u64, u8)> {
+        let out = self.find_output_reg(ty)?;
+        let def = self.device_defs.get(ty)?;
+        let regs = def.sections.regs.as_ref()?;
+        regs.regs
+            .iter()
+            .find(|r| matches!(r.access, RegAccess::Rw | RegAccess::Wo) && r.offset != out.0)
+            .map(|r| (r.offset, r.width))
+    }
+
     /// The port's readable input register: `(offset, width, access)`.
     fn find_input_reg(&self, ty: &str) -> Option<(u64, u8, SirRegAccess)> {
         let def = self.device_defs.get(ty)?;
@@ -882,6 +955,9 @@ impl Resolver {
             if let Some(ev) = self.resolve_pin_event(&pin, &inj.event.event.name, inj.span) {
                 self.injections.push(SirInjection { at_ns: inj.at.to_ns(), event: ev });
             }
+        }
+        for f in &sim.faults {
+            self.fault_injections.push(SirFaultInjection { at_ns: f.at.to_ns(), addr: f.addr });
         }
         if let Some(d) = sim.run_until {
             self.run_until_ns = Some(d.to_ns());

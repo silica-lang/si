@@ -29,8 +29,49 @@ pub struct SirModule {
     pub cells: Vec<CellInfo>,
     /// Scripted event injections from a `sim` block (§7.1).
     pub injections: Vec<SirInjection>,
+    /// Scripted Layer-3 fault injections from a `sim` block (§5.4).
+    pub fault_injections: Vec<SirFaultInjection>,
     /// Virtual-time horizon from `run until <dur>` (None ⇒ run until idle).
     pub run_until_ns: Option<u64>,
+    /// SoC memory regions (flash/RAM), for the generated linker script (§6.4).
+    pub memory: Vec<SirRegion>,
+    /// Resolved pin bindings, for generated startup pin configuration (§6.4).
+    pub pins: Vec<SirPin>,
+    /// Core clock in Hz (from `board.soc.clocks`), for lowering `every` periods
+    /// to timer ticks (§4.5).  0 if unknown.
+    pub core_hz: u64,
+}
+
+/// A board pin binding (`led_user : gpio.pin = gpio_a.pin(5) as output`),
+/// resolved for startup configuration: the generated reset handler sets each
+/// output pin's direction before running `sys.start`.
+#[derive(Debug, Clone)]
+pub struct SirPin {
+    pub device: usize,
+    pub index: u8,
+    pub output: bool,
+    pub pull_up: bool,
+    /// Offset + width of the device's direction register (1 = output).
+    pub dir_reg_offset: u64,
+    pub dir_reg_width: u8,
+}
+
+/// A named memory region with a base address and size, from `board.soc.memory`.
+#[derive(Debug, Clone)]
+pub struct SirRegion {
+    pub name: String,
+    pub origin: u64,
+    pub size: u64,
+}
+
+impl SirRegion {
+    /// Heuristic: the executable region (lowest origin / contains the reset
+    /// vector) is flash; the region at the SRAM origin is RAM.  Used by the
+    /// linker-script generator (§6.4).
+    pub fn is_ram(&self) -> bool {
+        // ARMv7-M SRAM is the 0x2000_0000 bit-band region.
+        (self.origin & 0xF000_0000) == 0x2000_0000
+    }
 }
 
 // ─── Reactions ────────────────────────────────────────────────────────────────
@@ -114,6 +155,14 @@ pub struct SirEvent {
 pub struct SirInjection {
     pub at_ns: u64,
     pub event: usize,
+}
+
+/// A scripted Layer-3 hardware-fault injection (§5.4): a fault to `addr` at a
+/// virtual time, decoded against the address-ownership map.
+#[derive(Debug)]
+pub struct SirFaultInjection {
+    pub at_ns: u64,
+    pub addr: u64,
 }
 
 // ─── Cell concurrency analysis (§5.5) ────────────────────────────────────────
@@ -271,6 +320,16 @@ impl SirType {
             SirType::S32 => "int32_t",
             SirType::S64 => "int64_t",
             SirType::Bytes => "const uint8_t *",
+        }
+    }
+
+    /// Storage size in bytes — used to sum the static RAM footprint (§5.3).
+    pub fn byte_size(&self) -> u64 {
+        match self {
+            SirType::Bool | SirType::U8 | SirType::S8 => 1,
+            SirType::U16 | SirType::S16 => 2,
+            SirType::U32 | SirType::S32 | SirType::Bytes => 4,
+            SirType::U64 | SirType::S64 => 8,
         }
     }
 }

@@ -10,8 +10,11 @@
 //!
 //! Output is a single `.c` file.  The caller invokes `cc` to compile it.
 
+use std::collections::HashMap;
 use std::fmt::Write;
 
+use crate::backend::Target;
+use crate::layer3;
 use crate::sir::*;
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
@@ -19,23 +22,69 @@ use crate::sir::*;
 pub struct CBackend {
     buf: String,
     indent: usize,
+    target: Target,
+    /// device id → MMIO base address (populated at the start of `emit`).
+    device_bases: HashMap<usize, u64>,
+    /// Max reaction priority in the module, for the priority-ceiling → BASEPRI
+    /// mapping (§5.5).
+    max_priority: u8,
 }
 
 impl CBackend {
     pub fn new() -> Self {
-        CBackend { buf: String::new(), indent: 0 }
+        Self::with_target(Target::Host)
+    }
+
+    pub fn with_target(target: Target) -> Self {
+        CBackend {
+            buf: String::new(),
+            indent: 0,
+            target,
+            device_bases: HashMap::new(),
+            max_priority: 0,
+        }
+    }
+
+    /// nRF52840 has 3 NVIC priority bits; priorities occupy the top 3 bits.
+    const PRIO_SHIFT: u8 = 5;
+
+    /// Map an abstract reaction priority (higher = more urgent) to a hardware
+    /// BASEPRI/NVIC byte (lower number = more urgent), starting at level 1 so a
+    /// ceiling is never 0 (BASEPRI 0 disables masking).  §5.5.
+    fn basepri_byte(&self, our_priority: u8) -> u8 {
+        let level = (self.max_priority - our_priority) + 1;
+        level << Self::PRIO_SHIFT
     }
 
     /// Emit a complete C translation unit from a `SirModule` and return it as
     /// a `String`.
     pub fn emit(mut self, module: &SirModule) -> String {
-        self.emit_header(module);
-        self.emit_newline();
-        self.emit_globals(module);
-        self.emit_newline();
-        self.emit_reaction_fns(module);
-        self.emit_newline();
-        self.emit_main(module);
+        for dev in &module.devices {
+            if let Some(base) = dev.base_addr {
+                self.device_bases.insert(dev.id, base);
+            }
+        }
+        self.max_priority = module.reactions.iter().map(|r| r.priority).max().unwrap_or(0);
+        match self.target {
+            Target::Host => {
+                self.emit_header(module);
+                self.emit_newline();
+                self.emit_globals(module);
+                self.emit_newline();
+                self.emit_reaction_fns(module);
+                self.emit_newline();
+                self.emit_main(module);
+            }
+            Target::MetalNrf52840 => {
+                self.emit_header_metal(module);
+                self.emit_newline();
+                self.emit_globals(module);
+                self.emit_newline();
+                self.emit_reaction_fns(module);
+                self.emit_newline();
+                self.emit_metal_startup(module);
+            }
+        }
         self.buf
     }
 
@@ -111,11 +160,14 @@ impl CBackend {
             return;
         }
         self.line("/* program variables and cells */");
+        // On metal, cells are touched by ISRs and must not be optimized away or
+        // cached — emit them volatile (and it keeps the boot-test observable).
+        let qualifier = if self.target == Target::MetalNrf52840 { "static volatile" } else { "static" };
         for var in &module.vars {
             let c_ty = var.ty.c_type();
             let c_init = expr_to_c_literal(&var.init);
             let comment = if var.is_cell { " /* cell */" } else { "" };
-            let decl = format!("static {} {} = {};{}", c_ty, var.name, c_init, comment);
+            let decl = format!("{} {} {} = {};{}", qualifier, c_ty, var.name, c_init, comment);
             self.line(&decl);
         }
         self.emit_newline();
@@ -151,14 +203,23 @@ impl CBackend {
                     let val = emit_expr(value);
                     self.line(&format!("{} = {};", name, val));
                 }
-                SirPlace::Reg { device, reg_offset, .. } => {
-                    // The MMIO-lowering metal backend is deferred (Phase 3);
-                    // the slice exercises register access through the host
-                    // simulator (`--sim`), which services the same SIR node.
-                    self.line(&format!(
-                        "/* TODO(metal): MMIO store to device {} reg 0x{:x} */",
-                        device, reg_offset
-                    ));
+                place @ SirPlace::Reg { device, reg_offset, .. } => {
+                    match self.target {
+                        Target::MetalNrf52840 => {
+                            let stmt = self.emit_mmio_store(place, value);
+                            for l in stmt {
+                                self.line(&l);
+                            }
+                        }
+                        Target::Host => {
+                            // On the host the register has no MMIO meaning; the
+                            // simulator (`--sim`) services this same SIR node.
+                            self.line(&format!(
+                                "/* host: no MMIO; sim services device {} reg 0x{:x} */",
+                                device, reg_offset
+                            ));
+                        }
+                    }
                 }
             },
             SirStmt::If { cond, then } => {
@@ -171,16 +232,35 @@ impl CBackend {
                 self.indent -= 1;
                 self.line("}");
             }
-            SirStmt::Critical { ceiling, body } => {
-                // Metal lowers `ceiling` to a BASEPRI raise/restore (§5.5).  On
-                // the host C path there is nothing to mask; keep the section
-                // visible as a comment and emit the body.
-                self.line(&format!("/* critical-section enter (ceiling {}) */", ceiling));
-                for s in body {
-                    self.emit_stmt(s);
+            SirStmt::Critical { ceiling, body } => match self.target {
+                Target::MetalNrf52840 => {
+                    // Priority-ceiling protocol (§5.5): raise BASEPRI to the
+                    // ceiling so no cell-sharing reaction can preempt the access,
+                    // then restore.  Masks exactly the racing interrupts.
+                    let bp = self.basepri_byte(*ceiling);
+                    self.line(&format!("{{ /* critical-section: raise to ceiling {} (BASEPRI 0x{:02x}) */", ceiling, bp));
+                    self.indent += 1;
+                    self.line("uint32_t __bp_saved = __get_BASEPRI();");
+                    self.line(&format!("__set_BASEPRI(0x{:02x}U);", bp));
+                    self.line("__DMB();");
+                    for s in body {
+                        self.emit_stmt(s);
+                    }
+                    self.line("__DMB();");
+                    self.line("__set_BASEPRI(__bp_saved);");
+                    self.indent -= 1;
+                    self.line("}");
                 }
-                self.line("/* critical-section exit */");
-            }
+                Target::Host => {
+                    // No interrupts to mask on the host; the simulator services
+                    // the section. Keep it visible as a comment.
+                    self.line(&format!("/* critical-section enter (ceiling {}) */", ceiling));
+                    for s in body {
+                        self.emit_stmt(s);
+                    }
+                    self.line("/* critical-section exit */");
+                }
+            },
             SirStmt::DeviceOp { device, op, .. } => {
                 self.line(&format!("/* TODO(metal): device {} op {} */", device, op));
             }
@@ -319,6 +399,360 @@ impl CBackend {
         self.line("}");
     }
 
+    // ── Metal (bare-metal nRF52840) ───────────────────────────────────────────
+
+    /// Lower a `SirPlace::Reg` store to ordered volatile MMIO (§4.2/§6.2, gate
+    /// #3).  A read/write register is a barrier-bracketed read-modify-write; a
+    /// write-1-to-set/clear register writes the field directly (no RMW, so a
+    /// status bit in the same register is never clobbered).
+    fn emit_mmio_store(&self, place: &SirPlace, value: &SirExpr) -> Vec<String> {
+        let SirPlace::Reg { device, reg_offset: offset, width, field_mask: mask, field_shift: shift, access } = place
+        else {
+            return vec!["#error \"internal: emit_mmio_store on a non-register place\"".into()];
+        };
+        let (device, offset, width, mask, shift, access) = (*device, *offset, *width, *mask, *shift, *access);
+        // A missing base would silently write to 0x0; refuse instead.
+        let Some(&base) = self.device_bases.get(&device) else {
+            return vec![format!(
+                "#error \"device {} has no MMIO base address (instance needs `at <addr>`)\"",
+                device
+            )];
+        };
+        let cty = match width {
+            8 => "uint8_t",
+            16 => "uint16_t",
+            32 => "uint32_t",
+            _ => return vec![format!("#error \"unsupported register width {} (expected 8/16/32)\"", width)],
+        };
+        let addr = base + offset;
+        let v = emit_expr(value);
+        // Field math is computed in uint32_t then narrowed to the register width.
+        let field = format!("(((uint32_t)({}) << {}) & 0x{:x}UL)", v, shift, mask);
+        let mut out = vec![format!("{{ /* MMIO store: device {} reg 0x{:x} ({}-bit, §4.2 ordered) */", device, offset, width)];
+        out.push(format!("    volatile {ct} *__p = (volatile {ct} *)0x{:08x}UL;", addr, ct = cty));
+        match access {
+            // write-1-to-clear / write-only: write just the field, no RMW.
+            SirRegAccess::W1c | SirRegAccess::Wo => {
+                out.push("    __DMB();".into());
+                out.push(format!("    *__p = ({ct})({field});", ct = cty, field = field));
+                out.push("    __DMB();".into());
+            }
+            // read/write: read-modify-write the field, bracketed by barriers.
+            _ => {
+                out.push(format!("    {ct} __v = *__p;", ct = cty));
+                out.push(format!("    __v = ({ct})(((uint32_t)__v & ~0x{:x}UL) | {field});", mask, ct = cty, field = field));
+                out.push("    __DMB();".into());
+                out.push("    *__p = __v;".into());
+                out.push("    __DMB();".into());
+            }
+        }
+        out.push("}".into());
+        out
+    }
+
+    /// Emit the Layer-3 fault decoder (§5.4): the address-ownership table (no
+    /// on-device strings — §4.3; the host renders labels from indices) plus a
+    /// `HardFault_Handler` that reads BFAR, finds the owning region, and records
+    /// `{addr, owner-index, pending}` to fixed RAM the harness reads back.
+    fn emit_fault_decoder(&mut self, module: &SirModule) {
+        let owners = layer3::ownership_map(module);
+        self.emit_newline();
+        self.line("/* Layer-3 fault decoder: address-ownership map (§5.4) */");
+        if owners.is_empty() {
+            self.line("#define __OWNER_COUNT 0U");
+            self.line("static const uint32_t __owner_start[1] = {0U};");
+            self.line("static const uint32_t __owner_end[1]   = {0U};");
+        } else {
+            self.line(&format!("#define __OWNER_COUNT {}U", owners.len()));
+            let starts: Vec<String> = owners.iter().map(|r| format!("0x{:08x}U", r.start)).collect();
+            let ends: Vec<String> = owners.iter().map(|r| format!("0x{:08x}U", r.end)).collect();
+            self.line(&format!("static const uint32_t __owner_start[__OWNER_COUNT] = {{ {} }};", starts.join(", ")));
+            self.line(&format!("static const uint32_t __owner_end[__OWNER_COUNT]   = {{ {} }};", ends.join(", ")));
+            // Index → label, as a comment, for the host-side decoder.
+            for (i, r) in owners.iter().enumerate() {
+                self.line(&format!("/* owner[{}] = {} [0x{:08x}, 0x{:08x}) */", i, r.label, r.start, r.end));
+            }
+        }
+        self.line("/* fault record (read by the host decoder) — structured, no strings (§4.3) */");
+        self.line("volatile uint32_t __fault_addr = 0U;");
+        self.line("volatile uint32_t __fault_owner = 0xFFFFFFFFUL; /* index, or 0xFFFFFFFF = unclaimed/invalid */");
+        self.line("volatile uint32_t __fault_cfsr = 0U;");
+        self.line("volatile uint32_t __fault_pending = 0U;");
+        self.line("void HardFault_Handler(void) {");
+        self.indent += 1;
+        self.line("uint32_t __cfsr = *(volatile uint32_t *)0xE000ED28UL; /* SCB CFSR */");
+        self.line("uint32_t __a = 0U;");
+        self.line("uint32_t __o = 0xFFFFFFFFUL;");
+        // BFAR holds the faulting address only when CFSR.BFARVALID (bit 15) is set;
+        // otherwise it is stale/undefined, so don't attribute an address.
+        self.line("if (__cfsr & 0x00008000UL) { /* BFARVALID */");
+        self.indent += 1;
+        self.line("__a = *(volatile uint32_t *)0xE000ED38UL; /* SCB BFAR */");
+        self.line("for (uint32_t __i = 0U; __i < __OWNER_COUNT; __i++) {");
+        self.indent += 1;
+        self.line("if (__a >= __owner_start[__i] && __a < __owner_end[__i]) { __o = __i; break; }");
+        self.indent -= 1;
+        self.line("}");
+        self.indent -= 1;
+        self.line("}");
+        self.line("__fault_addr = __a; __fault_owner = __o; __fault_cfsr = __cfsr; __fault_pending = 1U;");
+        self.line("for (;;) { /* halt; safe-state drive is a later phase (§5.6) */ }");
+        self.indent -= 1;
+        self.line("}");
+    }
+
+    fn emit_header_metal(&mut self, _module: &SirModule) {
+        self.line("/* Generated by silicac — do not edit.  Freestanding metal target (§6.2/§6.4). */");
+        self.line("#include <stdint.h>");
+        self.line("");
+        self.line("/* Memory barriers (§4.2/§6.2): ordered MMIO + DMA/IRQ hand-off. */");
+        self.line("#define __DSB() __asm__ volatile(\"dsb 0xf\" ::: \"memory\")");
+        self.line("#define __DMB() __asm__ volatile(\"dmb 0xf\" ::: \"memory\")");
+        self.line("");
+        self.line("/* BASEPRI access for priority-ceiling critical sections (§5.5). */");
+        self.line("#define __set_BASEPRI(v) __asm__ volatile(\"msr basepri, %0\" :: \"r\"((uint32_t)(v)) : \"memory\")");
+        self.line("static inline uint32_t __get_BASEPRI(void) { uint32_t __r; __asm__ volatile(\"mrs %0, basepri\" : \"=r\"(__r)); return __r; }");
+        self.line("");
+        self.line("/* Symbols provided by the generated linker script (§6.4). */");
+        self.line("extern uint32_t _estack;");
+        self.line("extern uint32_t _sidata, _sdata, _edata, _sbss, _ebss;");
+    }
+
+    /// Emit the vector table + reset/startup (§6.4): copy `.data`, zero `.bss`,
+    /// configure pins, run `sys.start`, program SysTick (`every`) and GPIOTE/NVIC
+    /// (`on <pin>.falling`), then idle in WFI.  `every` is dispatched from
+    /// `SysTick_Handler` (§4.5); `on` events from `GPIOTE_IRQHandler` (§4.1).
+    ///
+    /// GPIOTE/NVIC register details are nRF-specific and live in this nRF52840
+    /// target (SIR stays neutral); SysTick/NVIC are at architectural SCS
+    /// addresses.  Modelling GPIOTE as a std device with full event routing is a
+    /// documented refinement.
+    fn emit_metal_startup(&mut self, module: &SirModule) {
+        const GPIOTE_BASE: u64 = 0x4000_6000;
+        const GPIOTE_IRQN: usize = 6;
+
+        let systick = match systick_plan(module) {
+            Ok(p) => p,
+            Err(e) => {
+                self.line(&format!("#error \"{}\"", e));
+                None
+            }
+        };
+
+        // Collect `on <pin>.falling` bindings → one GPIOTE channel per event.
+        // (channel, port_base, pin, hw_priority_byte, [reaction ids])
+        let mut events: Vec<(usize, u64, u8, u8, Vec<usize>)> = Vec::new();
+        for ev in &module.events {
+            let rs: Vec<usize> = module
+                .reactions
+                .iter()
+                .filter(|r| matches!(r.trigger, SirTrigger::Event(e) if e == ev.id))
+                .map(|r| r.id)
+                .collect();
+            if rs.is_empty() {
+                continue;
+            }
+            let prio = module
+                .reactions
+                .iter()
+                .filter(|r| rs.contains(&r.id))
+                .map(|r| r.priority)
+                .max()
+                .unwrap_or(self.max_priority);
+            let base = self.device_bases.get(&ev.device).copied().unwrap_or(0);
+            events.push((events.len(), base, ev.pin_index.unwrap_or(0), self.basepri_byte(prio), rs));
+        }
+
+        self.line("/* default handler for unused vectors */");
+        self.line("static void __default_handler(void) { for (;;) {} }");
+        self.line("void Reset_Handler(void);");
+
+        // Layer-3 fault decoder: address-ownership table + HardFault handler.
+        self.emit_fault_decoder(module);
+
+        // SysTick handler: software-prescaled per-reaction counters (§4.5).
+        if let Some(plan) = &systick {
+            self.emit_newline();
+            self.line("/* every -> SysTick dispatch (1ms base, per-reaction counters) */");
+            for (id, threshold) in &plan.thresholds {
+                self.line(&format!("static volatile uint32_t __systick_ctr_{} = {}U;", id, threshold));
+            }
+            self.line("void SysTick_Handler(void) {");
+            self.indent += 1;
+            for (id, threshold) in &plan.thresholds {
+                self.line(&format!("if (--__systick_ctr_{} == 0U) {{", id));
+                self.indent += 1;
+                self.line(&format!("__systick_ctr_{} = {}U;", id, threshold));
+                self.line(&format!("{}();", reaction_fn_name(*id)));
+                self.indent -= 1;
+                self.line("}");
+            }
+            self.indent -= 1;
+            self.line("}");
+        }
+
+        // GPIOTE handler: clear the channel event, dispatch the bound reactions.
+        if !events.is_empty() {
+            self.emit_newline();
+            self.line("/* on <pin>.falling -> GPIOTE IRQ dispatch (§4.1) */");
+            self.line("void GPIOTE_IRQHandler(void) {");
+            self.indent += 1;
+            for (ch, _base, _pin, _prio, rs) in &events {
+                let events_in = GPIOTE_BASE + 0x100 + 4 * (*ch as u64);
+                self.line(&format!("if (*(volatile uint32_t *)0x{:08x}UL != 0U) {{", events_in));
+                self.indent += 1;
+                self.line(&format!("*(volatile uint32_t *)0x{:08x}UL = 0U; /* clear EVENTS_IN[{}] */", events_in, ch));
+                for id in rs {
+                    self.line(&format!("{}();", reaction_fn_name(*id)));
+                }
+                self.indent -= 1;
+                self.line("}");
+            }
+            self.indent -= 1;
+            self.line("}");
+        }
+        self.emit_newline();
+
+        // Vector table: system exceptions + external IRQs up to the highest used.
+        self.line("/* Cortex-M vector table — placed at flash base by the linker (§6.4). */");
+        self.line("__attribute__((section(\".vectors\"), used))");
+        self.line("const void *const __vectors[] = {");
+        self.indent += 1;
+        let systick_entry = if systick.is_some() { "SysTick_Handler" } else { "__default_handler" };
+        let mut entries: Vec<(String, String)> = vec![
+            ("&_estack".into(), "0  initial SP".into()),
+            ("Reset_Handler".into(), "1  reset".into()),
+            ("__default_handler".into(), "2  NMI".into()),
+            ("HardFault_Handler".into(), "3  HardFault".into()),
+        ];
+        for i in 4..=10 {
+            entries.push(("0".into(), format!("{}  reserved", i)));
+        }
+        entries.push(("__default_handler".into(), "11 SVCall".into()));
+        entries.push(("0".into(), "12".into()));
+        entries.push(("0".into(), "13".into()));
+        entries.push(("__default_handler".into(), "14 PendSV".into()));
+        entries.push((systick_entry.into(), "15 SysTick".into()));
+        // External IRQs (index 16 + n).  Extend to GPIOTE if any events.
+        if !events.is_empty() {
+            for irq in 0..=GPIOTE_IRQN {
+                let (sym, note) = if irq == GPIOTE_IRQN {
+                    ("GPIOTE_IRQHandler".to_string(), format!("{} GPIOTE", 16 + irq))
+                } else {
+                    ("__default_handler".to_string(), format!("{} IRQ{}", 16 + irq, irq))
+                };
+                entries.push((sym, note));
+            }
+        }
+        for (sym, comment) in &entries {
+            let cast = if sym == "0" { "0".to_string() } else { format!("(void *)&{}", strip_amp(sym)) };
+            self.line(&format!("{:<28} /* {} */", format!("{},", cast), comment));
+        }
+        self.indent -= 1;
+        self.line("};");
+        self.emit_newline();
+
+        self.line("void Reset_Handler(void) {");
+        self.indent += 1;
+        self.line("/* copy .data (flash LMA -> RAM VMA) */");
+        self.line("uint32_t *src = &_sidata, *dst = &_sdata;");
+        self.line("while (dst < &_edata) { *dst++ = *src++; }");
+        self.line("/* zero .bss */");
+        self.line("for (dst = &_sbss; dst < &_ebss; ) { *dst++ = 0U; }");
+        self.emit_newline();
+
+        // Device init: output-pin directions (§6.4).
+        let outputs: Vec<&SirPin> = module.pins.iter().filter(|p| p.output).collect();
+        if !outputs.is_empty() {
+            self.line("/* configure output pin directions */");
+            for pin in outputs {
+                let place = SirPlace::Reg {
+                    device: pin.device,
+                    reg_offset: pin.dir_reg_offset,
+                    width: pin.dir_reg_width,
+                    field_mask: 1u64 << pin.index,
+                    field_shift: pin.index,
+                    access: SirRegAccess::Rw,
+                };
+                let value = SirExpr::Bool(true);
+                for l in self.emit_mmio_store(&place, &value) {
+                    self.line(&l);
+                }
+            }
+            self.emit_newline();
+        }
+
+        // Input pins with a pull resistor → PIN_CNF (nRF: 0x700 + 4*pin).
+        let pulls: Vec<&SirPin> = module.pins.iter().filter(|p| !p.output && p.pull_up).collect();
+        if !pulls.is_empty() {
+            self.line("/* configure input pins: connect buffer + pull-up (PIN_CNF) */");
+            for pin in pulls {
+                let base = self.device_bases.get(&pin.device).copied().unwrap_or(0);
+                let addr = base + 0x700 + 4 * pin.index as u64;
+                self.line(&format!(
+                    "*(volatile uint32_t *)0x{:08x}UL = 0xCUL; /* PIN_CNF[{}]: input, pull-up */",
+                    addr, pin.index
+                ));
+            }
+            self.emit_newline();
+        }
+
+        let sys_start: Vec<usize> = module
+            .reactions
+            .iter()
+            .filter(|r| matches!(r.trigger, SirTrigger::SysStart))
+            .map(|r| r.id)
+            .collect();
+        if !sys_start.is_empty() {
+            self.line("/* run sys.start reactions, in declaration order */");
+            for id in sys_start {
+                self.line(&format!("{}();", reaction_fn_name(id)));
+            }
+            self.emit_newline();
+        }
+
+        // Program SysTick (architectural system timer at the SCS, §4.5).
+        if let Some(plan) = &systick {
+            self.line("/* SysTick: 1ms base tick (§4.5) */");
+            self.line(&format!("*(volatile uint32_t *)0xE000E014UL = {}UL; /* SYST_RVR */", plan.reload));
+            self.line("*(volatile uint32_t *)0xE000E018UL = 0UL;        /* SYST_CVR */");
+            self.line("__DSB();");
+            self.line("*(volatile uint32_t *)0xE000E010UL = 0x7UL;      /* SYST_CSR: ENABLE|TICKINT|CLKSOURCE */");
+            // SysTick exception priority (SHPR3 byte [31:24]) for the ceiling (§5.5).
+            let sys_prio = systick_priority(module).map(|p| self.basepri_byte(p)).unwrap_or(0);
+            self.line(&format!("*(volatile uint8_t *)0xE000ED23UL = 0x{:02x}U; /* SysTick priority */", sys_prio));
+            self.emit_newline();
+        }
+
+        // Configure GPIOTE channels + NVIC for `on` events (§4.1, §5.5).
+        if !events.is_empty() {
+            self.line("/* GPIOTE channels (falling edge) + NVIC enable for `on` events */");
+            for (ch, base, pin, prio, _rs) in &events {
+                let cfg = GPIOTE_BASE + 0x510 + 4 * (*ch as u64);
+                let intenset = GPIOTE_BASE + 0x304;
+                // CONFIG: MODE=event(1) | PSEL(pin) | POLARITY=HiToLo(2).  Port 0
+                // for the slice's single GPIO instance (multi-port is a refinement).
+                let port = if *base == 0x5000_0300 { 1u64 } else { 0u64 };
+                let config = 1u64 | ((*pin as u64) << 8) | (port << 13) | (2u64 << 16);
+                self.line(&format!("*(volatile uint32_t *)0x{:08x}UL = 0x{:x}UL; /* GPIOTE CONFIG[{}] */", cfg, config, ch));
+                self.line(&format!("*(volatile uint32_t *)0x{:08x}UL = 0x{:x}UL; /* GPIOTE INTENSET IN[{}] */", intenset, 1u64 << ch, ch));
+                self.line(&format!("*(volatile uint8_t *)0x{:08x}UL = 0x{:02x}U; /* NVIC IPR IRQ{} priority */", 0xE000_E400u64 + GPIOTE_IRQN as u64, prio, GPIOTE_IRQN));
+            }
+            self.line(&format!("*(volatile uint32_t *)0xE000E100UL = 0x{:x}UL; /* NVIC ISER0: enable GPIOTE */", 1u64 << GPIOTE_IRQN));
+            self.emit_newline();
+        }
+
+        if systick.is_some() || !events.is_empty() {
+            self.line("__DSB();");
+            self.line("__asm__ volatile(\"cpsie i\"); /* enable interrupts */");
+            self.emit_newline();
+        }
+
+        self.line("for (;;) { __asm__ volatile(\"wfi\"); }");
+        self.indent -= 1;
+        self.line("}");
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     fn line(&mut self, s: &str) {
@@ -337,6 +771,12 @@ impl CBackend {
 
 fn reaction_fn_name(id: usize) -> String {
     format!("__reaction_{}", id)
+}
+
+/// Strip a leading `&` (vector-table symbols are pre-formatted with one for
+/// `_estack`; functions don't carry it).
+fn strip_amp(s: &str) -> &str {
+    s.strip_prefix('&').unwrap_or(s)
 }
 
 /// Does any statement in `stmts` (recursing into `Critical`/`If` bodies)
@@ -436,6 +876,153 @@ fn c_escape_bytes(bytes: &[u8]) -> String {
         }
     }
     s
+}
+
+// ─── Metal: linker script + RAM budget (§6.4, §5.3) ──────────────────────────
+
+/// Reserved stack budget (bytes).  Worst-case stack analysis (§5.3) is deferred;
+/// for now a fixed reservation is summed into the RAM-budget gate.
+pub const STACK_RESERVE: u64 = 2048;
+
+#[derive(Debug, Clone, Copy)]
+pub struct RamBudget {
+    pub statics: u64,
+    pub stack_reserve: u64,
+    pub ram_size: u64,
+}
+
+impl RamBudget {
+    pub fn used(&self) -> u64 {
+        self.statics + self.stack_reserve
+    }
+}
+
+/// Compute the static RAM footprint and check it against the RAM region
+/// (validation gate #1, §5.3).  No dynamic allocation exists in the language, so
+/// the total is `statics + reserved stack`; exceeding the region is an error.
+pub fn ram_budget(module: &SirModule) -> Result<RamBudget, String> {
+    let ram = module
+        .memory
+        .iter()
+        .find(|r| r.is_ram())
+        .ok_or("no RAM region found in board.soc.memory")?;
+    // Model the generated C layout conservatively: lay statics out in declaration
+    // order, aligning each to its natural alignment (so a u8 before a u64 incurs
+    // the padding the C compiler would), so the gate doesn't undercount.
+    let mut off = 0u64;
+    for v in &module.vars {
+        let size = v.ty.byte_size();
+        let align = size.max(1); // scalars: align == size (1/2/4/8); Bytes/ptr = 4
+        off = off.div_ceil(align) * align;
+        off += size;
+    }
+    let statics = off;
+    let budget = RamBudget { statics, stack_reserve: STACK_RESERVE, ram_size: ram.size };
+    if budget.used() > budget.ram_size {
+        return Err(format!(
+            "RAM budget exceeded: {} B (statics {} + stack {}) > {} B region '{}'",
+            budget.used(), statics, STACK_RESERVE, ram.size, ram.name
+        ));
+    }
+    Ok(budget)
+}
+
+// ─── Metal: `every` → SysTick plan (§4.5) ─────────────────────────────────────
+
+/// Default core clock for the nRF52840 if the board declares none.
+pub const NRF52840_CORE_HZ: u64 = 64_000_000;
+/// SysTick base period: a 1 ms tick, software-prescaled per reaction.  A single
+/// 24-bit SysTick cannot hold long periods directly (500 ms at 64 MHz overflows),
+/// so the handler counts base ticks per `every` reaction.
+pub const SYSTICK_BASE_NS: u64 = 1_000_000;
+
+#[derive(Debug, Clone)]
+pub struct SysTickPlan {
+    /// SysTick reload value (RVR): `core_hz * base_ns / 1e9 - 1`, must fit 24 bits.
+    pub reload: u64,
+    /// Per-`every`-reaction base-tick threshold: `(reaction_id, ticks)`.
+    pub thresholds: Vec<(usize, u64)>,
+}
+
+/// Plan the SysTick programming for the module's `every` reactions (§4.5).
+/// `Ok(None)` if there are no periodic reactions.  Errors if a period is not a
+/// whole base tick or the reload does not fit SysTick's 24-bit counter.
+pub fn systick_plan(module: &SirModule) -> Result<Option<SysTickPlan>, String> {
+    let everys: Vec<(usize, u64)> = module
+        .reactions
+        .iter()
+        .filter_map(|r| match r.trigger {
+            SirTrigger::EveryNs(ns) => Some((r.id, ns)),
+            _ => None,
+        })
+        .collect();
+    if everys.is_empty() {
+        return Ok(None);
+    }
+    let core_hz = if module.core_hz != 0 { module.core_hz } else { NRF52840_CORE_HZ };
+    let ticks_per_base = core_hz * SYSTICK_BASE_NS / 1_000_000_000;
+    if ticks_per_base == 0 {
+        return Err(format!("core clock {} Hz too slow for a {} ns SysTick base", core_hz, SYSTICK_BASE_NS));
+    }
+    let reload = ticks_per_base - 1;
+    if reload > 0x00FF_FFFF {
+        return Err(format!("SysTick reload {} exceeds 24 bits (core {} Hz)", reload, core_hz));
+    }
+    let mut thresholds = Vec::new();
+    for (id, ns) in everys {
+        if ns % SYSTICK_BASE_NS != 0 {
+            return Err(format!(
+                "`every` period {} ns is not a whole {} ns SysTick base tick",
+                ns, SYSTICK_BASE_NS
+            ));
+        }
+        thresholds.push((id, ns / SYSTICK_BASE_NS));
+    }
+    Ok(Some(SysTickPlan { reload, thresholds }))
+}
+
+/// The abstract priority of the module's periodic (`every`) reactions, used to
+/// set the SysTick exception priority for the ceiling protocol (§5.5).
+fn systick_priority(module: &SirModule) -> Option<u8> {
+    module
+        .reactions
+        .iter()
+        .filter(|r| matches!(r.trigger, SirTrigger::EveryNs(_)))
+        .map(|r| r.priority)
+        .max()
+}
+
+/// Generate the linker script from the board's memory regions (§6.4).
+pub fn emit_linker_script(module: &SirModule) -> Result<String, String> {
+    let flash = module
+        .memory
+        .iter()
+        .find(|r| !r.is_ram())
+        .ok_or("no flash/code region found in board.soc.memory")?;
+    let ram = module
+        .memory
+        .iter()
+        .find(|r| r.is_ram())
+        .ok_or("no RAM region found in board.soc.memory")?;
+
+    let mut s = String::new();
+    let _ = writeln!(s, "/* Generated by silicac from board.soc.memory (§6.4) — do not edit. */");
+    let _ = writeln!(s, "MEMORY");
+    let _ = writeln!(s, "{{");
+    let _ = writeln!(s, "  FLASH (rx) : ORIGIN = 0x{:08x}, LENGTH = {}", flash.origin, flash.size);
+    let _ = writeln!(s, "  RAM  (rwx) : ORIGIN = 0x{:08x}, LENGTH = {}", ram.origin, ram.size);
+    let _ = writeln!(s, "}}");
+    let _ = writeln!(s, "ENTRY(Reset_Handler)");
+    let _ = writeln!(s, "_estack = ORIGIN(RAM) + LENGTH(RAM);");
+    let _ = writeln!(s, "SECTIONS");
+    let _ = writeln!(s, "{{");
+    let _ = writeln!(s, "  .vectors : {{ KEEP(*(.vectors)) }} > FLASH");
+    let _ = writeln!(s, "  .text    : {{ *(.text*) *(.rodata*) }} > FLASH");
+    let _ = writeln!(s, "  _sidata = LOADADDR(.data);");
+    let _ = writeln!(s, "  .data : {{ _sdata = .; *(.data*) _edata = .; }} > RAM AT > FLASH");
+    let _ = writeln!(s, "  .bss  : {{ _sbss = .; *(.bss*) *(COMMON) _ebss = .; }} > RAM");
+    let _ = writeln!(s, "}}");
+    Ok(s)
 }
 
 #[cfg(test)]

@@ -1,0 +1,26 @@
+# Spike: GPIOTE falling-edge → NVIC IRQ → handler toggles LED1 (P0.13), driven
+# by injected button (sw0 = P0.11) presses.  Invoke via spike/run.sh.
+#
+# The button is accessed as `gpio0.sw0` (it is a child of gpio0, not a top-level
+# monitor name).  With Renode's button drive direction, the HiToLo (falling)
+# edge our GPIOTE channel watches lands on Release — so each Press+Release pair
+# yields exactly one LED toggle.  Sampling OUT bit 13 shows the toggle.
+
+mach create "dk"
+machine LoadPlatformDescription @platforms/boards/nrf52840dk_nrf52840.repl
+sysbus LoadELF $bin
+mach set "dk"
+
+emulation RunFor "0.01"
+sysbus ReadDoubleWord 0x50000504    # initial: LED off (bit13=1)
+gpio0.sw0 Press
+emulation RunFor "0.005"
+gpio0.sw0 Release
+emulation RunFor "0.005"
+sysbus ReadDoubleWord 0x50000504    # after press+release: LED on (bit13=0)
+gpio0.sw0 Press
+emulation RunFor "0.005"
+gpio0.sw0 Release
+emulation RunFor "0.005"
+sysbus ReadDoubleWord 0x50000504    # after 2nd cycle: LED off again (bit13=1)
+quit

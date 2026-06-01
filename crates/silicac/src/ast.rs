@@ -423,6 +423,8 @@ pub struct SimDef {
     /// The program this scenario drives.
     pub program: Ident,
     pub injections: Vec<Injection>,
+    /// `inject fault <addr> at <duration>` — Layer-3 hardware-fault injections.
+    pub faults: Vec<FaultInjection>,
     /// `run until <duration>` — virtual-time horizon.
     pub run_until: Option<Duration>,
     pub span: Span,
@@ -432,6 +434,15 @@ pub struct SimDef {
 #[derive(Debug, Clone)]
 pub struct Injection {
     pub event: EventRef,
+    pub at: Duration,
+    pub span: Span,
+}
+
+/// `inject fault <addr> at <duration>` — a simulated Layer-3 hardware fault to a
+/// memory address, decoded against the address-ownership map (§5.4).
+#[derive(Debug, Clone)]
+pub struct FaultInjection {
+    pub addr: u64,
     pub at: Duration,
     pub span: Span,
 }

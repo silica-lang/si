@@ -21,12 +21,14 @@ The full rationale, type system, execution model, and roadmap live in
 | [`docs/DESIGN.md`](docs/DESIGN.md) | The design document / spec. The source of truth. |
 | [`crates/silicac`](crates/silicac) | `silicac`, the Rust compiler (lexer → parser → resolver → SIR → consumers). |
 | [`crates/silicac/std`](crates/silicac/std) | The standard library: peripheral `device`s authored in `.si` (e.g. `gpio`, `timer`). |
-| [`examples`](examples) | Example `.si` programs. |
+| [`examples`](examples) | Example `.si` programs (host, sim, and nRF52840 metal). |
+| [`harness`](harness) | `metal_vs_sim.sh` — the on-metal (Renode) ≡ simulator validation gate. |
 
 ## What works today
 
 The compiler implements the **reactive-core vertical slice** (DESIGN.md §9.6): the canonical
-blink + button program runs in a **deterministic host simulator**.
+blink + button program runs **both** in a deterministic host simulator **and on real
+hardware** (nRF52840), from the same source.
 
 - **Language:** `program` / `board` / `soc` / `device` (`regs`/`config`/`needs`/`ops`/`emits`),
   typed pin bindings, `cell`, and the `on <event>` / `every <duration>` reactive model.
@@ -35,18 +37,28 @@ blink + button program runs in a **deterministic host simulator**.
   accesses**.
 - **Compiler-computed concurrency.** Two reactions sharing one `cell` get a
   priority-ceiling **critical section computed automatically** — no `disable_irq` in source
-  (§5.5). Single-owner cells are *proven* section-free.
+  (§5.5); on metal it lowers to real BASEPRI masking. Single-owner cells are *proven*
+  section-free.
 - **Static safety checks.** Binding two things to one physical pad is a **compile error**
-  (§3.3).
+  (§3.3); the static RAM budget is checked against the chip's memory (no dynamic allocation).
 - **A deterministic simulator** (§7.1): a virtual clock, scripted event injection, mock
   register side effects, and a structured trace — reproducible, no wall-clock dependence.
+- **On-metal codegen** (`--target metal-nrf52840`): generated linker script, vector table,
+  reset/startup, ordered MMIO with barriers, `every`→SysTick, and `on <pin>.falling`→GPIOTE/NVIC
+  — a freestanding image with no libc (§6.2/§6.4). The `harness/metal_vs_sim.sh` gate asserts
+  the metal LED sequence matches the simulator's (validated in Renode).
 
-SIR (Silica IR) is the contract (§6.1): the host simulator and the C backend are two
-*consumers* of the same IR, keeping a future LLVM / on-metal backend reachable.
+- **Layer-3 fault decoding** (§5.4): an address-ownership map (from the board) turns a
+  faulting address into a language-level diagnosis (*"no device claims this address"* /
+  *"within device `gpio0`"*). A `sim` block can `inject fault`, and the metal backend emits a
+  `HardFault_Handler` that decodes against the same map.
 
-Not yet built (deferred, not foreclosed — see DESIGN.md §10/§11): on-metal codegen
-(linker/vector/startup/MMIO), composed devices over buses (`i2c`/`spi`), the three-layer
-fault model, typed overlays, and the DTS→Silica fact importer.
+SIR (Silica IR) is the contract (§6.1): the host simulator and the C/metal backend are
+*consumers* of the same IR, keeping a future LLVM backend reachable.
+
+This completes the Phase-0 reactive core (DESIGN.md §11). Not yet built (deferred, not
+foreclosed — see §10/§11): composed devices over buses (`i2c`/`spi`), the Layer-3 *site map*
+(when-state-violation decode), typed overlays, and the DTS→Silica fact importer.
 
 ## Build & run
 
@@ -62,17 +74,20 @@ cargo run -- --sim examples/blink_button.si
 # Compile a host program to a native binary via the C backend
 cargo run -- examples/hello.si -o /tmp/hello && /tmp/hello
 
-# Emit C without compiling
-cargo run -- examples/hello.si --emit-c
+# Build a bare-metal nRF52840 image (needs arm-none-eabi-gcc)
+cargo run -- --target metal-nrf52840 examples/blink_button_nrf52840.si -o blink.elf
 
 # Run the test suite
 cargo test
+
+# End-to-end "sim ≡ metal" gate (needs arm-none-eabi-gcc + Renode)
+RENODE=/path/to/renode ./harness/metal_vs_sim.sh
 ```
 
 `silicac` usage:
 
 ```
-silicac <input.si> [-o <output>] [--emit-c] [--sim] [--cc <compiler>] [--std <dir>]
+silicac <input.si> [-o <output>] [--emit-c] [--sim] [--target host|metal-nrf52840] [--cc <compiler>] [--std <dir>]
 ```
 
 The standard-library devices are loaded from `crates/silicac/std` by default; override with

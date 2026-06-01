@@ -6,13 +6,14 @@
 //! Pipeline:
 //!   source → lex → parse → resolve → SIR → C backend → cc → binary
 
-use silicac::{backend, lexer, parser, resolver, sim};
+use silicac::backend::{self, Target};
+use silicac::{lexer, parser, resolver, sim};
 
 use std::path::{Path, PathBuf};
 use std::process;
 
 const USAGE: &str =
-    "usage: silicac <input.si> [-o <output>] [--emit-c] [--sim] [--cc <compiler>] [--std <dir>]";
+    "usage: silicac <input.si> [-o <output>] [--emit-c] [--sim] [--target host|metal-nrf52840] [--cc <compiler>] [--std <dir>]";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -38,7 +39,8 @@ struct Config {
     output: PathBuf,
     emit_c: bool,
     sim: bool,
-    cc: String,
+    target: Target,
+    cc: Option<String>,
     std_dir: PathBuf,
 }
 
@@ -48,7 +50,8 @@ impl Config {
         let mut output: Option<PathBuf> = None;
         let mut emit_c = false;
         let mut sim = false;
-        let mut cc = "cc".to_string();
+        let mut target = Target::Host;
+        let mut cc: Option<String> = None;
         let mut std_dir: Option<PathBuf> = None;
 
         let mut i = 0;
@@ -60,9 +63,17 @@ impl Config {
                 }
                 "--emit-c" => emit_c = true,
                 "--sim" => sim = true,
+                "--target" => {
+                    i += 1;
+                    target = match args.get(i).map(|s| s.as_str()) {
+                        Some("host") => Target::Host,
+                        Some("metal-nrf52840") => Target::MetalNrf52840,
+                        other => return Err(format!("unknown --target {:?} (host|metal-nrf52840)", other)),
+                    };
+                }
                 "--cc" => {
                     i += 1;
-                    cc = args.get(i).ok_or("--cc requires a value")?.clone();
+                    cc = Some(args.get(i).ok_or("--cc requires a value")?.clone());
                 }
                 "--std" => {
                     i += 1;
@@ -86,7 +97,7 @@ impl Config {
         });
         let std_dir = std_dir.unwrap_or_else(silicac::default_std_dir);
 
-        Ok(Config { input, output, emit_c, sim, cc, std_dir })
+        Ok(Config { input, output, emit_c, sim, target, cc, std_dir })
     }
 }
 
@@ -131,38 +142,61 @@ fn run(cfg: &Config) -> Result<(), String> {
         return Ok(());
     }
 
-    // ── 5b. C backend ──────────────────────────────────────────────────────────
-    let c_src = backend::c::CBackend::new().emit(&sir);
+    // ── 5b. RAM-budget gate (metal only, validation gate #1, §5.3) ─────────────
+    if cfg.target == Target::MetalNrf52840 {
+        let budget = backend::c::ram_budget(&sir)?;
+        eprintln!(
+            "silicac: RAM budget {} B used ({} statics + {} stack) of {} B",
+            budget.used(), budget.statics, budget.stack_reserve, budget.ram_size
+        );
+    }
 
-    // ── 6. Emit C or compile ──────────────────────────────────────────────────
+    // ── 5c. C backend (host or metal — both consume the same SIR, §6.1) ────────
+    let c_src = backend::c::CBackend::with_target(cfg.target).emit(&sir);
+    let cc = cfg.cc.clone().unwrap_or_else(|| cfg.target.default_cc().to_string());
+
+    // ── 6. Emit sources or compile ─────────────────────────────────────────────
     if cfg.emit_c {
-        // Just write the C source to <output>.c
         let c_path = cfg.output.with_extension("c");
         std::fs::write(&c_path, &c_src)
             .map_err(|e| format!("cannot write '{}': {}", c_path.display(), e))?;
         eprintln!("silicac: wrote C source to '{}'", c_path.display());
+        if cfg.target == Target::MetalNrf52840 {
+            let ld = backend::c::emit_linker_script(&sir)?;
+            let ld_path = cfg.output.with_extension("ld");
+            std::fs::write(&ld_path, ld)
+                .map_err(|e| format!("cannot write '{}': {}", ld_path.display(), e))?;
+            eprintln!("silicac: wrote linker script to '{}'", ld_path.display());
+        }
     } else {
-        // Write to a temp file, then invoke cc.
         let c_path = tmp_c_path(&cfg.input);
         std::fs::write(&c_path, &c_src)
             .map_err(|e| format!("cannot write temp file '{}': {}", c_path.display(), e))?;
 
-        let status = process::Command::new(&cfg.cc)
+        let mut cmd = process::Command::new(&cc);
+        for flag in cfg.target.cc_flags() {
+            cmd.arg(flag);
+        }
+        // Metal needs the generated linker script (§6.4); it must persist for
+        // the link, so write it next to the output.
+        let ld_path = cfg.output.with_extension("ld");
+        if cfg.target == Target::MetalNrf52840 {
+            let ld = backend::c::emit_linker_script(&sir)?;
+            std::fs::write(&ld_path, ld)
+                .map_err(|e| format!("cannot write '{}': {}", ld_path.display(), e))?;
+            cmd.arg("-T").arg(&ld_path);
+        }
+        let status = cmd
             .arg("-o")
             .arg(&cfg.output)
             .arg(&c_path)
             .status()
-            .map_err(|e| format!("cannot run '{}': {}", cfg.cc, e))?;
+            .map_err(|e| format!("cannot run '{}': {}", cc, e))?;
 
-        // Clean up the temp file regardless of cc outcome.
         let _ = std::fs::remove_file(&c_path);
 
         if !status.success() {
-            return Err(format!(
-                "C compiler '{}' exited with status {}",
-                cfg.cc,
-                status.code().unwrap_or(-1)
-            ));
+            return Err(format!("C compiler '{}' exited with status {}", cc, status.code().unwrap_or(-1)));
         }
         eprintln!("silicac: compiled '{}' → '{}'", cfg.input.display(), cfg.output.display());
     }

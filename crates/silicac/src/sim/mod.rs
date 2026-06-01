@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 
+use crate::layer3;
 use crate::sir::*;
 
 // ─── Trace records (§11/D13 — structured, text rendered host-side) ──────────────
@@ -38,6 +39,9 @@ pub enum TraceKind {
     CriticalExit,
     /// `host_io.print(...)`.
     Print { text: String },
+    /// A decoded Layer-3 hardware fault (§5.4): the faulting address and the
+    /// language-level diagnosis from the address-ownership map.
+    Fault { address: u64, diagnosis: String },
 }
 
 #[derive(Debug, Default)]
@@ -83,6 +87,9 @@ impl SimResult {
                 TraceKind::Print { text } => {
                     format!("[{:>8.3}ms]   print {:?}", ms, text)
                 }
+                TraceKind::Fault { address, diagnosis } => {
+                    format!("[{:>8.3}ms] FAULT (layer 3): {} (addr 0x{:08x})", ms, diagnosis, address)
+                }
             };
             out.push_str(&line);
             out.push('\n');
@@ -99,6 +106,8 @@ enum Payload {
     TimerTick { reaction: usize, period_ns: u64 },
     /// A scripted event injection (§7.1).
     Inject { event: usize },
+    /// A scripted Layer-3 fault injection (§5.4).
+    Fault { addr: u64 },
 }
 
 struct QItem {
@@ -182,6 +191,11 @@ impl<'m> Sim<'m> {
             });
             seq += 1;
         }
+        for f in &self.module.fault_injections {
+            // Faults are highest-priority so they order first among same-time events.
+            queue.push(QItem { at_ns: f.at_ns, priority: u8::MAX, seq, payload: Payload::Fault { addr: f.addr } });
+            seq += 1;
+        }
 
         let horizon = self.module.run_until_ns.unwrap_or(u64::MAX);
 
@@ -226,6 +240,14 @@ impl<'m> Sim<'m> {
                     for idx in bound {
                         self.fire(idx);
                     }
+                }
+                Payload::Fault { addr } => {
+                    // Layer-3 decode against the address-ownership map (§5.4).
+                    let decoded = layer3::decode_address(self.module, addr);
+                    self.trace.push(TraceRecord {
+                        at_ns: self.now,
+                        kind: TraceKind::Fault { address: addr, diagnosis: decoded.diagnosis },
+                    });
                 }
             }
         }

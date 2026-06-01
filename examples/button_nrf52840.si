@@ -1,0 +1,43 @@
+// Button-only nRF52840 example — isolates the `on <pin>.falling` → GPIOTE/NVIC
+// path (no timer).  Each button press toggles the LED.
+//
+//   silicac --target metal-nrf52840 examples/button_nrf52840.si -o button.elf
+
+board nrf52840_dk {
+  soc nrf52840 {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+
+  gpio0 : nrf_gpio at 0x5000_0000
+
+  led_user : nrf_gpio.pin = gpio0.pin(13) as output
+  btn_user : nrf_gpio.pin = gpio0.pin(11) as input pulling up
+}
+
+program button {
+  use board nrf52840_dk as dev
+
+  let led    = dev.led_user
+  let button = dev.btn_user
+
+  cell state : bool = false
+
+  on sys.start {
+    led.set(false)
+  }
+
+  on button.falling {
+    state = not state
+    led.set(state)
+  }
+}
+
+sim button_demo for button {
+  inject btn_user.falling at 100ms
+  inject btn_user.falling at 200ms
+  run until 300ms
+}
