@@ -48,12 +48,17 @@ hardware** (nRF52840), from the same source.
   — a freestanding image with no libc (§6.2/§6.4). The `harness/metal_vs_sim.sh` gate asserts
   the metal LED sequence matches the simulator's (validated in Renode).
 
+- **Layer-3 fault decoding** (§5.4): an address-ownership map (from the board) turns a
+  faulting address into a language-level diagnosis (*"no device claims this address"* /
+  *"within device `gpio0`"*). A `sim` block can `inject fault`, and the metal backend emits a
+  `HardFault_Handler` that decodes against the same map.
+
 SIR (Silica IR) is the contract (§6.1): the host simulator and the C/metal backend are
 *consumers* of the same IR, keeping a future LLVM backend reachable.
 
-Not yet built (deferred, not foreclosed — see DESIGN.md §10/§11): the Layer-3 fault decoder
-(§5.4), composed devices over buses (`i2c`/`spi`), typed overlays, and the DTS→Silica fact
-importer.
+This completes the Phase-0 reactive core (DESIGN.md §11). Not yet built (deferred, not
+foreclosed — see §10/§11): composed devices over buses (`i2c`/`spi`), the Layer-3 *site map*
+(when-state-violation decode), typed overlays, and the DTS→Silica fact importer.
 
 ## Build & run
 

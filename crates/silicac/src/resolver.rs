@@ -105,6 +105,7 @@ pub struct Resolver {
     events: Vec<SirEvent>,
     cells: Vec<CellInfo>,
     injections: Vec<SirInjection>,
+    fault_injections: Vec<SirFaultInjection>,
     run_until_ns: Option<u64>,
     memory: Vec<SirRegion>,
     pins: Vec<SirPin>,
@@ -135,6 +136,7 @@ impl Resolver {
             events: Vec::new(),
             cells: Vec::new(),
             injections: Vec::new(),
+            fault_injections: Vec::new(),
             run_until_ns: None,
             memory: Vec::new(),
             pins: Vec::new(),
@@ -188,6 +190,7 @@ impl Resolver {
                 events: self.events,
                 cells: self.cells,
                 injections: self.injections,
+                fault_injections: self.fault_injections,
                 run_until_ns: self.run_until_ns,
                 memory: self.memory,
                 pins: self.pins,
@@ -939,6 +942,9 @@ impl Resolver {
             if let Some(ev) = self.resolve_pin_event(&pin, &inj.event.event.name, inj.span) {
                 self.injections.push(SirInjection { at_ns: inj.at.to_ns(), event: ev });
             }
+        }
+        for f in &sim.faults {
+            self.fault_injections.push(SirFaultInjection { at_ns: f.at.to_ns(), addr: f.addr });
         }
         if let Some(d) = sim.run_until {
             self.run_until_ns = Some(d.to_ns());

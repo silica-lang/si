@@ -1121,6 +1121,7 @@ impl Parser {
         let program = self.eat_ident()?;
         self.eat(&Token::LBrace)?;
         let mut injections = Vec::new();
+        let mut faults = Vec::new();
         let mut run_until = None;
         while self.peek() != Some(&Token::RBrace) {
             if self.at_end() {
@@ -1130,13 +1131,23 @@ impl Parser {
                 Some(Token::Ident(s)) if s == "inject" => {
                     let istart = self.current_span().start;
                     self.advance();
-                    let event = self.parse_event_ref()?;
-                    // `at <duration>`
-                    self.eat(&Token::KwAt)?;
-                    let at = self.parse_duration()?;
-                    self.eat_optional_semi();
-                    let iend = self.prev_span().end;
-                    injections.push(Injection { event, at, span: Span::new(istart, iend) });
+                    // `inject fault <addr> at <dur>` vs `inject <event> at <dur>`.
+                    if self.peek() == Some(&Token::KwFault) {
+                        self.advance();
+                        let addr = self.expect_int_lit()?;
+                        self.eat(&Token::KwAt)?;
+                        let at = self.parse_duration()?;
+                        self.eat_optional_semi();
+                        let iend = self.prev_span().end;
+                        faults.push(FaultInjection { addr, at, span: Span::new(istart, iend) });
+                    } else {
+                        let event = self.parse_event_ref()?;
+                        self.eat(&Token::KwAt)?;
+                        let at = self.parse_duration()?;
+                        self.eat_optional_semi();
+                        let iend = self.prev_span().end;
+                        injections.push(Injection { event, at, span: Span::new(istart, iend) });
+                    }
                 }
                 Some(Token::Ident(s)) if s == "run" => {
                     self.advance();
@@ -1161,7 +1172,7 @@ impl Parser {
         }
         let end = self.current_span().end;
         self.eat(&Token::RBrace)?;
-        Ok(SimDef { name, program, injections, run_until, span: Span::new(start, end) })
+        Ok(SimDef { name, program, injections, faults, run_until, span: Span::new(start, end) })
     }
 
     // ── Block & statements ──────────────────────────────────────────────────
@@ -1776,6 +1787,25 @@ sim blink_demo for blink {
             assert_eq!(s.injections[0].event.event.name, "falling");
             assert_eq!(s.injections[0].at.to_ns(), 1_200_000_000);
             assert_eq!(s.run_until.unwrap().to_ns(), 3_000_000_000);
+            assert!(s.faults.is_empty());
+        } else {
+            panic!("expected sim");
+        }
+    }
+
+    #[test]
+    fn sim_fault_injection_parses() {
+        let src = r#"
+sim s for p {
+    inject fault 0x4001_0000 at 800ms
+    run until 1000ms
+}
+"#;
+        let m = parse_src(src);
+        if let Item::Sim(s) = &m.items[0] {
+            assert_eq!(s.faults.len(), 1);
+            assert_eq!(s.faults[0].addr, 0x4001_0000);
+            assert_eq!(s.faults[0].at.to_ns(), 800_000_000);
         } else {
             panic!("expected sim");
         }

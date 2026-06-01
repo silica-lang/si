@@ -29,6 +29,8 @@ pub struct SirModule {
     pub cells: Vec<CellInfo>,
     /// Scripted event injections from a `sim` block (§7.1).
     pub injections: Vec<SirInjection>,
+    /// Scripted Layer-3 fault injections from a `sim` block (§5.4).
+    pub fault_injections: Vec<SirFaultInjection>,
     /// Virtual-time horizon from `run until <dur>` (None ⇒ run until idle).
     pub run_until_ns: Option<u64>,
     /// SoC memory regions (flash/RAM), for the generated linker script (§6.4).
@@ -153,6 +155,14 @@ pub struct SirEvent {
 pub struct SirInjection {
     pub at_ns: u64,
     pub event: usize,
+}
+
+/// A scripted Layer-3 hardware-fault injection (§5.4): a fault to `addr` at a
+/// virtual time, decoded against the address-ownership map.
+#[derive(Debug)]
+pub struct SirFaultInjection {
+    pub at_ns: u64,
+    pub addr: u64,
 }
 
 // ─── Cell concurrency analysis (§5.5) ────────────────────────────────────────

@@ -178,8 +178,36 @@ note below.
 3. **Toolchain availability** — `arm-none-eabi-gcc` and Renode (with the nRF52840 model) must be
    present in dev/CI; to be confirmed and documented.
 
-## Explicitly out of scope (remaining ~5% of Phase 0)
+## Layer-3 fault decoder (§4.4/§5.4) — done
 
-The **Layer-3 forced-fault → decoded-trace** success criterion (§5.4). A minimal
-`HardFault_Handler` emitting a trace marker is cheap to add here, but the full graph-aware
-fault decoder (address-ownership + site maps) is a separate increment.
+The final Phase-0 item. A shared **address-ownership map** (`crate::layer3`)
+computed from the board — each device's MMIO span + the flash/RAM regions — turns
+a faulting address into a language-level diagnosis (*"no device claims this
+address"* / *"within device `gpio0` …"*).
+
+- **Simulator (primary):** a `sim` block can `inject fault <addr> at <dur>`; the
+  interpreter decodes each against the ownership map and emits a structured
+  `Fault` trace record. This satisfies the §11 "forced fault → decoded trace
+  record" criterion and is where §7.2 says the decoder lives. Covered by
+  `tests/sim_fault_decode.rs` and `examples/fault_nrf52840.si`.
+- **Metal:** the backend emits the ownership table (indices, no on-device
+  strings — §4.3) + a `HardFault_Handler` (vector #3) that reads SCB BFAR, scans
+  the table, and records `{addr, owner, pending}` to fixed RAM for the host to
+  render. Covered by a hermetic codegen test; the handler was verified to execute
+  and scan the table on the Renode CPU. **Live forced-fault decode is limited by
+  Renode**, which tolerates unmapped accesses (no bus fault raised) and exposes
+  BFAR read-only — an emulator constraint, not a compiler one; on real silicon the
+  precise bus fault populates BFAR.
+
+The **site map** (PC→handler/op/when-state) half of §5.4 — for *"handler X touched
+device Y outside its valid when state"* — remains a later increment (it needs
+per-site debug info and enforced typestate).
+
+## Phase 0 status
+
+All §11 deliverables and the three validation-matrix gates are met; the §9.6
+success criteria — identical program in sim and on metal, LED blinks, button
+shares a cell without a manual critical section, and a forced fault shows up as a
+decoded trace record — are demonstrated. Remaining refinements (timer-as-device
+wiring, GPIOTE/NVIC as std devices, the Layer-3 site map, multi-port GPIO) are
+documented inline and are additive, not foreclosed.

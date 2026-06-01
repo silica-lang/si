@@ -238,6 +238,22 @@ fn shared_cell_critical_lowers_to_basepri_ceiling() {
 }
 
 #[test]
+fn metal_emits_layer3_fault_decoder() {
+    // The metal target emits the address-ownership table + a HardFault handler
+    // that reads BFAR and records the decoded owner (§5.4).
+    let sir = compile(BLINK_BTN);
+    let src = c::CBackend::with_target(Target::MetalNrf52840).emit(&sir);
+
+    assert!(src.contains("void HardFault_Handler(void)"));
+    assert!(src.contains("3  HardFault") && src.contains("(void *)&HardFault_Handler"), "vector entry");
+    assert!(src.contains("__owner_start") && src.contains("__owner_end"), "ownership table");
+    assert!(src.contains("0xE000ED38UL"), "reads SCB BFAR");
+    assert!(src.contains("__fault_addr") && src.contains("__fault_owner"), "fault record");
+    // gpio0's MMIO region is in the table (base 0x5000_0000).
+    assert!(src.contains("0x50000000U"), "device region in ownership map");
+}
+
+#[test]
 fn host_target_still_emits_hosted_main() {
     // The host path is unchanged: it still produces a libc `main`, proving the
     // target switch did not regress the existing consumer.
