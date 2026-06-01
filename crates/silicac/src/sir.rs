@@ -45,6 +45,11 @@ pub struct SirModule {
     /// Core clock in Hz (from `board.soc.clocks`), for lowering `every` periods
     /// to timer ticks (§4.5).  0 if unknown.
     pub core_hz: u64,
+    /// Hardware watchdog timeout in ns (§5.6/SIL-006), if the board declares one.
+    pub watchdog_timeout_ns: Option<u64>,
+    /// Number of bus transactions to *hang* (wedged bus, never complete); from
+    /// `inject bus_hang times <n>`.
+    pub bus_hangs: u32,
 }
 
 /// A board pin binding (`led_user : gpio.pin = gpio_a.pin(5) as output`),

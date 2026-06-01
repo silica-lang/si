@@ -1,0 +1,31 @@
+// Scheduler-fed hardware watchdog (§5.6/SIL-006).  The scheduler feeds the
+// watchdog only on a clean return to idle; if a reaction hangs (here the I²C bus
+// wedges mid-transaction and never completes), it never returns to idle, starves
+// the watchdog, and the hardware resets — the backstop a software fault decoder
+// alone cannot provide.
+//
+//   silicac --sim examples/watchdog.si
+
+board rig {
+  soc s {
+    memory { flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+  i2c0 : i2c_controller at 0x4000_3000 { needs { clock = soc.sysclk } }
+  env  : bme280 { needs { bus = i2c0 } }
+  wdt0 : wdt at 0x4001_0000 { config { timeout = 100ms } }
+}
+
+program app {
+  use board rig as r
+  let sensor = r.env
+
+  every 1000ms {
+    let t = sensor.read_temp()?   // if the bus wedges here, the watchdog saves us
+  }
+}
+
+sim app_sim for app {
+  inject bus_hang times 1   // the first transfer never completes
+  run until 1500ms
+}
