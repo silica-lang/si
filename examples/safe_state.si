@@ -1,0 +1,48 @@
+// Safe-state demo (§5.6): when a sensor read faults with no recovery, the
+// `safe` disposition drives every device to its declared safe state.  Here a
+// motor (energized at boot) is driven `off` when the control loop's sensor read
+// NAKs — its own bounded, non-yielding `safe` op writes the de-energize bit.
+//
+//   silicac --sim examples/safe_state.si
+
+device motor {
+  regs {
+    CTRL : reg32 at 0x00 access rw { enable: bit[0] }
+  }
+  states { running, off }
+  safe_state = off
+  ops {
+    op run()  -> () { CTRL.enable = 1 }
+    op safe() -> () { CTRL.enable = 0 }   // de-energize (non-yielding, bounded)
+  }
+}
+
+board rig {
+  soc s {
+    memory { flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+  i2c0   : i2c_controller at 0x4000_3000 { needs { clock = soc.sysclk } }
+  env    : bme280 { needs { bus = i2c0 } }
+  motor0 : motor at 0x5001_0000
+}
+
+program ctrl {
+  use board rig as r
+
+  let sensor = r.env
+  let m      = r.motor0
+
+  on sys.start {
+    m.run()           // energize
+  }
+
+  every 1000ms on fault safe {
+    let t = sensor.read_temp()?   // a fault here drives everything safe
+  }
+}
+
+sim ctrl_sim for ctrl {
+  inject bus_fault nak times 1    // unrecoverable (disposition is `safe`, not retry)
+  run until 1500ms
+}

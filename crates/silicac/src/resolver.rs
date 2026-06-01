@@ -45,6 +45,9 @@ enum Binding {
     /// A board device-instance alias (`let sensor = board.env`) — for composed
     /// devices whose ops are called (`sensor.read_temp()`).
     Device(InstanceRef),
+    /// A device register, in scope inside that device's own op bodies (leaf
+    /// MMIO): `OUT = 0` / `OUT.enable = 0` lowers to a `SirPlace::Reg`.
+    Reg(RegInfo),
     /// A `use` alias pointing to another name.
     #[allow(dead_code)]
     Alias(Vec<String>),
@@ -55,6 +58,18 @@ enum Binding {
 struct InstanceRef {
     device: usize,
     ty: String,
+}
+
+/// A device register (+ its fields), for lowering register references inside the
+/// device's own op bodies to `SirPlace::Reg`.
+#[derive(Debug, Clone)]
+struct RegInfo {
+    device: usize,
+    offset: u64,
+    width: u8,
+    access: SirRegAccess,
+    /// field name → (mask, shift).
+    fields: HashMap<String, (u64, u8)>,
 }
 
 /// What a device instance's `needs` relation resolves to.
@@ -137,6 +152,7 @@ pub struct Resolver {
     injections: Vec<SirInjection>,
     fault_injections: Vec<SirFaultInjection>,
     bus_fault_queue: Vec<String>,
+    safe_seqs: Vec<SafeSeq>,
     run_until_ns: Option<u64>,
     memory: Vec<SirRegion>,
     pins: Vec<SirPin>,
@@ -176,6 +192,7 @@ impl Resolver {
             injections: Vec::new(),
             fault_injections: Vec::new(),
             bus_fault_queue: Vec::new(),
+            safe_seqs: Vec::new(),
             run_until_ns: None,
             memory: Vec::new(),
             pins: Vec::new(),
@@ -242,6 +259,7 @@ impl Resolver {
                 injections: self.injections,
                 fault_injections: self.fault_injections,
                 bus_fault_queue: self.bus_fault_queue,
+                safe_seqs: self.safe_seqs,
                 run_until_ns: self.run_until_ns,
                 memory: self.memory,
                 pins: self.pins,
@@ -479,6 +497,13 @@ impl Resolver {
             self.instance_needs.insert(dev_id, resolved);
         }
 
+        // Lower each instance's safe op (§5.6), if its type declares one.
+        for (_, inst) in instances.iter() {
+            if let Some(seq) = self.lower_safe_seq(inst.device, &inst.ty) {
+                self.safe_seqs.push(seq);
+            }
+        }
+
         // Pin bindings — with duplicate physical-pad detection (§3.3).
         let mut pad_owner: HashMap<(String, u64), (String, Span)> = HashMap::new();
         let mut claim_pad = |errs: &mut Vec<Diag>, port: &str, index: u64, owner: &str, span: Span| {
@@ -594,6 +619,28 @@ impl Resolver {
         let yields = body_yields(&body);
         let disposition = lower_disposition(&r.fault_disp);
         Some(SirReaction { id, trigger, body, priority, disposition, yields })
+    }
+
+    /// Build the register bindings for a device type (its `regs` + fields), to
+    /// be put in scope inside that device's own op bodies (leaf MMIO).
+    fn reg_infos(&self, device: usize, ty: &str) -> HashMap<String, RegInfo> {
+        let mut m = HashMap::new();
+        if let Some(def) = self.device_defs.get(ty) {
+            if let Some(rs) = &def.sections.regs {
+                for r in &rs.regs {
+                    let fields = r
+                        .fields
+                        .iter()
+                        .map(|f| (f.name.name.clone(), bitspec_mask_shift(f.bits)))
+                        .collect();
+                    m.insert(
+                        r.name.name.clone(),
+                        RegInfo { device, offset: r.offset, width: r.width, access: map_access(r.access), fields },
+                    );
+                }
+            }
+        }
+        m
     }
 
     /// The union of all fault codes declared by any op (interface or device),
@@ -940,6 +987,10 @@ impl Resolver {
                 }
             }
         }
+        // The device's own registers are in scope inside its op bodies (leaf MMIO).
+        for (name, ri) in self.reg_infos(inst.device, &inst.ty) {
+            inner.insert(&name, Binding::Reg(ri));
+        }
         let result = self.fresh("r");
         out.push(SirStmt::Assign { target: SirPlace::Var(result.clone()), value: SirExpr::U64(0) });
         self.op_result.push(result.clone());
@@ -954,6 +1005,36 @@ impl Resolver {
         let n = self.tmp_counter;
         self.tmp_counter += 1;
         format!("__{}{}", prefix, n)
+    }
+
+    /// Lower a device instance's `safe` op (§5.6) into a statement sequence, with
+    /// the device's registers + needs in scope.  Returns `None` if the device
+    /// declares no `safe_state` / `safe` op.  A safe op must be **non-yielding**
+    /// (it must not depend on the scheduler it may be escaping).
+    fn lower_safe_seq(&mut self, device: usize, ty: &str) -> Option<SafeSeq> {
+        let def = self.device_defs.get(ty)?.clone();
+        let state = def.sections.safe_state.as_ref()?.name.clone();
+        let op = self.find_op(ty, "safe").cloned()?;
+        if op.yields {
+            self.err(op.span, "a `safe` op may not yield (§5.6: it must not depend on the scheduler)");
+            return None;
+        }
+        let mut inner = Scope::new();
+        for (name, ri) in self.reg_infos(device, ty) {
+            inner.insert(&name, Binding::Reg(ri));
+        }
+        if let Some(needs) = self.instance_needs.get(&device).cloned() {
+            for (name, val) in needs {
+                if let NeedVal::Device(r) = val {
+                    inner.insert(&name, Binding::Device(r));
+                }
+            }
+        }
+        let mut body = Vec::new();
+        for stmt in &op.body.stmts {
+            self.lower_stmt(stmt, &mut inner, &[], &mut body);
+        }
+        Some(SafeSeq { device, state, body })
     }
 
     /// Lower a pin op call (`led.set(x)`) to a register access (§6.5).
@@ -1056,11 +1137,27 @@ impl Resolver {
             ExprKind::StringLit(s) => SirExpr::Bytes(s.as_bytes().to_vec()),
             ExprKind::Ident(ident) => match scope.lookup(&ident.name) {
                 Some(Binding::Local(name, _)) | Some(Binding::Cell(name, _)) => SirExpr::Load(name.clone()),
+                // Whole-register read inside an op body.
+                Some(Binding::Reg(ri)) => reg_load(ri, full_mask(ri.width), 0),
                 _ => {
                     self.err(ident.span, format!("undefined variable '{}'", ident.name));
                     SirExpr::Load(ident.name.clone())
                 }
             },
+            // `REG.field` read inside an op body.
+            ExprKind::Field(base, field) => {
+                if let ExprKind::Ident(reg) = &base.kind {
+                    if let Some(Binding::Reg(ri)) = scope.lookup(&reg.name) {
+                        if let Some(&(mask, shift)) = ri.fields.get(&field.name) {
+                            return reg_load(ri, mask, shift);
+                        }
+                        self.err(field.span, format!("register '{}' has no field '{}'", reg.name, field.name));
+                        return SirExpr::U64(0);
+                    }
+                }
+                self.err(expr.span, "field expression not supported as a value here");
+                SirExpr::U64(0)
+            }
             ExprKind::Not(inner) => SirExpr::Not(Box::new(self.lower_expr(inner, scope))),
             ExprKind::BinOp { op, lhs, rhs } => {
                 let l = self.lower_expr(lhs, scope);
@@ -1117,10 +1214,6 @@ impl Resolver {
                 self.err(expr.span, "call/field expression not supported as a value here");
                 SirExpr::U64(0)
             }
-            ExprKind::Field(_, _) => {
-                self.err(expr.span, "field expression not supported as a value here");
-                SirExpr::U64(0)
-            }
         }
     }
 
@@ -1130,11 +1223,27 @@ impl Resolver {
                 Some(Binding::Local(name, _)) | Some(Binding::Cell(name, _)) => {
                     Some(SirPlace::Var(name.clone()))
                 }
+                // `REG = expr` — a whole-register write inside an op body.
+                Some(Binding::Reg(ri)) => Some(reg_place(ri, full_mask(ri.width), 0)),
                 _ => {
                     self.err(ident.span, format!("'{}' is not assignable", ident.name));
                     None
                 }
             },
+            // `REG.field = expr` — a register field write.
+            ExprKind::Field(base, field) => {
+                if let ExprKind::Ident(reg) = &base.kind {
+                    if let Some(Binding::Reg(ri)) = scope.lookup(&reg.name) {
+                        if let Some(&(mask, shift)) = ri.fields.get(&field.name) {
+                            return Some(reg_place(ri, mask, shift));
+                        }
+                        self.err(field.span, format!("register '{}' has no field '{}'", reg.name, field.name));
+                        return None;
+                    }
+                }
+                self.err(expr.span, "expected an assignable place");
+                None
+            }
             _ => {
                 self.err(expr.span, "expected an assignable place (variable name)");
                 None
@@ -1305,6 +1414,41 @@ impl Resolver {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Mask + shift for a register field bit-spec.
+fn bitspec_mask_shift(b: BitSpec) -> (u64, u8) {
+    match b {
+        BitSpec::Bit(n) => (1u64 << n, n),
+        BitSpec::Range(hi, lo) => ((((1u64 << (hi - lo + 1)) - 1) << lo), lo),
+    }
+}
+
+/// Full-width mask for a register of the given bit width.
+fn full_mask(width: u8) -> u64 {
+    if width >= 64 { u64::MAX } else { (1u64 << width) - 1 }
+}
+
+fn reg_place(ri: &RegInfo, mask: u64, shift: u8) -> SirPlace {
+    SirPlace::Reg {
+        device: ri.device,
+        reg_offset: ri.offset,
+        width: ri.width,
+        field_mask: mask,
+        field_shift: shift,
+        access: ri.access,
+    }
+}
+
+fn reg_load(ri: &RegInfo, mask: u64, shift: u8) -> SirExpr {
+    SirExpr::RegLoad {
+        device: ri.device,
+        reg_offset: ri.offset,
+        width: ri.width,
+        field_mask: mask,
+        field_shift: shift,
+        access: ri.access,
+    }
+}
 
 fn map_access(a: RegAccess) -> SirRegAccess {
     match a {

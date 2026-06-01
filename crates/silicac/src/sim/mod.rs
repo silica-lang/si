@@ -51,6 +51,8 @@ pub enum TraceKind {
     Dispose { reaction: usize, action: String },
     /// A re-fire was coalesced because the reaction was still in-flight (§5.1).
     Coalesced { reaction: usize },
+    /// A device was driven to its safe state on an unrecovered fault (§5.6).
+    SafeState { device: usize, state: String },
 }
 
 #[derive(Debug, Default)]
@@ -111,6 +113,9 @@ impl SimResult {
                 }
                 TraceKind::Coalesced { reaction } => {
                     format!("[{:>8.3}ms]   reaction#{} re-fire coalesced (in-flight, §5.1)", ms, reaction)
+                }
+                TraceKind::SafeState { device, state } => {
+                    format!("[{:>8.3}ms]   SAFE-STATE: {} -> {} (§5.6)", ms, name_of(*device), state)
                 }
             };
             out.push_str(&line);
@@ -434,8 +439,16 @@ impl<'m> Sim<'m> {
                 });
                 self.in_flight[act.reaction] = false;
             }
+            SirDisposition::Safe => {
+                self.trace.push(TraceRecord {
+                    at_ns: self.now,
+                    kind: TraceKind::Dispose { reaction: act.reaction, action: format!("safe ({})", code) },
+                });
+                self.in_flight[act.reaction] = false;
+                self.drive_safe();
+            }
             _ => {
-                // Escalate / Safe / retry-exhausted → Layer-3.
+                // Escalate / retry-exhausted → Layer-3.
                 self.trace.push(TraceRecord {
                     at_ns: self.now,
                     kind: TraceKind::Dispose { reaction: act.reaction, action: format!("escalate ({})", code) },
@@ -443,6 +456,24 @@ impl<'m> Sim<'m> {
                 self.in_flight[act.reaction] = false;
             }
         }
+    }
+
+    /// Drive every device with a declared safe op to its safe state (§5.6) and
+    /// hold.  Each safe sequence is bounded, non-yielding register writes.
+    fn drive_safe(&mut self) {
+        let module = self.module;
+        for seq in &module.safe_seqs {
+            let mut frame = HashMap::new();
+            for stmt in &seq.body {
+                self.eval_stmt(stmt, &mut frame);
+            }
+            self.trace.push(TraceRecord {
+                at_ns: self.now,
+                kind: TraceKind::SafeState { device: seq.device, state: seq.state.clone() },
+            });
+        }
+        // Post-safe policy: hold (the system is now in a safe state).
+        self.stop = true;
     }
 
     /// The mock bus model (§7.1): a fixed latency + either the fault at the head

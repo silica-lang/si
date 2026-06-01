@@ -445,7 +445,15 @@ impl Parser {
     fn parse_op_decl(&mut self) -> Result<OpDecl, ParseError> {
         let start = self.current_span().start;
         self.eat(&Token::KwOp)?;
-        let name = self.eat_ident()?;
+        // `safe` is the conventional safe-op name (§5.6) but also a keyword
+        // (the `safe` fault disposition); accept it as an op name here.
+        let name = if self.peek() == Some(&Token::KwSafe) {
+            let span = self.current_span();
+            self.advance();
+            Ident::new("safe", span)
+        } else {
+            self.eat_ident()?
+        };
         self.eat(&Token::LParen)?;
         let params = self.parse_params()?;
         self.eat(&Token::RParen)?;
