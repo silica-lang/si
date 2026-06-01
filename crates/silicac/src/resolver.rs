@@ -507,25 +507,35 @@ impl Resolver {
         // Identify the system watchdog (§5.6/SIL-006): the instance whose device
         // implements the `watchdog` interface (structural, not by name — §2).
         // Its `timeout` comes from the instance config or the device default.
+        let mut wdt_seen = false;
         for inst in &board.instances {
             if !self.implements(&inst.device_ty.name, "watchdog") {
                 continue;
             }
-            let from_inst = inst
-                .config
-                .iter()
-                .find(|(k, _)| k.name == "timeout")
-                .and_then(|(_, e)| if let ExprKind::IntLit(n) = e.kind { Some(n) } else { None });
-            let from_default = self
-                .device_defs
-                .get(&inst.device_ty.name)
-                .and_then(|d| d.sections.config.as_ref())
-                .and_then(|c| c.fields.iter().find(|f| f.name.name == "timeout"))
-                .and_then(|f| f.default.as_ref())
-                .and_then(|e| if let ExprKind::IntLit(n) = e.kind { Some(n) } else { None });
-            if let Some(ns) = from_inst.or(from_default) {
-                self.watchdog_timeout_ns = Some(ns);
+            if wdt_seen {
+                self.err(inst.span, "more than one watchdog on the board; only one system watchdog is supported (§5.6)");
+                continue;
             }
+            wdt_seen = true;
+            // Instance config `timeout` overrides the device default; if present
+            // it must be a constant (don't silently fall back to the default).
+            let from_inst = inst.config.iter().find(|(k, _)| k.name == "timeout").map(|(_, e)| {
+                if let ExprKind::IntLit(n) = e.kind { Some(n) } else {
+                    self.err(e.span, "watchdog `timeout` must be a constant duration");
+                    None
+                }
+            });
+            let timeout = match from_inst {
+                Some(v) => v, // instance set it (Some(n) or None after the error)
+                None => self
+                    .device_defs
+                    .get(&inst.device_ty.name)
+                    .and_then(|d| d.sections.config.as_ref())
+                    .and_then(|c| c.fields.iter().find(|f| f.name.name == "timeout"))
+                    .and_then(|f| f.default.as_ref())
+                    .and_then(|e| if let ExprKind::IntLit(n) = e.kind { Some(n) } else { None }),
+            };
+            self.watchdog_timeout_ns = timeout;
         }
 
         // Lower each instance's safe op (§5.6), if its type declares one.
