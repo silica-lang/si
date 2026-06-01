@@ -29,7 +29,7 @@ program app {
 
   every 1000ms on fault retry(max = 3) {
     let t = sensor.read_temp()?
-    samples = samples + 1
+    samples += 1
   }
 }
 

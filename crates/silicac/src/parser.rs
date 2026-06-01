@@ -1369,9 +1369,12 @@ impl Parser {
     fn parse_add(&mut self) -> Result<Expr, ParseError> {
         let mut lhs = self.parse_mul()?;
         loop {
+            // Don't consume a `+`/`-` that is really the start of a compound
+            // assignment (`+=` / `-=`); leave it for `parse_assign`.
+            let compound = self.peek2() == Some(&Token::Eq);
             let op = match self.peek() {
-                Some(Token::Plus) => BinOp::Add,
-                Some(Token::Minus) => BinOp::Sub,
+                Some(Token::Plus) if !compound => BinOp::Add,
+                Some(Token::Minus) if !compound => BinOp::Sub,
                 _ => break,
             };
             self.advance();
@@ -1385,9 +1388,11 @@ impl Parser {
     fn parse_mul(&mut self) -> Result<Expr, ParseError> {
         let mut lhs = self.parse_unary()?;
         loop {
+            // Likewise leave `*=` / `/=` for `parse_assign`.
+            let compound = self.peek2() == Some(&Token::Eq);
             let op = match self.peek() {
-                Some(Token::Star) => BinOp::Mul,
-                Some(Token::Slash) => BinOp::Div,
+                Some(Token::Star) if !compound => BinOp::Mul,
+                Some(Token::Slash) if !compound => BinOp::Div,
                 Some(Token::Percent) => BinOp::Rem,
                 _ => break,
             };
@@ -1840,6 +1845,29 @@ sim blink_demo for blink {
             assert!(s.faults.is_empty());
         } else {
             panic!("expected sim");
+        }
+    }
+
+    #[test]
+    fn compound_assignment_parses() {
+        // Regression: `+=`/`-=`/`*=`/`/=` must parse as a compound assignment,
+        // not as a binary `+` followed by a stray `=`.
+        let src = r#"
+program p {
+    cell n : u32 = 0
+    every 1s { n += 1 }
+}
+"#;
+        let m = parse_src(src);
+        if let Item::Program(prog) = &m.items[0] {
+            let r = prog.items.iter().find_map(|i| match i {
+                ProgramItem::Reaction(r) => Some(r),
+                _ => None,
+            }).expect("reaction");
+            match &r.body.stmts[0] {
+                Stmt::Expr(e) => assert!(matches!(e.kind, ExprKind::CompoundAssign(BinOp::Add, _, _))),
+                other => panic!("expected compound assign, got {:?}", other),
+            }
         }
     }
 
