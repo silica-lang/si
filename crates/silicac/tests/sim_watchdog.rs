@@ -54,6 +54,25 @@ fn a_hung_reaction_starves_the_watchdog_and_resets() {
 }
 
 #[test]
+fn more_than_one_watchdog_is_an_error() {
+    let src = r#"
+board rig {
+  soc s { memory { flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K } }
+  wdt0 : wdt at 0x4001_0000 { config { timeout = 100ms } }
+  wdt1 : wdt at 0x4001_1000 { config { timeout = 50ms } }
+}
+program app { use board rig as r  on sys.start { } }
+"#;
+    let std_items = silicac::load_std_items(&silicac::default_std_dir()).expect("std");
+    let tokens = lexer::lex(src).expect("lex");
+    let mut ast = parser::parse(tokens).expect("parse");
+    ast.items.splice(0..0, std_items);
+    let errs = resolver::resolve(&ast).expect_err("expected a multiple-watchdog error");
+    assert!(errs.iter().any(|e| e.msg.contains("more than one watchdog")),
+        "got: {:?}", errs.iter().map(|e| &e.msg).collect::<Vec<_>>());
+}
+
+#[test]
 fn a_healthy_reaction_feeds_the_watchdog_so_it_never_fires() {
     // No hang: the read completes in 2 µs, the scheduler returns to idle and
     // feeds the watchdog, so it never resets.

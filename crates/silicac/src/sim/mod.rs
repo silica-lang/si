@@ -372,7 +372,10 @@ impl<'m> Sim<'m> {
             let gen = self.wdt_gen;
             self.wdt_active = Some(gen);
             let seq = self.next_seq();
-            self.queue.push(QItem { at_ns: self.now + t, priority: u8::MAX, seq, payload: Payload::WdtTimeout { gen } });
+            // Lowest priority: any reaction work scheduled at the same instant
+            // (e.g. a resume that returns to idle exactly at the deadline) runs
+            // first and feeds/disarms the watchdog before this check (§5.6).
+            self.queue.push(QItem { at_ns: self.now + t, priority: 0, seq, payload: Payload::WdtTimeout { gen } });
         }
     }
 
