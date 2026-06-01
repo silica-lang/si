@@ -94,7 +94,7 @@ Toolchain: `arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -nostartfiles -T <generate
 | --- | --- | --- |
 | **A** ✅ | `--target` flag; linker-script + vector-table + reset generation; RAM-budget gate; metal `main` runs `sys.start` then idles | firmware links & boots in Renode |
 | **B** ✅ | `SirPlace::Reg`→MMIO with barriers; `std/nrf_gpio.si`; init sets `DIR` | LED driven once at boot — observed on the pin |
-| **C** | `every`→SysTick (std device + handler + vector entry) | LED **blinks** periodically |
+| **C** ✅ | `every`→SysTick (handler + vector entry + startup config) | LED **blinks** periodically |
 | **D** | `on falling`→GPIOTE+NVIC vector; `Critical`→BASEPRI | full **blink+button**, shared cell, injected presses |
 | **E** | Renode `.resc` + Robot test asserting the sim-identical sequence; README docs | **automated metal gate** in CI |
 
@@ -117,6 +117,18 @@ before `sys.start`. On `examples/blink_button_nrf52840.si`, `sys.start`'s
 after boot (was `0x0`). The *same* program runs under `--sim` (mock registers).
 Direction-register selection is a documented heuristic (a writable register
 distinct from the data register) to be replaced by per-pin config ops.
+
+**Stage C — done** (verified in Renode). `every` lowers onto the Cortex-M
+SysTick (§4.5): `systick_plan` computes a 1 ms base reload from
+`board.soc.clocks` (RVR = `core_hz/1000 - 1`; a 24-bit-overflow or non-whole-ms
+period is a compile error), and the generated `SysTick_Handler` software-counts
+base ticks per `every` reaction. Startup programs SYST_RVR/CVR/CSR and enables
+interrupts; the vector table gains the SysTick entry (#15). On
+`blink_button_nrf52840.si` the LED toggles in Renode: `OUT` bit 13 tracks the
+`lit` cell 1↔0. Timing note: Renode's SysTick rate follows its CPU clock, which
+must be pinned to 64 MHz in the Stage-E harness for sim≡metal *timing* (the
+*sequence* already matches). SysTick is programmed at its architectural SCS
+address (it is part of the Cortex-M core, not a board peripheral).
 
 ## How the Phase-0 gates close
 

@@ -35,6 +35,9 @@ pub struct SirModule {
     pub memory: Vec<SirRegion>,
     /// Resolved pin bindings, for generated startup pin configuration (§6.4).
     pub pins: Vec<SirPin>,
+    /// Core clock in Hz (from `board.soc.clocks`), for lowering `every` periods
+    /// to timer ticks (§4.5).  0 if unknown.
+    pub core_hz: u64,
 }
 
 /// A board pin binding (`led_user : gpio.pin = gpio_a.pin(5) as output`),

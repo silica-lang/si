@@ -108,6 +108,7 @@ pub struct Resolver {
     run_until_ns: Option<u64>,
     memory: Vec<SirRegion>,
     pins: Vec<SirPin>,
+    core_hz: u64,
 
     /// Device id → device-type name (for reg/op/emit lookups).
     dev_types: HashMap<usize, String>,
@@ -137,6 +138,7 @@ impl Resolver {
             run_until_ns: None,
             memory: Vec::new(),
             pins: Vec::new(),
+            core_hz: 0,
             dev_types: HashMap::new(),
             board_ctx: None,
             program_ctx: HashMap::new(),
@@ -189,6 +191,7 @@ impl Resolver {
                 run_until_ns: self.run_until_ns,
                 memory: self.memory,
                 pins: self.pins,
+                core_hz: self.core_hz,
             })
         } else {
             Err(self.errors)
@@ -309,6 +312,18 @@ impl Resolver {
                     origin: region.at,
                     size: region.size,
                 });
+            }
+            // Core clock → `every` tick lowering (§4.5).  Prefer a clock named
+            // `sysclk`, else the first clock; only constant frequencies are read.
+            let pick = soc
+                .clocks
+                .iter()
+                .find(|c| c.name.name == "sysclk")
+                .or_else(|| soc.clocks.first());
+            if let Some(clk) = pick {
+                if let ExprKind::IntLit(hz) = clk.init.kind {
+                    self.core_hz = hz;
+                }
             }
         }
 

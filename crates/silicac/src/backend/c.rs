@@ -412,23 +412,66 @@ impl CBackend {
     }
 
     /// Emit the vector table + reset/startup (§6.4): copy `.data`, zero `.bss`,
-    /// run `sys.start` reactions, then idle in WFI.  Periodic/event reactions
-    /// are dispatched by handlers wired in later stages (timer → SysTick,
-    /// `on` → GPIOTE/NVIC); for now they are emitted but not yet invoked.
+    /// configure output pins, run `sys.start`, program SysTick for `every`
+    /// reactions, then idle in WFI.  `every` reactions are dispatched from the
+    /// generated `SysTick_Handler` (§4.5); `on` events are wired in Stage D.
     fn emit_metal_startup(&mut self, module: &SirModule) {
+        let systick = match systick_plan(module) {
+            Ok(p) => p,
+            Err(e) => {
+                self.line(&format!("#error \"{}\"", e));
+                None
+            }
+        };
+
         self.line("/* default handler for unused vectors */");
         self.line("static void __default_handler(void) { for (;;) {} }");
         self.line("void Reset_Handler(void);");
+
+        // SysTick handler: software-prescaled per-reaction counters (§4.5).
+        if let Some(plan) = &systick {
+            self.emit_newline();
+            self.line("/* every -> SysTick dispatch (1ms base, per-reaction counters) */");
+            for (id, threshold) in &plan.thresholds {
+                self.line(&format!("static volatile uint32_t __systick_ctr_{} = {}U;", id, threshold));
+            }
+            self.line("void SysTick_Handler(void) {");
+            self.indent += 1;
+            for (id, threshold) in &plan.thresholds {
+                self.line(&format!("if (--__systick_ctr_{} == 0U) {{", id));
+                self.indent += 1;
+                self.line(&format!("__systick_ctr_{} = {}U;", id, threshold));
+                self.line(&format!("{}();", reaction_fn_name(*id)));
+                self.indent -= 1;
+                self.line("}");
+            }
+            self.indent -= 1;
+            self.line("}");
+        }
         self.emit_newline();
 
+        // Vector table up to SysTick (#15).
         self.line("/* Cortex-M vector table — placed at flash base by the linker (§6.4). */");
         self.line("__attribute__((section(\".vectors\"), used))");
         self.line("const void *const __vectors[] = {");
         self.indent += 1;
-        self.line("(void *)&_estack,        /* 0  initial SP */");
-        self.line("(void *)Reset_Handler,   /* 1  reset */");
-        self.line("(void *)__default_handler, /* 2  NMI */");
-        self.line("(void *)__default_handler, /* 3  HardFault */");
+        let systick_entry = if systick.is_some() { "SysTick_Handler" } else { "__default_handler" };
+        let entries: [(&str, &str); 16] = [
+            ("&_estack", "0  initial SP"),
+            ("Reset_Handler", "1  reset"),
+            ("__default_handler", "2  NMI"),
+            ("__default_handler", "3  HardFault"),
+            ("0", "4  reserved"), ("0", "5"), ("0", "6"), ("0", "7"),
+            ("0", "8"), ("0", "9"), ("0", "10"),
+            ("__default_handler", "11 SVCall"),
+            ("0", "12"), ("0", "13"),
+            ("__default_handler", "14 PendSV"),
+            (systick_entry, "15 SysTick"),
+        ];
+        for (sym, comment) in entries {
+            let cast = if sym == "0" { "0".to_string() } else { format!("(void *)&{}", strip_amp(sym)) };
+            self.line(&format!("{:<28} /* {} */", format!("{},", cast), comment));
+        }
         self.indent -= 1;
         self.line("};");
         self.emit_newline();
@@ -450,12 +493,7 @@ impl CBackend {
                 let mask = 1u64 << pin.index;
                 let value = SirExpr::Bool(true);
                 let stmt = self.emit_mmio_store(
-                    pin.device,
-                    pin.dir_reg_offset,
-                    mask,
-                    pin.index,
-                    SirRegAccess::Rw,
-                    &value,
+                    pin.device, pin.dir_reg_offset, mask, pin.index, SirRegAccess::Rw, &value,
                 );
                 for l in stmt {
                     self.line(&l);
@@ -470,16 +508,25 @@ impl CBackend {
             .filter(|r| matches!(r.trigger, SirTrigger::SysStart))
             .map(|r| r.id)
             .collect();
-        if sys_start.is_empty() {
-            self.line("/* no sys.start reactions */");
-        } else {
+        if !sys_start.is_empty() {
             self.line("/* run sys.start reactions, in declaration order */");
             for id in sys_start {
                 self.line(&format!("{}();", reaction_fn_name(id)));
             }
+            self.emit_newline();
         }
-        self.emit_newline();
-        self.line("/* idle — periodic/event reactions are dispatched by handlers (later stages) */");
+
+        // Program SysTick (architectural system timer at the SCS, §4.5).
+        if let Some(plan) = &systick {
+            self.line("/* SysTick: 1ms base tick, interrupt enabled (§4.5) */");
+            self.line(&format!("*(volatile uint32_t *)0xE000E014UL = {}UL; /* SYST_RVR */", plan.reload));
+            self.line("*(volatile uint32_t *)0xE000E018UL = 0UL;        /* SYST_CVR */");
+            self.line("__DSB();");
+            self.line("*(volatile uint32_t *)0xE000E010UL = 0x7UL;      /* SYST_CSR: ENABLE|TICKINT|CLKSOURCE */");
+            self.line("__asm__ volatile(\"cpsie i\");");
+            self.emit_newline();
+        }
+
         self.line("for (;;) { __asm__ volatile(\"wfi\"); }");
         self.indent -= 1;
         self.line("}");
@@ -503,6 +550,12 @@ impl CBackend {
 
 fn reaction_fn_name(id: usize) -> String {
     format!("__reaction_{}", id)
+}
+
+/// Strip a leading `&` (vector-table symbols are pre-formatted with one for
+/// `_estack`; functions don't carry it).
+fn strip_amp(s: &str) -> &str {
+    s.strip_prefix('&').unwrap_or(s)
 }
 
 /// Does any statement in `stmts` (recursing into `Critical`/`If` bodies)
@@ -641,6 +694,60 @@ pub fn ram_budget(module: &SirModule) -> Result<RamBudget, String> {
         ));
     }
     Ok(budget)
+}
+
+// ─── Metal: `every` → SysTick plan (§4.5) ─────────────────────────────────────
+
+/// Default core clock for the nRF52840 if the board declares none.
+pub const NRF52840_CORE_HZ: u64 = 64_000_000;
+/// SysTick base period: a 1 ms tick, software-prescaled per reaction.  A single
+/// 24-bit SysTick cannot hold long periods directly (500 ms at 64 MHz overflows),
+/// so the handler counts base ticks per `every` reaction.
+pub const SYSTICK_BASE_NS: u64 = 1_000_000;
+
+#[derive(Debug, Clone)]
+pub struct SysTickPlan {
+    /// SysTick reload value (RVR): `core_hz * base_ns / 1e9 - 1`, must fit 24 bits.
+    pub reload: u64,
+    /// Per-`every`-reaction base-tick threshold: `(reaction_id, ticks)`.
+    pub thresholds: Vec<(usize, u64)>,
+}
+
+/// Plan the SysTick programming for the module's `every` reactions (§4.5).
+/// `Ok(None)` if there are no periodic reactions.  Errors if a period is not a
+/// whole base tick or the reload does not fit SysTick's 24-bit counter.
+pub fn systick_plan(module: &SirModule) -> Result<Option<SysTickPlan>, String> {
+    let everys: Vec<(usize, u64)> = module
+        .reactions
+        .iter()
+        .filter_map(|r| match r.trigger {
+            SirTrigger::EveryNs(ns) => Some((r.id, ns)),
+            _ => None,
+        })
+        .collect();
+    if everys.is_empty() {
+        return Ok(None);
+    }
+    let core_hz = if module.core_hz != 0 { module.core_hz } else { NRF52840_CORE_HZ };
+    let ticks_per_base = core_hz * SYSTICK_BASE_NS / 1_000_000_000;
+    if ticks_per_base == 0 {
+        return Err(format!("core clock {} Hz too slow for a {} ns SysTick base", core_hz, SYSTICK_BASE_NS));
+    }
+    let reload = ticks_per_base - 1;
+    if reload > 0x00FF_FFFF {
+        return Err(format!("SysTick reload {} exceeds 24 bits (core {} Hz)", reload, core_hz));
+    }
+    let mut thresholds = Vec::new();
+    for (id, ns) in everys {
+        if ns % SYSTICK_BASE_NS != 0 {
+            return Err(format!(
+                "`every` period {} ns is not a whole {} ns SysTick base tick",
+                ns, SYSTICK_BASE_NS
+            ));
+        }
+        thresholds.push((id, ns / SYSTICK_BASE_NS));
+    }
+    Ok(Some(SysTickPlan { reload, thresholds }))
 }
 
 /// Generate the linker script from the board's memory regions (§6.4).

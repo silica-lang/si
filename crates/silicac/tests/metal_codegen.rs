@@ -121,6 +121,69 @@ fn reg_access_lowers_to_ordered_mmio_with_barriers() {
     assert!(src.contains("0x50000514UL"), "DIR config write:\n{src}");
 }
 
+const BLINK: &str = r#"
+board b {
+  soc s {
+    memory { flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+  gpio0 : nrf_gpio at 0x5000_0000
+  led : nrf_gpio.pin = gpio0.pin(13) as output
+}
+program p {
+  use board b as dev
+  let led = dev.led
+  cell lit : bool = false
+  every 500ms { lit = not lit  led.set(lit) }
+}
+"#;
+
+#[test]
+fn every_lowers_to_systick_plan() {
+    let sir = compile(BLINK);
+    let plan = c::systick_plan(&sir).expect("plan ok").expect("has periodic reactions");
+    assert_eq!(plan.reload, 63_999); // 64 MHz / 1000 - 1
+    assert_eq!(plan.thresholds.len(), 1);
+    assert_eq!(plan.thresholds[0].1, 500); // 500 ms / 1 ms base
+}
+
+#[test]
+fn every_emits_systick_handler_and_config() {
+    let sir = compile(BLINK);
+    let src = c::CBackend::with_target(Target::MetalNrf52840).emit(&sir);
+    assert!(src.contains("void SysTick_Handler(void)"));
+    assert!(src.contains("__systick_ctr_"));
+    assert!(src.contains("= 500U;"), "per-reaction threshold");
+    assert!(src.contains("15 SysTick"), "SysTick in the vector table");
+    assert!(src.contains("(void *)&SysTick_Handler"), "vector entry");
+    assert!(src.contains("0xE000E014UL = 63999UL"), "SYST_RVR config");
+    assert!(src.contains("0xE000E010UL = 0x7UL"), "SYST_CSR enable");
+    assert!(src.contains("cpsie i"), "interrupts enabled");
+}
+
+#[test]
+fn non_whole_millisecond_period_is_an_error() {
+    let src = r#"
+board b { soc s { memory { flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K } clocks { sysclk : clock_source = 64MHz } } }
+program p { use board b as dev  every 1500us { } }
+"#;
+    let sir = compile(src);
+    let err = c::systick_plan(&sir).expect_err("expected timing error");
+    assert!(err.contains("whole"), "got: {err}");
+}
+
+#[test]
+fn systick_reload_overflow_is_an_error() {
+    // A core clock so fast that a 1 ms reload exceeds SysTick's 24-bit counter.
+    let src = r#"
+board b { soc s { memory { flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K } clocks { sysclk : clock_source = 20000MHz } } }
+program p { use board b as dev  every 500ms { } }
+"#;
+    let sir = compile(src);
+    let err = c::systick_plan(&sir).expect_err("expected reload overflow");
+    assert!(err.contains("24 bits"), "got: {err}");
+}
+
 #[test]
 fn host_target_still_emits_hosted_main() {
     // The host path is unchanged: it still produces a libc `main`, proving the

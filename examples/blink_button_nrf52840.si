@@ -14,6 +14,9 @@ board nrf52840_dk {
       flash : region at 0x0 size 1024K
       ram   : region at 0x2000_0000 size 256K
     }
+    clocks {
+      sysclk : clock_source = 64MHz
+    }
   }
 
   gpio0 : nrf_gpio at 0x5000_0000
