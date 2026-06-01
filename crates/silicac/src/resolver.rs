@@ -311,9 +311,16 @@ impl Resolver {
         // statement) and yields are hoisted out as separate `BusXfer`s, so a
         // `Critical` containing a `BusXfer` would be a yield inside a held
         // section — reject it (defensive; the lowering does not produce it).
+        // A yielding op must sit at the reaction's top level in this slice: the
+        // simulator's stepper splits segments only there.  Reject yields nested
+        // in a critical section (§5.5/D03) or an `if` (fail fast — otherwise the
+        // sim would silently skip the suspension).
         for r in &out[first..] {
             if critical_contains_yield(&r.body) {
                 self.err(prog.span, "a cell critical section may not span a yield (§5.5/D03)");
+            }
+            if if_contains_yield(&r.body) {
+                self.err(prog.span, "a yielding op inside `if` is not supported in this slice (§5.2: yields must be at the reaction top level)");
             }
         }
 
@@ -589,6 +596,24 @@ impl Resolver {
         Some(SirReaction { id, trigger, body, priority, disposition, yields })
     }
 
+    /// The union of all fault codes declared by any op (interface or device),
+    /// used to validate fault-injection scripts (§4.4/D14).
+    fn declared_fault_codes(&self) -> std::collections::HashSet<String> {
+        let mut codes = std::collections::HashSet::new();
+        let iface_ops = self.interfaces.values().flat_map(|i| i.ops.iter());
+        let dev_ops = self
+            .device_defs
+            .values()
+            .filter_map(|d| d.sections.ops.as_ref())
+            .flat_map(|s| s.items.iter().map(|OpsItem::Op(o)| o));
+        for op in iface_ops.chain(dev_ops) {
+            for c in &op.ret.fault_codes {
+                codes.insert(c.name.clone());
+            }
+        }
+        codes
+    }
+
     /// Does `ty` implement interface `iface` (a declared `implements`)?
     fn implements(&self, ty: &str, iface: &str) -> bool {
         self.device_defs
@@ -598,40 +623,53 @@ impl Resolver {
     }
 
     /// Check a device's `implements` claims against the interface op signatures
-    /// (§4.1/D18): every interface op must have a matching device op (name +
-    /// arity).  Nominal (the `implements` is a declared claim) + structural.
+    /// (§4.1/D18): every interface op must have a matching device op with the
+    /// same shape — name, arity, **`yields`**, and **fallibility** (a mismatch
+    /// would break composition / fault propagation at runtime).
     fn check_conformance(&mut self, d: &DeviceDef) {
-        let dev_ops: Vec<(&str, usize)> = d
+        // (name, arity, yields, fallible)
+        let dev_ops: Vec<(&str, usize, bool, bool)> = d
             .sections
             .ops
             .as_ref()
             .map(|s| {
                 s.items
                     .iter()
-                    .map(|OpsItem::Op(o)| (o.name.name.as_str(), o.params.len()))
+                    .map(|OpsItem::Op(o)| (o.name.name.as_str(), o.params.len(), o.yields, o.ret.fallible))
                     .collect()
             })
             .unwrap_or_default();
         for iface_name in &d.implements {
             // Snapshot the interface's op shapes so the immutable borrow is
             // released before reporting errors.
-            let iface_ops: Vec<(String, usize)> = match self.interfaces.get(&iface_name.name) {
-                Some(iface) => iface.ops.iter().map(|o| (o.name.name.clone(), o.params.len())).collect(),
+            let iface_ops: Vec<(String, usize, bool, bool)> = match self.interfaces.get(&iface_name.name) {
+                Some(iface) => iface
+                    .ops
+                    .iter()
+                    .map(|o| (o.name.name.clone(), o.params.len(), o.yields, o.ret.fallible))
+                    .collect(),
                 None => {
                     self.err(iface_name.span, format!("unknown interface '{}'", iface_name.name));
                     continue;
                 }
             };
-            for (opname, arity) in &iface_ops {
-                let ok = dev_ops.iter().any(|(n, a)| n == opname && a == arity);
-                if !ok {
-                    self.err(
+            for (opname, arity, iy, ifal) in &iface_ops {
+                match dev_ops.iter().find(|(n, ..)| n == opname) {
+                    None => self.err(
                         d.name.span,
                         format!(
-                            "device '{}' implements '{}' but is missing op `{}({} args)`",
-                            d.name.name, iface_name.name, opname, arity
+                            "device '{}' implements '{}' but is missing op `{}`",
+                            d.name.name, iface_name.name, opname
                         ),
-                    );
+                    ),
+                    Some((_, a, dy, dfal)) if a != arity || dy != iy || dfal != ifal => self.err(
+                        d.name.span,
+                        format!(
+                            "device '{}' op `{}` does not match interface '{}' (arity/yields/fallibility differ)",
+                            d.name.name, opname, iface_name.name
+                        ),
+                    ),
+                    Some(_) => {}
                 }
             }
         }
@@ -888,7 +926,7 @@ impl Resolver {
         for (p, v) in op.params.iter().zip(arg_vals) {
             let tmp = self.fresh("arg");
             out.push(SirStmt::Assign { target: SirPlace::Var(tmp.clone()), value: v });
-            inner.insert(&p.name.name, Binding::Local(tmp, SirType::U32));
+            inner.insert(&p.name.name, Binding::Local(tmp, resolve_type_expr(&p.ty)));
         }
         if let Some(needs) = self.instance_needs.get(&inst.device).cloned() {
             for (name, val) in needs {
@@ -1250,7 +1288,12 @@ impl Resolver {
         for f in &sim.faults {
             self.fault_injections.push(SirFaultInjection { at_ns: f.at.to_ns(), addr: f.addr });
         }
+        let declared = self.declared_fault_codes();
         for (code, times) in &sim.bus_faults {
+            // Fault injection is keyed to declared codes (§4.4/D14): reject typos.
+            if !declared.contains(&code.name) {
+                self.err(code.span, format!("injected bus fault code '{}' is not declared by any op's `or fault{{...}}`", code.name));
+            }
             for _ in 0..*times {
                 self.bus_fault_queue.push(code.name.clone());
             }
@@ -1318,6 +1361,15 @@ fn critical_contains_yield(stmts: &[SirStmt]) -> bool {
     stmts.iter().any(|s| match s {
         SirStmt::Critical { body, .. } => body_yields(body) || critical_contains_yield(body),
         SirStmt::If { then, .. } => critical_contains_yield(then),
+        _ => false,
+    })
+}
+
+/// True if any `if` in the body (transitively) contains a yielding bus transfer.
+fn if_contains_yield(stmts: &[SirStmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        SirStmt::If { then, .. } => body_yields(then) || if_contains_yield(then),
+        SirStmt::Critical { body, .. } => if_contains_yield(body),
         _ => false,
     })
 }

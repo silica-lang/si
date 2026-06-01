@@ -505,9 +505,10 @@ impl<'m> Sim<'m> {
             }
             SirStmt::DeviceOp { .. } => { /* Phase-1 composed-device hook */ }
             SirStmt::BusXfer { dst, .. } => {
-                // A BusXfer nested inside If/Critical is not split into a segment
-                // here (top-level transactions are handled by `run_activation`).
-                // The slice keeps yielding ops at the top level; complete inline.
+                // Unreachable: top-level transactions are handled by
+                // `run_activation`, and the resolver rejects yields nested in
+                // `if`/critical-section (§5.2/§5.5).  Kept as a defensive no-op.
+                debug_assert!(false, "nested BusXfer reached eval_stmt — resolver should have rejected it");
                 frame.insert(dst.clone(), 0);
             }
             SirStmt::Exit(_) => {

@@ -69,8 +69,9 @@ struct Reaction {
 
 // ─── Reaction bodies (what the lowering would generate) ────────────────────────
 
-/// `every 1ms { let before = counter; let raw = bus.read()? /* yields */;
-///              temp = compensate(raw); log }`
+/// `every 1µs { let before = counter; let raw = bus.read()? /* yields */;
+///              temp = compensate(raw); log }`  (the prototype uses tiny ns
+/// periods — 1µs here, 2µs bus latency — so the trace is quick to read.)
 /// Two segments split by the bus transaction's suspension point.
 fn sensor_body(seg: usize, frame: &mut Frame, w: &mut World) -> Step {
     const BUS_LATENCY_NS: u64 = 2_000; // a slow I2C transaction
@@ -156,8 +157,8 @@ fn main() {
         *seq += 1;
     };
 
-    // Seed: the periodic sensor at its first period; a scripted button press at
-    // 1500us — i.e. *during* the sensor's bus suspension (1000us..3000us).
+    // Seed: the periodic sensor at its first period (t=1µs); a scripted button
+    // press at 1.5µs — i.e. *during* the sensor's bus suspension (1µs..3µs).
     push(&mut q, &mut seq, 1_000, reactions[0].priority, Kind::Fire { reaction: 0, seg: 0 });
     push(&mut q, &mut seq, 1_500, reactions[1].priority, Kind::Fire { reaction: 1, seg: 0 });
 

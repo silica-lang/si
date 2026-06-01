@@ -88,6 +88,44 @@ program p { on sys.start { } }
 }
 
 #[test]
+fn conformance_checks_yields_and_fallibility() {
+    // read_reg matches name+arity but is neither yielding nor fallible → reject.
+    let src = r#"
+interface i2c { op read_reg(addr: u32, reg: u32) -> u32 or fault{nak} yields }
+device bad implements i2c {
+  ops { op read_reg(addr: u32, reg: u32) -> u32 {} }
+}
+program p { on sys.start { } }
+"#;
+    let errs = resolve_str(src).expect_err("expected a signature-mismatch error");
+    assert!(
+        errs.iter().any(|e| e.msg.contains("does not match interface")),
+        "got: {:?}", errs.iter().map(|e| &e.msg).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn undeclared_bus_fault_code_is_an_error() {
+    let src = r#"
+interface i2c { op read_reg(addr: u32, reg: u32) -> u32 or fault{nak} yields }
+device i2c_ctrl implements i2c { ops { op read_reg(addr: u32, reg: u32) -> u32 or fault{nak} yields } }
+device bme280 { needs { bus : i2c } ops { op read_temp() -> u32 or fault{nak} yields { return bus.read_reg(0x76, 0xFA)? } } }
+board demo {
+  soc s { memory { flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K } clocks { sysclk : clock_source = 64MHz } }
+  i2c0 : i2c_ctrl
+  env  : bme280 { needs { bus = i2c0 } }
+}
+program app { use board demo as b  let sensor = b.env  every 1000ms on fault skip { let t = sensor.read_temp()? } }
+sim app_sim for app { inject bus_fault bogus times 1   run until 1500ms }
+"#;
+    let errs = resolve_str(src).expect_err("expected an undeclared-code error");
+    assert!(
+        errs.iter().any(|e| e.msg.contains("not declared by any op")),
+        "got: {:?}", errs.iter().map(|e| &e.msg).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn bus_need_must_be_satisfied_by_an_implementing_device() {
     // `env.bus` requires an i2c provider, but `not_i2c` doesn't implement it.
     let src = r#"
