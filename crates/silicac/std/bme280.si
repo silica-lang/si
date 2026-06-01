@@ -1,0 +1,21 @@
+// std-lib BME280 environmental sensor — a **composed** device (§3.5): it has
+// **no `regs`** of its own (it is not memory-mapped on this core).  Its ops are
+// expressed as transactions over a substrate `i2c` bus it `needs`; the consumer
+// calls `sensor.read_temp()` exactly like a leaf op, unaware of the bus
+// underneath (§3.5).  The `REG_*` addresses are the sensor's *remote* registers
+// passed over the wire, not local MMIO.
+
+device bme280 {
+  needs {
+    bus : i2c
+  }
+
+  ops {
+    // One yielding bus read of the temperature register; `?` propagates a bus
+    // fault (NAK/timeout) to the reaction's disposition (§4.4).  (Compensation
+    // math is a pure fixed-point helper, elided in this slice.)
+    op read_temp() -> u32 or fault{nak, timeout, arblost} yields {
+      return bus.read_reg(0x76, 0xFA)?
+    }
+  }
+}

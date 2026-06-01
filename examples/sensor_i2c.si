@@ -1,0 +1,39 @@
+// Composed-device keystone (§3.5): a BME280 sensor reached over an I²C bus.
+// `sensor.read_temp()` is a fallible, **yielding** transaction over the bus —
+// the handler suspends while the transfer runs and the scheduler does other
+// work, faults propagate via `?`, and a `retry` disposition recovers from a
+// transient NAK.
+//
+//   silicac --sim examples/sensor_i2c.si
+//
+// (i2c / i2c_controller / bme280 are std-lib devices loaded from crates/silicac/std.)
+
+board sensor_board {
+  soc s {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+
+  i2c0 : i2c_controller at 0x4000_3000 { needs { clock = soc.sysclk } }
+  env  : bme280 { needs { bus = i2c0 } }
+}
+
+program app {
+  use board sensor_board as b
+
+  let sensor = b.env
+  cell samples : u32 = 0
+
+  every 1000ms on fault retry(max = 3) {
+    let t = sensor.read_temp()?
+    samples += 1
+  }
+}
+
+sim app_sim for app {
+  inject bus_fault nak times 1    // the first transfer NAKs; retry recovers
+  run until 2500ms
+}

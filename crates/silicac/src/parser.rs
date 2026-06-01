@@ -462,18 +462,31 @@ impl Parser {
         let ret = if self.peek() == Some(&Token::Arrow) {
             self.advance();
             let ty = self.parse_type()?;
-            let fallible = if self.peek() == Some(&Token::KwOr) {
+            let (fallible, fault_codes) = if self.peek() == Some(&Token::KwOr) {
                 self.advance();
                 self.eat(&Token::KwFault)?;
-                true
+                // optional declared code set: `fault{nak, timeout}`
+                let mut codes = Vec::new();
+                if self.peek() == Some(&Token::LBrace) {
+                    self.advance();
+                    while self.peek() != Some(&Token::RBrace) {
+                        codes.push(self.eat_ident()?);
+                        if self.peek() == Some(&Token::Comma) {
+                            self.advance();
+                        }
+                    }
+                    self.eat(&Token::RBrace)?;
+                }
+                (true, codes)
             } else {
-                false
+                (false, Vec::new())
             };
-            ReturnType { ty, fallible }
+            ReturnType { ty, fallible, fault_codes }
         } else {
             ReturnType {
                 ty: TypeExpr { kind: TypeKind::Unit, span: Span::default() },
                 fallible: false,
+                fault_codes: Vec::new(),
             }
         };
 
@@ -748,11 +761,35 @@ impl Parser {
         let start = self.current_span().start;
         self.eat(&Token::KwInterface)?;
         let name = self.eat_ident()?;
-        // Consume the body with balanced-brace skipping — the slice does not
-        // lower interfaces, it only needs to not choke on them (§3.5).
-        self.skip_balanced_braces()?;
-        let end = self.prev_span().end;
-        Ok(InterfaceDef { name, span: Span::new(start, end) })
+        self.eat(&Token::LBrace)?;
+        let mut ops = Vec::new();
+        let mut types = Vec::new();
+        while self.peek() != Some(&Token::RBrace) {
+            if self.at_end() {
+                return Err(self.error("unexpected EOF in interface body"));
+            }
+            match self.peek() {
+                Some(Token::KwOp) => ops.push(self.parse_op_decl()?),
+                // `type address = u7`
+                Some(Token::Ident(s)) if s == "type" => {
+                    self.advance();
+                    let alias = self.eat_ident()?;
+                    self.eat(&Token::Eq)?;
+                    let target = self.eat_ident()?;
+                    self.eat_optional_semi();
+                    types.push((alias, target));
+                }
+                other => {
+                    return Err(ParseError {
+                        span: self.current_span(),
+                        msg: format!("expected `op` or `type` in interface body, got {:?}", other),
+                    })
+                }
+            }
+        }
+        let end = self.current_span().end;
+        self.eat(&Token::RBrace)?;
+        Ok(InterfaceDef { name, ops, types, span: Span::new(start, end) })
     }
 
     fn skip_balanced_braces(&mut self) -> Result<(), ParseError> {
@@ -1122,6 +1159,7 @@ impl Parser {
         self.eat(&Token::LBrace)?;
         let mut injections = Vec::new();
         let mut faults = Vec::new();
+        let mut bus_faults = Vec::new();
         let mut run_until = None;
         while self.peek() != Some(&Token::RBrace) {
             if self.at_end() {
@@ -1140,6 +1178,18 @@ impl Parser {
                         self.eat_optional_semi();
                         let iend = self.prev_span().end;
                         faults.push(FaultInjection { addr, at, span: Span::new(istart, iend) });
+                    } else if matches!(self.peek(), Some(Token::Ident(s)) if s == "bus_fault") {
+                        // `inject bus_fault <code> times <n>`
+                        self.advance();
+                        let code = self.eat_ident()?;
+                        let times = if matches!(self.peek(), Some(Token::Ident(s)) if s == "times") {
+                            self.advance();
+                            self.expect_int_lit()? as u32
+                        } else {
+                            1
+                        };
+                        self.eat_optional_semi();
+                        bus_faults.push((code, times));
                     } else {
                         let event = self.parse_event_ref()?;
                         self.eat(&Token::KwAt)?;
@@ -1172,7 +1222,7 @@ impl Parser {
         }
         let end = self.current_span().end;
         self.eat(&Token::RBrace)?;
-        Ok(SimDef { name, program, injections, faults, run_until, span: Span::new(start, end) })
+        Ok(SimDef { name, program, injections, faults, bus_faults, run_until, span: Span::new(start, end) })
     }
 
     // ── Block & statements ──────────────────────────────────────────────────
@@ -1319,9 +1369,12 @@ impl Parser {
     fn parse_add(&mut self) -> Result<Expr, ParseError> {
         let mut lhs = self.parse_mul()?;
         loop {
+            // Don't consume a `+`/`-` that is really the start of a compound
+            // assignment (`+=` / `-=`); leave it for `parse_assign`.
+            let compound = self.peek2() == Some(&Token::Eq);
             let op = match self.peek() {
-                Some(Token::Plus) => BinOp::Add,
-                Some(Token::Minus) => BinOp::Sub,
+                Some(Token::Plus) if !compound => BinOp::Add,
+                Some(Token::Minus) if !compound => BinOp::Sub,
                 _ => break,
             };
             self.advance();
@@ -1335,9 +1388,11 @@ impl Parser {
     fn parse_mul(&mut self) -> Result<Expr, ParseError> {
         let mut lhs = self.parse_unary()?;
         loop {
+            // Likewise leave `*=` / `/=` for `parse_assign`.
+            let compound = self.peek2() == Some(&Token::Eq);
             let op = match self.peek() {
-                Some(Token::Star) => BinOp::Mul,
-                Some(Token::Slash) => BinOp::Div,
+                Some(Token::Star) if !compound => BinOp::Mul,
+                Some(Token::Slash) if !compound => BinOp::Div,
                 Some(Token::Percent) => BinOp::Rem,
                 _ => break,
             };
@@ -1790,6 +1845,29 @@ sim blink_demo for blink {
             assert!(s.faults.is_empty());
         } else {
             panic!("expected sim");
+        }
+    }
+
+    #[test]
+    fn compound_assignment_parses() {
+        // Regression: `+=`/`-=`/`*=`/`/=` must parse as a compound assignment,
+        // not as a binary `+` followed by a stray `=`.
+        let src = r#"
+program p {
+    cell n : u32 = 0
+    every 1s { n += 1 }
+}
+"#;
+        let m = parse_src(src);
+        if let Item::Program(prog) = &m.items[0] {
+            let r = prog.items.iter().find_map(|i| match i {
+                ProgramItem::Reaction(r) => Some(r),
+                _ => None,
+            }).expect("reaction");
+            match &r.body.stmts[0] {
+                Stmt::Expr(e) => assert!(matches!(e.kind, ExprKind::CompoundAssign(BinOp::Add, _, _))),
+                other => panic!("expected compound assign, got {:?}", other),
+            }
         }
     }
 

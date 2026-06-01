@@ -31,6 +31,9 @@ pub struct SirModule {
     pub injections: Vec<SirInjection>,
     /// Scripted Layer-3 fault injections from a `sim` block (§5.4).
     pub fault_injections: Vec<SirFaultInjection>,
+    /// FIFO of fault codes to fail successive bus transactions with (each entry
+    /// fails one transaction); from `inject bus_fault <code> times <n>`.
+    pub bus_fault_queue: Vec<String>,
     /// Virtual-time horizon from `run until <dur>` (None ⇒ run until idle).
     pub run_until_ns: Option<u64>,
     /// SoC memory regions (flash/RAM), for the generated linker script (§6.4).
@@ -85,6 +88,25 @@ pub struct SirReaction {
     /// Static priority for deterministic scheduling and the priority-ceiling
     /// protocol (§5.1, §5.5).  Higher = more urgent.
     pub priority: u8,
+    /// Layer-2 fault disposition at the reaction boundary (§4.4/§5.4).
+    pub disposition: SirDisposition,
+    /// True if the body contains a yielding bus transaction — the handler is a
+    /// state machine that suspends and resumes (§5.2).
+    pub yields: bool,
+}
+
+/// Reaction-boundary fault disposition (§4.4): what happens when a fault
+/// propagates out of the handler body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SirDisposition {
+    /// Raise to the Layer-3 handler (the conservative default).
+    Escalate,
+    /// Re-run the reaction up to `max` times before escalating.
+    Retry { max: u32 },
+    /// Drop this activation, keep scheduling.
+    Skip,
+    /// Drive devices to safe state (§5.6) — modelled as escalate for now.
+    Safe,
 }
 
 #[derive(Debug, Clone)]
@@ -200,6 +222,23 @@ pub enum SirStmt {
     /// hook for composed devices; the slice lowers GPIO set/get directly to a
     /// register access instead (leaf MMIO, §6.5).
     DeviceOp { device: usize, op: String, args: Vec<SirExpr> },
+    /// A yielding bus transaction on a substrate controller (the keystone, §3.5):
+    /// a primitive (empty-bodied, `yields`) op of a leaf controller.  The handler
+    /// **suspends** here; the scheduler runs other work; on completion `dst` is
+    /// bound to the result, or — if `propagate` — a fault short-circuits to the
+    /// reaction's disposition.  On the host the controller is a mock serviced by
+    /// the sim's bus model (§7.1); on metal it lowers to the controller's MMIO.
+    BusXfer {
+        device: usize,
+        op: String,
+        args: Vec<SirExpr>,
+        /// Local to bind the transaction result to (a fresh temp).
+        dst: String,
+        /// True if the call site applied `?` (fault propagates out).
+        propagate: bool,
+        /// Fault codes the op declares it can raise (§4.4/D14).
+        fault_codes: Vec<String>,
+    },
 }
 
 /// An assignable place (left-hand side).

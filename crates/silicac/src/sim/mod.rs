@@ -42,6 +42,15 @@ pub enum TraceKind {
     /// A decoded Layer-3 hardware fault (§5.4): the faulting address and the
     /// language-level diagnosis from the address-ownership map.
     Fault { address: u64, diagnosis: String },
+    /// A reaction suspended on a bus transaction (§5.2/§3.5).
+    BusStart { device: usize, op: String },
+    /// A bus transaction completed: `code` = None on success, Some on fault.
+    BusDone { device: usize, op: String, code: Option<String> },
+    /// A Layer-2 disposition fired at the reaction boundary (§4.4): retry/skip/
+    /// escalate.
+    Dispose { reaction: usize, action: String },
+    /// A re-fire was coalesced because the reaction was still in-flight (§5.1).
+    Coalesced { reaction: usize },
 }
 
 #[derive(Debug, Default)]
@@ -90,6 +99,19 @@ impl SimResult {
                 TraceKind::Fault { address, diagnosis } => {
                     format!("[{:>8.3}ms] FAULT (layer 3): {} (addr 0x{:08x})", ms, diagnosis, address)
                 }
+                TraceKind::BusStart { device, op } => {
+                    format!("[{:>8.3}ms]   bus {}.{}() — suspend (yields)", ms, name_of(*device), op)
+                }
+                TraceKind::BusDone { device, op, code } => match code {
+                    None => format!("[{:>8.3}ms]   bus {}.{}() — done, resume", ms, name_of(*device), op),
+                    Some(c) => format!("[{:>8.3}ms]   bus {}.{}() — FAULT {}", ms, name_of(*device), op, c),
+                },
+                TraceKind::Dispose { reaction, action } => {
+                    format!("[{:>8.3}ms]   reaction#{} disposition: {}", ms, reaction, action)
+                }
+                TraceKind::Coalesced { reaction } => {
+                    format!("[{:>8.3}ms]   reaction#{} re-fire coalesced (in-flight, §5.1)", ms, reaction)
+                }
             };
             out.push_str(&line);
             out.push('\n');
@@ -100,7 +122,6 @@ impl SimResult {
 
 // ─── Event queue ────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 enum Payload {
     /// A periodic `every` timer tick.
     TimerTick { reaction: usize, period_ns: u64 },
@@ -108,6 +129,15 @@ enum Payload {
     Inject { event: usize },
     /// A scripted Layer-3 fault injection (§5.4).
     Fault { addr: u64 },
+    /// Resume a suspended handler when its bus transaction completes (§5.2).
+    Resume {
+        act: Activation,
+        device: usize,
+        op: String,
+        dst: String,
+        propagate: bool,
+        outcome: Result<u64, String>,
+    },
 }
 
 struct QItem {
@@ -117,15 +147,43 @@ struct QItem {
     payload: Payload,
 }
 
+/// A handler activation: the saved state of one (possibly suspended) reaction
+/// run — the §5.2 statically-sized frame plus a top-level program counter.
+#[derive(Clone)]
+struct Activation {
+    reaction: usize,
+    /// Next top-level body index to execute on resume.
+    pc: usize,
+    /// Locals live across yields (the frame), distinct from shared cells.
+    locals: HashMap<String, u64>,
+    /// Layer-2 retry count so far (§4.4).
+    retries: u32,
+}
+
 // ─── Simulator ──────────────────────────────────────────────────────────────────
+
+/// Virtual-time latency the mock bus model gives a transaction (§7.1).
+const BUS_LATENCY_NS: u64 = 2_000;
+/// Fixed data a successful mock bus read returns.
+const BUS_DATA: u64 = 0x0000_5AB0;
 
 struct Sim<'m> {
     module: &'m SirModule,
     now: u64,
     /// device id → (register offset → current value).
     regs: HashMap<usize, HashMap<u64, u64>>,
-    /// cell / local name → current value.
+    /// Shared `cell` storage (persistent, cross-reaction).  Locals live in each
+    /// activation's frame, not here.
     cells: HashMap<String, u64>,
+    /// Names that are cells (vs per-activation locals).
+    cell_names: std::collections::HashSet<String>,
+    /// Per-reaction single-live-activation flag (§5.1).
+    in_flight: Vec<bool>,
+    /// Index into `module.bus_fault_queue` (transactions failed so far).
+    bus_fault_idx: usize,
+    /// Event queue + deterministic tie-break counter.
+    queue: Vec<QItem>,
+    seq: u64,
     trace: Vec<TraceRecord>,
     stdout: String,
     stop: bool,
@@ -133,11 +191,19 @@ struct Sim<'m> {
 
 /// Run the program in `module` under the deterministic host simulator.
 pub fn run(module: &SirModule) -> SimResult {
+    // Module-level vars (cells + program-level lets) are global/shared; all other
+    // names are per-activation locals (the frame).
+    let cell_names = module.vars.iter().map(|v| v.name.clone()).collect();
     let mut sim = Sim {
         module,
         now: 0,
         regs: HashMap::new(),
         cells: HashMap::new(),
+        cell_names,
+        in_flight: vec![false; module.reactions.len()],
+        bus_fault_idx: 0,
+        queue: Vec::new(),
+        seq: 0,
         trace: Vec::new(),
         stdout: String::new(),
         stop: false,
@@ -160,48 +226,46 @@ impl<'m> Sim<'m> {
             self.cells.insert(var.name.clone(), const_value(&var.init));
         }
 
-        // SysStart reactions run once at t=0, before the event loop.
-        for (idx, r) in self.module.reactions.iter().enumerate() {
-            if matches!(r.trigger, SirTrigger::SysStart) {
-                self.fire(idx);
-            }
-        }
-
-        // Seed the event queue.
-        let mut queue: Vec<QItem> = Vec::new();
-        let mut seq = 0u64;
+        // Seed the event queue (timers / injects / faults).
         for (idx, r) in self.module.reactions.iter().enumerate() {
             if let SirTrigger::EveryNs(period) = r.trigger {
-                queue.push(QItem {
+                let seq = self.next_seq();
+                self.queue.push(QItem {
                     at_ns: period, // fixed-rate: first deadline at one period (§4.5/D15)
                     priority: r.priority,
                     seq,
                     payload: Payload::TimerTick { reaction: idx, period_ns: period },
                 });
-                seq += 1;
             }
         }
         for inj in &self.module.injections {
             let priority = self.event_priority(inj.event);
-            queue.push(QItem {
-                at_ns: inj.at_ns,
-                priority,
-                seq,
-                payload: Payload::Inject { event: inj.event },
-            });
-            seq += 1;
+            let seq = self.next_seq();
+            self.queue.push(QItem { at_ns: inj.at_ns, priority, seq, payload: Payload::Inject { event: inj.event } });
         }
         for f in &self.module.fault_injections {
-            // Faults are highest-priority so they order first among same-time events.
-            queue.push(QItem { at_ns: f.at_ns, priority: u8::MAX, seq, payload: Payload::Fault { addr: f.addr } });
-            seq += 1;
+            let seq = self.next_seq();
+            self.queue.push(QItem { at_ns: f.at_ns, priority: u8::MAX, seq, payload: Payload::Fault { addr: f.addr } });
+        }
+
+        // SysStart reactions run once at t=0 (may suspend → enqueue a resume).
+        let starts: Vec<usize> = self
+            .module
+            .reactions
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| matches!(r.trigger, SirTrigger::SysStart))
+            .map(|(i, _)| i)
+            .collect();
+        for idx in starts {
+            self.fire(idx);
         }
 
         let horizon = self.module.run_until_ns.unwrap_or(u64::MAX);
 
         // Discrete-event loop: advance virtual time to each event in turn.
         while !self.stop {
-            let next = match pop_min(&mut queue) {
+            let next = match pop_min(&mut self.queue) {
                 Some(item) => item,
                 None => break,
             };
@@ -212,17 +276,15 @@ impl<'m> Sim<'m> {
             match next.payload {
                 Payload::TimerTick { reaction, period_ns } => {
                     self.fire(reaction);
-                    // Fixed-rate reschedule from the *scheduled* time (§4.5/D15).
-                    queue.push(QItem {
+                    let seq = self.next_seq();
+                    self.queue.push(QItem {
                         at_ns: next.at_ns + period_ns,
                         priority: next.priority,
                         seq,
                         payload: Payload::TimerTick { reaction, period_ns },
                     });
-                    seq += 1;
                 }
                 Payload::Inject { event } => {
-                    // Fire every reaction bound to this event, in priority order.
                     let mut bound: Vec<usize> = self
                         .module
                         .reactions
@@ -232,25 +294,30 @@ impl<'m> Sim<'m> {
                         .map(|(idx, _)| idx)
                         .collect();
                     bound.sort_by(|&a, &b| {
-                        self.module.reactions[b]
-                            .priority
-                            .cmp(&self.module.reactions[a].priority)
-                            .then(a.cmp(&b))
+                        self.module.reactions[b].priority.cmp(&self.module.reactions[a].priority).then(a.cmp(&b))
                     });
                     for idx in bound {
                         self.fire(idx);
                     }
                 }
                 Payload::Fault { addr } => {
-                    // Layer-3 decode against the address-ownership map (§5.4).
                     let decoded = layer3::decode_address(self.module, addr);
                     self.trace.push(TraceRecord {
                         at_ns: self.now,
                         kind: TraceKind::Fault { address: addr, diagnosis: decoded.diagnosis },
                     });
                 }
+                Payload::Resume { act, device, op, dst, propagate, outcome } => {
+                    self.resume(act, device, op, dst, propagate, outcome);
+                }
             }
         }
+    }
+
+    fn next_seq(&mut self) -> u64 {
+        let s = self.seq;
+        self.seq += 1;
+        s
     }
 
     fn event_priority(&self, event: usize) -> u8 {
@@ -263,40 +330,160 @@ impl<'m> Sim<'m> {
             .unwrap_or(2)
     }
 
+    /// Start a fresh activation of reaction `idx` (or coalesce if it is still
+    /// in-flight — single live activation, §5.1).
     fn fire(&mut self, idx: usize) {
-        // The module is immutable for the whole run; copy the `&'m` reference so
-        // the borrowed body is independent of `&mut self` (sim state).
-        let module = self.module;
-        let r = &module.reactions[idx];
-        let source = trigger_desc(&r.trigger);
+        if self.in_flight[idx] {
+            self.trace.push(TraceRecord { at_ns: self.now, kind: TraceKind::Coalesced { reaction: idx } });
+            return;
+        }
+        self.in_flight[idx] = true;
+        let source = trigger_desc(&self.module.reactions[idx].trigger);
         self.trace.push(TraceRecord {
             at_ns: self.now,
-            kind: TraceKind::ReactionFire { reaction: r.id, source },
+            kind: TraceKind::ReactionFire { reaction: idx, source },
         });
-        self.eval_stmts(&r.body);
+        let act = Activation { reaction: idx, pc: 0, locals: HashMap::new(), retries: 0 };
+        self.run_activation(act);
     }
 
-    fn eval_stmts(&mut self, body: &[SirStmt]) {
+    /// Run an activation from its `pc` over the reaction's top-level body until
+    /// it suspends on a `BusXfer` (§5.2) or completes.
+    fn run_activation(&mut self, mut act: Activation) {
+        let module = self.module; // copy `&'m` ref so the body is borrow-independent
+        let body = &module.reactions[act.reaction].body;
+        while act.pc < body.len() {
+            if self.stop {
+                return;
+            }
+            match &body[act.pc] {
+                SirStmt::BusXfer { device, op, args, dst, propagate, .. } => {
+                    let argvals: Vec<u64> = args.iter().map(|a| self.eval_expr(a, &act.locals)).collect();
+                    let _ = argvals; // args drive a real controller on metal; the mock is value-fixed
+                    let (latency, outcome) = self.service_bus();
+                    self.trace.push(TraceRecord {
+                        at_ns: self.now,
+                        kind: TraceKind::BusStart { device: *device, op: op.clone() },
+                    });
+                    act.pc += 1; // resume after this transaction
+                    let seq = self.next_seq();
+                    let priority = module.reactions[act.reaction].priority;
+                    self.queue.push(QItem {
+                        at_ns: self.now + latency,
+                        priority,
+                        seq,
+                        payload: Payload::Resume {
+                            act,
+                            device: *device,
+                            op: op.clone(),
+                            dst: dst.clone(),
+                            propagate: *propagate,
+                            outcome,
+                        },
+                    });
+                    return; // suspend — the scheduler runs other work meanwhile
+                }
+                stmt => {
+                    self.eval_stmt(stmt, &mut act.locals);
+                    act.pc += 1;
+                }
+            }
+        }
+        // Completed without an unhandled fault.
+        self.in_flight[act.reaction] = false;
+    }
+
+    /// Resume a suspended activation when its bus transaction completes.
+    fn resume(&mut self, mut act: Activation, device: usize, op: String, dst: String, propagate: bool, outcome: Result<u64, String>) {
+        let code = outcome.as_ref().err().cloned();
+        self.trace.push(TraceRecord {
+            at_ns: self.now,
+            kind: TraceKind::BusDone { device, op, code: code.clone() },
+        });
+        match outcome {
+            Ok(v) => {
+                act.locals.insert(dst, v);
+                self.run_activation(act);
+            }
+            Err(c) if propagate => self.dispose(act, c),
+            Err(_) => {
+                act.locals.insert(dst, 0);
+                self.run_activation(act);
+            }
+        }
+    }
+
+    /// Apply the reaction's Layer-2 fault disposition (§4.4/§5.4).
+    fn dispose(&mut self, mut act: Activation, code: String) {
+        let disp = self.module.reactions[act.reaction].disposition;
+        match disp {
+            SirDisposition::Retry { max } if act.retries < max => {
+                act.retries += 1;
+                self.trace.push(TraceRecord {
+                    at_ns: self.now,
+                    kind: TraceKind::Dispose { reaction: act.reaction, action: format!("retry {}/{}", act.retries, max) },
+                });
+                act.pc = 0;
+                act.locals.clear();
+                self.run_activation(act);
+            }
+            SirDisposition::Skip => {
+                self.trace.push(TraceRecord {
+                    at_ns: self.now,
+                    kind: TraceKind::Dispose { reaction: act.reaction, action: format!("skip ({})", code) },
+                });
+                self.in_flight[act.reaction] = false;
+            }
+            _ => {
+                // Escalate / Safe / retry-exhausted → Layer-3.
+                self.trace.push(TraceRecord {
+                    at_ns: self.now,
+                    kind: TraceKind::Dispose { reaction: act.reaction, action: format!("escalate ({})", code) },
+                });
+                self.in_flight[act.reaction] = false;
+            }
+        }
+    }
+
+    /// The mock bus model (§7.1): a fixed latency + either the fault at the head
+    /// of the injected queue, or success with fixed data.
+    fn service_bus(&mut self) -> (u64, Result<u64, String>) {
+        if self.bus_fault_idx < self.module.bus_fault_queue.len() {
+            let code = self.module.bus_fault_queue[self.bus_fault_idx].clone();
+            self.bus_fault_idx += 1;
+            (BUS_LATENCY_NS, Err(code))
+        } else {
+            (BUS_LATENCY_NS, Ok(BUS_DATA))
+        }
+    }
+
+    fn eval_stmts(&mut self, body: &[SirStmt], frame: &mut HashMap<String, u64>) {
         for stmt in body {
             if self.stop {
                 break;
             }
-            self.eval_stmt(stmt);
+            self.eval_stmt(stmt, frame);
         }
     }
 
-    fn eval_stmt(&mut self, stmt: &SirStmt) {
+    fn eval_stmt(&mut self, stmt: &SirStmt, frame: &mut HashMap<String, u64>) {
         match stmt {
             SirStmt::Intrinsic(intr) => self.eval_intrinsic(intr),
             SirStmt::Assign { target, value } => {
-                let v = self.eval_expr(value);
+                let v = self.eval_expr(value, frame);
                 match target {
                     SirPlace::Var(name) => {
-                        self.cells.insert(name.clone(), v);
-                        self.trace.push(TraceRecord {
-                            at_ns: self.now,
-                            kind: TraceKind::CellWrite { name: name.clone(), value: v },
-                        });
+                        // Module-level vars (cells) are shared/global and traced;
+                        // everything else is a per-activation local (the frame).
+                        if self.cell_names.contains(name) {
+                            self.cells.insert(name.clone(), v);
+                            self.trace.push(TraceRecord {
+                                at_ns: self.now,
+                                kind: TraceKind::CellWrite { name: name.clone(), value: v },
+                            });
+                        } else {
+                            frame.insert(name.clone(), v);
+                        }
                     }
                     SirPlace::Reg { device, reg_offset, field_mask, field_shift, access, .. } => {
                         self.write_reg(*device, *reg_offset, *field_mask, *field_shift, *access, v);
@@ -304,8 +491,8 @@ impl<'m> Sim<'m> {
                 }
             }
             SirStmt::If { cond, then } => {
-                if self.eval_expr(cond) != 0 {
-                    self.eval_stmts(then);
+                if self.eval_expr(cond, frame) != 0 {
+                    self.eval_stmts(then, frame);
                 }
             }
             SirStmt::Critical { ceiling, body } => {
@@ -313,10 +500,17 @@ impl<'m> Sim<'m> {
                     at_ns: self.now,
                     kind: TraceKind::CriticalEnter { ceiling: *ceiling },
                 });
-                self.eval_stmts(body);
+                self.eval_stmts(body, frame);
                 self.trace.push(TraceRecord { at_ns: self.now, kind: TraceKind::CriticalExit });
             }
             SirStmt::DeviceOp { .. } => { /* Phase-1 composed-device hook */ }
+            SirStmt::BusXfer { dst, .. } => {
+                // Unreachable: top-level transactions are handled by
+                // `run_activation`, and the resolver rejects yields nested in
+                // `if`/critical-section (§5.2/§5.5).  Kept as a defensive no-op.
+                debug_assert!(false, "nested BusXfer reached eval_stmt — resolver should have rejected it");
+                frame.insert(dst.clone(), 0);
+            }
             SirStmt::Exit(_) => {
                 self.stop = true;
             }
@@ -373,12 +567,19 @@ impl<'m> Sim<'m> {
         });
     }
 
-    fn eval_expr(&self, expr: &SirExpr) -> u64 {
+    fn eval_expr(&self, expr: &SirExpr, frame: &HashMap<String, u64>) -> u64 {
         match expr {
             SirExpr::Bool(b) => *b as u64,
             SirExpr::U64(n) => *n,
             SirExpr::Bytes(_) => 0,
-            SirExpr::Load(name) => *self.cells.get(name).unwrap_or(&0),
+            SirExpr::Load(name) => {
+                // Shared cells from global storage; everything else is a local.
+                if self.cell_names.contains(name) {
+                    *self.cells.get(name).unwrap_or(&0)
+                } else {
+                    *frame.get(name).unwrap_or(&0)
+                }
+            }
             SirExpr::RegLoad { device, reg_offset, field_mask, field_shift, .. } => {
                 let cur = self
                     .regs
@@ -388,10 +589,10 @@ impl<'m> Sim<'m> {
                     .unwrap_or(0);
                 (cur & field_mask) >> field_shift
             }
-            SirExpr::Not(inner) => (self.eval_expr(inner) == 0) as u64,
+            SirExpr::Not(inner) => (self.eval_expr(inner, frame) == 0) as u64,
             SirExpr::BinOp(op, l, r) => {
-                let a = self.eval_expr(l);
-                let b = self.eval_expr(r);
+                let a = self.eval_expr(l, frame);
+                let b = self.eval_expr(r, frame);
                 match op {
                     SirBinOp::Add => a.wrapping_add(b),
                     SirBinOp::Sub => a.wrapping_sub(b),

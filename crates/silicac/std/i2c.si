@@ -1,0 +1,14 @@
+// std-lib I²C bus interface (§3.5).  A *contract*: a named set of op signatures
+// (with semantics) that controllers provide (`implements i2c`) and devices
+// require (`needs bus: i2c`).  Transfers are yielding, fallible transactions —
+// the keystone over which composed devices express their ops.
+
+interface i2c {
+  type address = u32
+
+  // A register read/write over the bus.  Each is one indivisible transaction
+  // that suspends once (§3.5/SIL-003) and can fault (NAK / clock-stretch
+  // timeout / arbitration-lost, §4.4/D14).
+  op read_reg(addr: u32, reg: u32) -> u32 or fault{nak, timeout, arblost} yields
+  op write_reg(addr: u32, reg: u32, val: u32) -> () or fault{nak, timeout, arblost} yields
+}

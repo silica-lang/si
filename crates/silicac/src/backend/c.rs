@@ -264,6 +264,12 @@ impl CBackend {
             SirStmt::DeviceOp { device, op, .. } => {
                 self.line(&format!("/* TODO(metal): device {} op {} */", device, op));
             }
+            SirStmt::BusXfer { device, op, dst, .. } => {
+                // Metal lowering of yielding bus transactions (state-machine
+                // switch + controller MMIO) is increment 2; the sim services
+                // these (§7.1).
+                self.line(&format!("/* TODO(metal): bus xfer device {} op {} -> {} (increment 2) */", device, op, dst));
+            }
             SirStmt::Exit(code) => {
                 let c = emit_expr(code);
                 self.line(&format!("exit((int)({}));", c));
@@ -1056,6 +1062,8 @@ mod tests {
                     body: vec![SirStmt::Intrinsic(SirIntrinsic::HostIoPrintStr("hi\n".into()))],
                 }],
                 priority: 0,
+                disposition: SirDisposition::Escalate,
+                yields: false,
             }],
             ..Default::default()
         };
@@ -1074,6 +1082,8 @@ mod tests {
                     "Hello, World!\n".into(),
                 ))],
                 priority: 0,
+                disposition: SirDisposition::Escalate,
+                yields: false,
             }],
             ..Default::default()
         };

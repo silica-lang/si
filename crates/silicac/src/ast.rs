@@ -302,11 +302,17 @@ pub struct EmitDecl {
     pub span: Span,
 }
 
-// ─── Interface (thin stub, §3.5) ───────────────────────────────────────────────
+// ─── Interface (§3.5) ──────────────────────────────────────────────────────────
 
+/// A named contract a device provides (`implements i2c`) or requires
+/// (`needs bus: i2c`): a set of op signatures (bodies empty) + type members.
 #[derive(Debug, Clone)]
 pub struct InterfaceDef {
     pub name: Ident,
+    /// Op signatures the interface declares (`op transfer(...) -> ... yields`).
+    pub ops: Vec<OpDecl>,
+    /// `type address = u7` members (parsed; the alias target is recorded).
+    pub types: Vec<(Ident, Ident)>,
     pub span: Span,
 }
 
@@ -425,6 +431,9 @@ pub struct SimDef {
     pub injections: Vec<Injection>,
     /// `inject fault <addr> at <duration>` — Layer-3 hardware-fault injections.
     pub faults: Vec<FaultInjection>,
+    /// `inject bus_fault <code> times <n>` — fail the next n bus transactions
+    /// with `code` (for exercising the fault path / retry, §12).
+    pub bus_faults: Vec<(Ident, u32)>,
     /// `run until <duration>` — virtual-time horizon.
     pub run_until: Option<Duration>,
     pub span: Span,
@@ -481,6 +490,9 @@ pub struct Param {
 pub struct ReturnType {
     pub ty: TypeExpr,
     pub fallible: bool, // `-> T or fault`
+    /// Declared fault codes (§4.4/D14): `or fault{nak, timeout}`. Empty when
+    /// `or fault` is written without an explicit code set.
+    pub fault_codes: Vec<Ident>,
 }
 
 #[derive(Debug, Clone)]
