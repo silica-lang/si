@@ -1168,6 +1168,7 @@ impl Parser {
         let mut injections = Vec::new();
         let mut faults = Vec::new();
         let mut bus_faults = Vec::new();
+        let mut bus_hangs = 0u32;
         let mut run_until = None;
         while self.peek() != Some(&Token::RBrace) {
             if self.at_end() {
@@ -1186,6 +1187,17 @@ impl Parser {
                         self.eat_optional_semi();
                         let iend = self.prev_span().end;
                         faults.push(FaultInjection { addr, at, span: Span::new(istart, iend) });
+                    } else if matches!(self.peek(), Some(Token::Ident(s)) if s == "bus_hang") {
+                        // `inject bus_hang [times <n>]`
+                        self.advance();
+                        let times = if matches!(self.peek(), Some(Token::Ident(s)) if s == "times") {
+                            self.advance();
+                            self.expect_int_lit()? as u32
+                        } else {
+                            1
+                        };
+                        self.eat_optional_semi();
+                        bus_hangs += times;
                     } else if matches!(self.peek(), Some(Token::Ident(s)) if s == "bus_fault") {
                         // `inject bus_fault <code> times <n>`
                         self.advance();
@@ -1230,7 +1242,7 @@ impl Parser {
         }
         let end = self.current_span().end;
         self.eat(&Token::RBrace)?;
-        Ok(SimDef { name, program, injections, faults, bus_faults, run_until, span: Span::new(start, end) })
+        Ok(SimDef { name, program, injections, faults, bus_faults, bus_hangs, run_until, span: Span::new(start, end) })
     }
 
     // ── Block & statements ──────────────────────────────────────────────────
@@ -1533,6 +1545,13 @@ impl Parser {
                 let span = self.current_span();
                 self.advance();
                 Ok(Expr { kind: ExprKind::IntLit(bytes), span })
+            }
+            // Duration literals fold to nanoseconds in expression position —
+            // e.g. a config value `timeout = 100ms`.
+            Some(Token::DurationLit(v, u)) => {
+                let span = self.current_span();
+                self.advance();
+                Ok(Expr { kind: ExprKind::IntLit(u.to_ns(v)), span })
             }
             Some(Token::KwTrue) => {
                 let span = self.current_span();

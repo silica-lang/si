@@ -153,6 +153,8 @@ pub struct Resolver {
     fault_injections: Vec<SirFaultInjection>,
     bus_fault_queue: Vec<String>,
     safe_seqs: Vec<SafeSeq>,
+    watchdog_timeout_ns: Option<u64>,
+    bus_hangs: u32,
     run_until_ns: Option<u64>,
     memory: Vec<SirRegion>,
     pins: Vec<SirPin>,
@@ -193,6 +195,8 @@ impl Resolver {
             fault_injections: Vec::new(),
             bus_fault_queue: Vec::new(),
             safe_seqs: Vec::new(),
+            watchdog_timeout_ns: None,
+            bus_hangs: 0,
             run_until_ns: None,
             memory: Vec::new(),
             pins: Vec::new(),
@@ -265,6 +269,8 @@ impl Resolver {
                 memory: self.memory,
                 pins: self.pins,
                 core_hz: self.core_hz,
+                watchdog_timeout_ns: self.watchdog_timeout_ns,
+                bus_hangs: self.bus_hangs,
             })
         } else {
             Err(self.errors)
@@ -496,6 +502,30 @@ impl Resolver {
                 }
             }
             self.instance_needs.insert(dev_id, resolved);
+        }
+
+        // Identify the system watchdog (§5.6/SIL-006): the instance whose device
+        // implements the `watchdog` interface (structural, not by name — §2).
+        // Its `timeout` comes from the instance config or the device default.
+        for inst in &board.instances {
+            if !self.implements(&inst.device_ty.name, "watchdog") {
+                continue;
+            }
+            let from_inst = inst
+                .config
+                .iter()
+                .find(|(k, _)| k.name == "timeout")
+                .and_then(|(_, e)| if let ExprKind::IntLit(n) = e.kind { Some(n) } else { None });
+            let from_default = self
+                .device_defs
+                .get(&inst.device_ty.name)
+                .and_then(|d| d.sections.config.as_ref())
+                .and_then(|c| c.fields.iter().find(|f| f.name.name == "timeout"))
+                .and_then(|f| f.default.as_ref())
+                .and_then(|e| if let ExprKind::IntLit(n) = e.kind { Some(n) } else { None });
+            if let Some(ns) = from_inst.or(from_default) {
+                self.watchdog_timeout_ns = Some(ns);
+            }
         }
 
         // Lower each instance's safe op (§5.6), if its type declares one.
@@ -1458,6 +1488,7 @@ impl Resolver {
                 self.bus_fault_queue.push(code.name.clone());
             }
         }
+        self.bus_hangs += sim.bus_hangs;
         if let Some(d) = sim.run_until {
             self.run_until_ns = Some(d.to_ns());
         }

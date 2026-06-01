@@ -434,6 +434,9 @@ pub struct SimDef {
     /// `inject bus_fault <code> times <n>` — fail the next n bus transactions
     /// with `code` (for exercising the fault path / retry, §12).
     pub bus_faults: Vec<(Ident, u32)>,
+    /// `inject bus_hang times <n>` — hang the next n bus transactions (a wedged
+    /// bus that never completes), for exercising the watchdog (§5.6).
+    pub bus_hangs: u32,
     /// `run until <duration>` — virtual-time horizon.
     pub run_until: Option<Duration>,
     pub span: Span,
