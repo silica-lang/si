@@ -34,6 +34,8 @@ pub struct SirModule {
     /// FIFO of fault codes to fail successive bus transactions with (each entry
     /// fails one transaction); from `inject bus_fault <code> times <n>`.
     pub bus_fault_queue: Vec<String>,
+    /// Lowered device safe sequences (§5.6): driven on a `safe` disposition.
+    pub safe_seqs: Vec<SafeSeq>,
     /// Virtual-time horizon from `run until <dur>` (None ⇒ run until idle).
     pub run_until_ns: Option<u64>,
     /// SoC memory regions (flash/RAM), for the generated linker script (§6.4).
@@ -177,6 +179,15 @@ pub struct SirEvent {
 pub struct SirInjection {
     pub at_ns: u64,
     pub event: usize,
+}
+
+/// A device's lowered safe op (§5.6): the bounded, non-yielding statement
+/// sequence that drives the device to `state` on an unrecovered fault.
+#[derive(Debug)]
+pub struct SafeSeq {
+    pub device: usize,
+    pub state: String,
+    pub body: Vec<SirStmt>,
 }
 
 /// A scripted Layer-3 hardware-fault injection (§5.4): a fault to `addr` at a
