@@ -317,6 +317,12 @@ impl<'m> Sim<'m> {
                 self.trace.push(TraceRecord { at_ns: self.now, kind: TraceKind::CriticalExit });
             }
             SirStmt::DeviceOp { .. } => { /* Phase-1 composed-device hook */ }
+            SirStmt::BusXfer { dst, .. } => {
+                // Placeholder: real suspension (yield → resume) + bus model is
+                // wired next; for now complete immediately so the lowering is
+                // exercisable.  (Stage 3/4.)
+                self.cells.insert(dst.clone(), 0);
+            }
             SirStmt::Exit(_) => {
                 self.stop = true;
             }

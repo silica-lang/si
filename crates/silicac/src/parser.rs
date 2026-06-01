@@ -462,18 +462,31 @@ impl Parser {
         let ret = if self.peek() == Some(&Token::Arrow) {
             self.advance();
             let ty = self.parse_type()?;
-            let fallible = if self.peek() == Some(&Token::KwOr) {
+            let (fallible, fault_codes) = if self.peek() == Some(&Token::KwOr) {
                 self.advance();
                 self.eat(&Token::KwFault)?;
-                true
+                // optional declared code set: `fault{nak, timeout}`
+                let mut codes = Vec::new();
+                if self.peek() == Some(&Token::LBrace) {
+                    self.advance();
+                    while self.peek() != Some(&Token::RBrace) {
+                        codes.push(self.eat_ident()?);
+                        if self.peek() == Some(&Token::Comma) {
+                            self.advance();
+                        }
+                    }
+                    self.eat(&Token::RBrace)?;
+                }
+                (true, codes)
             } else {
-                false
+                (false, Vec::new())
             };
-            ReturnType { ty, fallible }
+            ReturnType { ty, fallible, fault_codes }
         } else {
             ReturnType {
                 ty: TypeExpr { kind: TypeKind::Unit, span: Span::default() },
                 fallible: false,
+                fault_codes: Vec::new(),
             }
         };
 
@@ -748,11 +761,35 @@ impl Parser {
         let start = self.current_span().start;
         self.eat(&Token::KwInterface)?;
         let name = self.eat_ident()?;
-        // Consume the body with balanced-brace skipping — the slice does not
-        // lower interfaces, it only needs to not choke on them (§3.5).
-        self.skip_balanced_braces()?;
-        let end = self.prev_span().end;
-        Ok(InterfaceDef { name, span: Span::new(start, end) })
+        self.eat(&Token::LBrace)?;
+        let mut ops = Vec::new();
+        let mut types = Vec::new();
+        while self.peek() != Some(&Token::RBrace) {
+            if self.at_end() {
+                return Err(self.error("unexpected EOF in interface body"));
+            }
+            match self.peek() {
+                Some(Token::KwOp) => ops.push(self.parse_op_decl()?),
+                // `type address = u7`
+                Some(Token::Ident(s)) if s == "type" => {
+                    self.advance();
+                    let alias = self.eat_ident()?;
+                    self.eat(&Token::Eq)?;
+                    let target = self.eat_ident()?;
+                    self.eat_optional_semi();
+                    types.push((alias, target));
+                }
+                other => {
+                    return Err(ParseError {
+                        span: self.current_span(),
+                        msg: format!("expected `op` or `type` in interface body, got {:?}", other),
+                    })
+                }
+            }
+        }
+        let end = self.current_span().end;
+        self.eat(&Token::RBrace)?;
+        Ok(InterfaceDef { name, ops, types, span: Span::new(start, end) })
     }
 
     fn skip_balanced_braces(&mut self) -> Result<(), ParseError> {

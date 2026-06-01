@@ -42,9 +42,28 @@ enum Binding {
     Board(String),
     /// A pin alias (`let led = board.led_user`).
     Pin(PinRef),
+    /// A board device-instance alias (`let sensor = board.env`) — for composed
+    /// devices whose ops are called (`sensor.read_temp()`).
+    Device(InstanceRef),
     /// A `use` alias pointing to another name.
     #[allow(dead_code)]
     Alias(Vec<String>),
+}
+
+/// A resolved reference to a board device instance.
+#[derive(Debug, Clone)]
+struct InstanceRef {
+    device: usize,
+    ty: String,
+}
+
+/// What a device instance's `needs` relation resolves to.
+#[derive(Debug, Clone)]
+enum NeedVal {
+    /// A reference to another device instance (e.g. `bus = i2c0`).
+    Device(InstanceRef),
+    /// A constant value (e.g. `addr = 0x76`).
+    Const(u64),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -89,6 +108,8 @@ impl Scope {
 struct BoardContext {
     /// Pin-binding name → resolved pin reference (`led_user` → …).
     pins: HashMap<String, PinRef>,
+    /// Instance name → device instance (`env` → bme280 #3) for composed devices.
+    instances: HashMap<String, InstanceRef>,
 }
 
 // ─── Resolver ─────────────────────────────────────────────────────────────────
@@ -97,8 +118,17 @@ pub struct Resolver {
     errors: Vec<Diag>,
     /// Device *types* by name (std-lib + user), e.g. `gpio` → its `DeviceDef`.
     device_defs: HashMap<String, DeviceDef>,
+    /// Interface declarations by name (`i2c` → its `InterfaceDef`).
+    interfaces: HashMap<String, InterfaceDef>,
     /// Board declarations by name.
     boards: HashMap<String, BoardDef>,
+    /// Device id → its resolved `needs` (`bus` → i2c0, `addr` → 0x76).
+    instance_needs: HashMap<usize, HashMap<String, NeedVal>>,
+    /// Counter for fresh temporaries introduced by op inlining / `?`.
+    tmp_counter: usize,
+    /// Stack of result-locals for ops currently being inlined; `return X` in an
+    /// op body binds the top.
+    op_result: Vec<String>,
 
     // ── output accumulators ──
     devices: Vec<SirDevice>,
@@ -134,7 +164,11 @@ impl Resolver {
         Resolver {
             errors: Vec::new(),
             device_defs: HashMap::new(),
+            interfaces: HashMap::new(),
             boards: HashMap::new(),
+            instance_needs: HashMap::new(),
+            tmp_counter: 0,
+            op_result: Vec::new(),
             devices: Vec::new(),
             events: Vec::new(),
             cells: Vec::new(),
@@ -162,10 +196,20 @@ impl Resolver {
                 Item::Device(d) => {
                     self.device_defs.insert(d.name.name.clone(), d.clone());
                 }
+                Item::Interface(i) => {
+                    self.interfaces.insert(i.name.name.clone(), i.clone());
+                }
                 Item::Board(b) => {
                     self.boards.insert(b.name.name.clone(), b.clone());
                 }
                 _ => {}
+            }
+        }
+
+        // ── Check `implements` conformance (§4.1/D18) ──
+        for item in &module.items {
+            if let Item::Device(d) = item {
+                self.check_conformance(d);
             }
         }
 
@@ -222,10 +266,12 @@ impl Resolver {
             match item {
                 ProgramItem::UseDecl(u) => self.resolve_use(u, &mut scope),
                 ProgramItem::LetDecl(l) => {
-                    // A `let` whose initialiser names a board pin is a pin alias
-                    // (compile-time), not storage.
+                    // A `let` whose initialiser names a board pin / device instance
+                    // is a compile-time alias, not storage.
                     if let Some(pin) = self.try_resolve_pin_expr(&l.init, &scope) {
                         scope.insert(&l.name.name, Binding::Pin(pin));
+                    } else if let Some(inst) = self.try_resolve_instance_expr(&l.init, &scope) {
+                        scope.insert(&l.name.name, Binding::Device(inst));
                     } else {
                         let ty = infer_type_from_expr(&l.init);
                         let init = self.lower_expr(&l.init, &scope);
@@ -373,6 +419,45 @@ impl Resolver {
             instance_ids.insert(inst.name.name.clone(), id);
         }
 
+        // Resolve each instance's `needs` relations (e.g. `bus = i2c0`) so a
+        // composed device's op body can reach its substrate.  A `needs` typed by
+        // an interface must be satisfied by an instance whose device implements
+        // that interface (§4.1/D18).
+        let instances: HashMap<String, InstanceRef> = instance_ids
+            .iter()
+            .map(|(name, &id)| {
+                let ty = self.dev_types.get(&id).cloned().unwrap_or_default();
+                (name.clone(), InstanceRef { device: id, ty })
+            })
+            .collect();
+        for inst in &board.instances {
+            let Some(&dev_id) = instance_ids.get(&inst.name.name) else { continue };
+            let declared = self.device_defs.get(&inst.device_ty.name).and_then(|d| d.sections.needs.clone());
+            let mut resolved: HashMap<String, NeedVal> = HashMap::new();
+            for (need_name, path) in &inst.needs {
+                let head = &path[0].name;
+                if let Some(target) = instances.get(head) {
+                    // If the need is interface-typed, check conformance (D18).
+                    if let Some(ns) = &declared {
+                        if let Some(nd) = ns.needs.iter().find(|n| n.name.name == need_name.name) {
+                            let iface = &nd.ty.name;
+                            if self.interfaces.contains_key(iface) && !self.implements(&target.ty, iface) {
+                                self.err(
+                                    inst.span,
+                                    format!(
+                                        "instance '{}': `{}` requires an `{}` provider, but '{}' (type '{}') does not implement it",
+                                        inst.name.name, need_name.name, iface, head, target.ty
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    resolved.insert(need_name.name.clone(), NeedVal::Device(target.clone()));
+                }
+            }
+            self.instance_needs.insert(dev_id, resolved);
+        }
+
         // Pin bindings — with duplicate physical-pad detection (§3.3).
         let mut pad_owner: HashMap<(String, u64), (String, Span)> = HashMap::new();
         let mut claim_pad = |errs: &mut Vec<Diag>, port: &str, index: u64, owner: &str, span: Span| {
@@ -429,7 +514,7 @@ impl Resolver {
         }
 
         let _ = use_span;
-        let ctx = BoardContext { pins };
+        let ctx = BoardContext { pins, instances };
         self.boards_built.insert(board_name.to_string(), ctx.clone());
         self.board_ctx = Some(ctx);
     }
@@ -441,6 +526,21 @@ impl Resolver {
                 if let Some(Binding::Board(_)) = scope.lookup(root) {
                     if let Some(ctx) = &self.board_ctx {
                         return ctx.pins.get(&field.name).cloned();
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// If `expr` is `<board-alias>.<instance>`, resolve it to an [`InstanceRef`]
+    /// (a composed/leaf device whose ops are called).
+    fn try_resolve_instance_expr(&mut self, expr: &Expr, scope: &Scope) -> Option<InstanceRef> {
+        if let ExprKind::Field(base, field) = &expr.kind {
+            if let Some(root) = expr_root_ident(base) {
+                if let Some(Binding::Board(_)) = scope.lookup(root) {
+                    if let Some(ctx) = &self.board_ctx {
+                        return ctx.instances.get(&field.name).cloned();
                     }
                 }
             }
@@ -470,7 +570,57 @@ impl Resolver {
         };
 
         let body = self.lower_block(&r.body, scope, vars);
-        Some(SirReaction { id, trigger, body, priority })
+        let yields = body_yields(&body);
+        let disposition = lower_disposition(&r.fault_disp);
+        Some(SirReaction { id, trigger, body, priority, disposition, yields })
+    }
+
+    /// Does `ty` implement interface `iface` (a declared `implements`)?
+    fn implements(&self, ty: &str, iface: &str) -> bool {
+        self.device_defs
+            .get(ty)
+            .map(|d| d.implements.iter().any(|i| i.name == iface))
+            .unwrap_or(false)
+    }
+
+    /// Check a device's `implements` claims against the interface op signatures
+    /// (§4.1/D18): every interface op must have a matching device op (name +
+    /// arity).  Nominal (the `implements` is a declared claim) + structural.
+    fn check_conformance(&mut self, d: &DeviceDef) {
+        let dev_ops: Vec<(&str, usize)> = d
+            .sections
+            .ops
+            .as_ref()
+            .map(|s| {
+                s.items
+                    .iter()
+                    .map(|OpsItem::Op(o)| (o.name.name.as_str(), o.params.len()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for iface_name in &d.implements {
+            // Snapshot the interface's op shapes so the immutable borrow is
+            // released before reporting errors.
+            let iface_ops: Vec<(String, usize)> = match self.interfaces.get(&iface_name.name) {
+                Some(iface) => iface.ops.iter().map(|o| (o.name.name.clone(), o.params.len())).collect(),
+                None => {
+                    self.err(iface_name.span, format!("unknown interface '{}'", iface_name.name));
+                    continue;
+                }
+            };
+            for (opname, arity) in &iface_ops {
+                let ok = dev_ops.iter().any(|(n, a)| n == opname && a == arity);
+                if !ok {
+                    self.err(
+                        d.name.span,
+                        format!(
+                            "device '{}' implements '{}' but is missing op `{}({} args)`",
+                            d.name.name, iface_name.name, opname, arity
+                        ),
+                    );
+                }
+            }
+        }
     }
 
     fn lower_event_trigger(&mut self, event_ref: &EventRef, scope: &Scope) -> Option<SirTrigger> {
@@ -544,87 +694,214 @@ impl Resolver {
         for (name, binding) in &scope.bindings {
             local_scope.insert(name, binding.clone());
         }
-        let mut stmts = Vec::new();
+        let mut out = Vec::new();
         for stmt in &block.stmts {
-            if let Some(s) = self.lower_stmt(stmt, &mut local_scope, vars) {
-                stmts.push(s);
-            }
+            self.lower_stmt(stmt, &mut local_scope, vars, &mut out);
         }
-        stmts
+        out
     }
 
-    fn lower_stmt(&mut self, stmt: &Stmt, scope: &mut Scope, _vars: &[SirVar]) -> Option<SirStmt> {
+    fn lower_stmt(&mut self, stmt: &Stmt, scope: &mut Scope, vars: &[SirVar], out: &mut Vec<SirStmt>) {
         match stmt {
-            Stmt::Expr(expr) => self.lower_expr_stmt(expr, scope),
+            Stmt::Expr(expr) => self.lower_expr_stmt(expr, scope, vars, out),
             Stmt::Let(l) => {
                 let ty = infer_type_from_expr(&l.init);
-                let value = self.lower_expr(&l.init, scope);
+                let value = self.lower_expr_emit(&l.init, scope, vars, out);
                 scope.insert(&l.name.name, Binding::Local(l.name.name.clone(), ty));
-                Some(SirStmt::Assign { target: SirPlace::Var(l.name.name.clone()), value })
+                out.push(SirStmt::Assign { target: SirPlace::Var(l.name.name.clone()), value });
             }
-            Stmt::Become(_, _) => None, // typestate transition — Phase 1
+            Stmt::Become(_, _) => {} // typestate transition — later
             Stmt::Return(expr, _) => {
-                if let Some(e) = expr {
-                    let val = self.lower_expr(e, scope);
-                    Some(SirStmt::Assign { target: SirPlace::Var("__ret".into()), value: val })
-                } else {
-                    None
+                // Inside an inlined op body, `return X` binds the op's result
+                // local; at the reaction top level it is a no-op.
+                let target = self.op_result.last().cloned();
+                if let (Some(e), Some(t)) = (expr, target) {
+                    let val = self.lower_expr_emit(e, scope, vars, out);
+                    out.push(SirStmt::Assign { target: SirPlace::Var(t), value: val });
+                } else if let Some(e) = expr {
+                    let _ = self.lower_expr_emit(e, scope, vars, out);
                 }
             }
             Stmt::Exit(code, _) => {
-                let val = self.lower_expr(code, scope);
-                Some(SirStmt::Exit(val))
+                let val = self.lower_expr_emit(code, scope, vars, out);
+                out.push(SirStmt::Exit(val));
             }
         }
     }
 
-    fn lower_expr_stmt(&mut self, expr: &Expr, scope: &mut Scope) -> Option<SirStmt> {
+    fn lower_expr_stmt(&mut self, expr: &Expr, scope: &mut Scope, vars: &[SirVar], out: &mut Vec<SirStmt>) {
         match &expr.kind {
             ExprKind::Assign(lhs, rhs) => {
-                let place = self.expr_to_place(lhs, scope)?;
-                let value = self.lower_expr(rhs, scope);
-                Some(SirStmt::Assign { target: place, value })
+                if let Some(place) = self.expr_to_place(lhs, scope) {
+                    let value = self.lower_expr_emit(rhs, scope, vars, out);
+                    out.push(SirStmt::Assign { target: place, value });
+                }
             }
             ExprKind::CompoundAssign(op, lhs, rhs) => {
-                let place = self.expr_to_place(lhs, scope)?;
-                let lhs_val = self.lower_expr(lhs, scope);
-                let rhs_val = self.lower_expr(rhs, scope);
-                let combined = SirExpr::BinOp(ast_binop_to_sir(*op), Box::new(lhs_val), Box::new(rhs_val));
-                Some(SirStmt::Assign { target: place, value: combined })
+                if let Some(place) = self.expr_to_place(lhs, scope) {
+                    let lhs_val = self.lower_expr(lhs, scope);
+                    let rhs_val = self.lower_expr_emit(rhs, scope, vars, out);
+                    let combined = SirExpr::BinOp(ast_binop_to_sir(*op), Box::new(lhs_val), Box::new(rhs_val));
+                    out.push(SirStmt::Assign { target: place, value: combined });
+                }
             }
             ExprKind::Call { callee, args, named: _ } => {
                 if let ExprKind::Field(dev_expr, method) = &callee.kind {
                     if let Some(device_name) = expr_root_ident(dev_expr) {
                         match scope.lookup(device_name).cloned() {
                             Some(Binding::IntrinsicDevice(IntrinsicDevice::HostIo)) => {
-                                return self.lower_host_io_call(method, args, scope);
+                                if let Some(s) = self.lower_host_io_call(method, args, scope) {
+                                    out.push(s);
+                                }
+                                return;
                             }
                             Some(Binding::IntrinsicDevice(IntrinsicDevice::Sys)) => {
                                 self.err(expr.span, "sys device has no callable ops");
-                                return None;
+                                return;
                             }
                             Some(Binding::Pin(pin)) => {
-                                return self.lower_pin_call(&pin, method, args, expr.span, scope);
+                                if let Some(s) = self.lower_pin_call(&pin, method, args, expr.span, scope) {
+                                    out.push(s);
+                                }
+                                return;
+                            }
+                            Some(Binding::Device(inst)) => {
+                                // op call as a statement: lower, discard the result.
+                                self.lower_op_call(&inst, &method.name, args, false, expr.span, scope, vars, out);
+                                return;
                             }
                             None => {
                                 self.err(dev_expr.span, format!("undefined device '{}'", device_name));
-                                return None;
+                                return;
                             }
                             _ => {
                                 self.err(dev_expr.span, format!("'{}' is not a callable device", device_name));
-                                return None;
+                                return;
                             }
                         }
                     }
                 }
                 self.err(expr.span, "unsupported call expression form");
-                None
             }
             _ => {
-                self.lower_expr(expr, scope);
-                None
+                let _ = self.lower_expr_emit(expr, scope, vars, out);
             }
         }
+    }
+
+    /// Like `lower_expr`, but may **emit statements** into `out` (for device-op
+    /// calls, which lower to a `BusXfer` or to inlined op bodies) and returns the
+    /// value expression to use.  Pure expressions delegate to `lower_expr`.
+    fn lower_expr_emit(&mut self, expr: &Expr, scope: &mut Scope, vars: &[SirVar], out: &mut Vec<SirStmt>) -> SirExpr {
+        match &expr.kind {
+            // `<call>?` — fault propagates out of the enclosing op/reaction (§4.4).
+            ExprKind::Try(inner) => {
+                if let ExprKind::Call { callee, args, .. } = &inner.kind {
+                    if let ExprKind::Field(dev_expr, method) = &callee.kind {
+                        if let Some(root) = expr_root_ident(dev_expr) {
+                            if let Some(Binding::Device(inst)) = scope.lookup(root).cloned() {
+                                return self.lower_op_call(&inst, &method.name, args, true, expr.span, scope, vars, out);
+                            }
+                        }
+                    }
+                }
+                self.lower_expr_emit(inner, scope, vars, out)
+            }
+            ExprKind::Call { callee, args, .. } => {
+                if let ExprKind::Field(dev_expr, method) = &callee.kind {
+                    if let Some(root) = expr_root_ident(dev_expr) {
+                        if let Some(Binding::Device(inst)) = scope.lookup(root).cloned() {
+                            return self.lower_op_call(&inst, &method.name, args, false, expr.span, scope, vars, out);
+                        }
+                    }
+                }
+                self.lower_expr(expr, scope) // pin reads etc.
+            }
+            ExprKind::BinOp { op, lhs, rhs } => {
+                let l = self.lower_expr_emit(lhs, scope, vars, out);
+                let r = self.lower_expr_emit(rhs, scope, vars, out);
+                SirExpr::BinOp(ast_binop_to_sir(*op), Box::new(l), Box::new(r))
+            }
+            ExprKind::Not(inner) => SirExpr::Not(Box::new(self.lower_expr_emit(inner, scope, vars, out))),
+            _ => self.lower_expr(expr, scope),
+        }
+    }
+
+    /// Lower a composed/leaf device-op call (the keystone, §3.5).  A primitive
+    /// (empty-bodied, `yields`) op is a bus transaction → `SirStmt::BusXfer`;
+    /// an op with a body is **inlined** (params + `needs` substituted), recursing
+    /// to the substrate.  Returns the result value.
+    #[allow(clippy::too_many_arguments)] // inherent lowering context (call + scope/vars/out)
+    fn lower_op_call(
+        &mut self,
+        inst: &InstanceRef,
+        op_name: &str,
+        args: &[Expr],
+        propagate: bool,
+        span: Span,
+        scope: &mut Scope,
+        vars: &[SirVar],
+        out: &mut Vec<SirStmt>,
+    ) -> SirExpr {
+        let Some(op) = self.find_op(&inst.ty, op_name).cloned() else {
+            self.err(span, format!("device type '{}' has no op '{}'", inst.ty, op_name));
+            return SirExpr::U64(0);
+        };
+        if args.len() != op.params.len() {
+            self.err(span, format!("op '{}' takes {} arg(s), got {}", op_name, op.params.len(), args.len()));
+            return SirExpr::U64(0);
+        }
+        let arg_vals: Vec<SirExpr> = args.iter().map(|a| self.lower_expr_emit(a, scope, vars, out)).collect();
+
+        // Primitive bus transaction: empty body + yields → serviced by the
+        // substrate (sim bus model / metal MMIO).
+        if op.body.stmts.is_empty() && op.yields {
+            let dst = self.fresh("bus");
+            let fault_codes = op.ret.fault_codes.iter().map(|c| c.name.clone()).collect();
+            out.push(SirStmt::BusXfer {
+                device: inst.device,
+                op: op_name.to_string(),
+                args: arg_vals,
+                dst: dst.clone(),
+                propagate,
+                fault_codes,
+            });
+            return SirExpr::Load(dst);
+        }
+
+        // Otherwise inline the op body with params + needs substituted.
+        let mut inner = Scope::new();
+        for (p, v) in op.params.iter().zip(arg_vals) {
+            let tmp = self.fresh("arg");
+            out.push(SirStmt::Assign { target: SirPlace::Var(tmp.clone()), value: v });
+            inner.insert(&p.name.name, Binding::Local(tmp, SirType::U32));
+        }
+        if let Some(needs) = self.instance_needs.get(&inst.device).cloned() {
+            for (name, val) in needs {
+                match val {
+                    NeedVal::Device(r) => inner.insert(&name, Binding::Device(r)),
+                    NeedVal::Const(c) => {
+                        let tmp = self.fresh("need");
+                        out.push(SirStmt::Assign { target: SirPlace::Var(tmp.clone()), value: SirExpr::U64(c) });
+                        inner.insert(&name, Binding::Local(tmp, SirType::U32));
+                    }
+                }
+            }
+        }
+        let result = self.fresh("r");
+        out.push(SirStmt::Assign { target: SirPlace::Var(result.clone()), value: SirExpr::U64(0) });
+        self.op_result.push(result.clone());
+        for stmt in &op.body.stmts {
+            self.lower_stmt(stmt, &mut inner, vars, out);
+        }
+        self.op_result.pop();
+        SirExpr::Load(result)
+    }
+
+    fn fresh(&mut self, prefix: &str) -> String {
+        let n = self.tmp_counter;
+        self.tmp_counter += 1;
+        format!("__{}{}", prefix, n)
     }
 
     /// Lower a pin op call (`led.set(x)`) to a register access (§6.5).
@@ -1012,6 +1289,27 @@ fn stmt_touches_cell(stmt: &SirStmt, cell: &str) -> bool {
             _ => false,
         },
         SirStmt::DeviceOp { args, .. } => args.iter().any(|a| expr_touches_cell(a, cell)),
+        SirStmt::BusXfer { args, .. } => args.iter().any(|a| expr_touches_cell(a, cell)),
+    }
+}
+
+/// True if a (possibly nested) statement list contains a yielding bus transfer.
+fn body_yields(stmts: &[SirStmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        SirStmt::BusXfer { .. } => true,
+        SirStmt::Critical { body, .. } => body_yields(body),
+        SirStmt::If { then, .. } => body_yields(then),
+        _ => false,
+    })
+}
+
+/// Lower a parsed fault disposition to its SIR form (§4.4); default `escalate`.
+fn lower_disposition(d: &Option<FaultDisp>) -> SirDisposition {
+    match d.as_ref().map(|f| &f.kind) {
+        Some(FaultDispKind::Retry { max }) => SirDisposition::Retry { max: max.unwrap_or(1) },
+        Some(FaultDispKind::Skip) => SirDisposition::Skip,
+        Some(FaultDispKind::Safe) => SirDisposition::Safe,
+        Some(FaultDispKind::Escalate) | None => SirDisposition::Escalate,
     }
 }
 
