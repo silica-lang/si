@@ -31,6 +31,9 @@ pub struct SirModule {
     pub injections: Vec<SirInjection>,
     /// Scripted Layer-3 fault injections from a `sim` block (§5.4).
     pub fault_injections: Vec<SirFaultInjection>,
+    /// FIFO of fault codes to fail successive bus transactions with (each entry
+    /// fails one transaction); from `inject bus_fault <code> times <n>`.
+    pub bus_fault_queue: Vec<String>,
     /// Virtual-time horizon from `run until <dur>` (None ⇒ run until idle).
     pub run_until_ns: Option<u64>,
     /// SoC memory regions (flash/RAM), for the generated linker script (§6.4).

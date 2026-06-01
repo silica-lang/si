@@ -136,6 +136,7 @@ pub struct Resolver {
     cells: Vec<CellInfo>,
     injections: Vec<SirInjection>,
     fault_injections: Vec<SirFaultInjection>,
+    bus_fault_queue: Vec<String>,
     run_until_ns: Option<u64>,
     memory: Vec<SirRegion>,
     pins: Vec<SirPin>,
@@ -174,6 +175,7 @@ impl Resolver {
             cells: Vec::new(),
             injections: Vec::new(),
             fault_injections: Vec::new(),
+            bus_fault_queue: Vec::new(),
             run_until_ns: None,
             memory: Vec::new(),
             pins: Vec::new(),
@@ -239,6 +241,7 @@ impl Resolver {
                 cells: self.cells,
                 injections: self.injections,
                 fault_injections: self.fault_injections,
+                bus_fault_queue: self.bus_fault_queue,
                 run_until_ns: self.run_until_ns,
                 memory: self.memory,
                 pins: self.pins,
@@ -302,6 +305,17 @@ impl Resolver {
 
         // Cell concurrency analysis + critical-section insertion (§5.5).
         self.analyze_cells(&mut out[first..], &vars);
+
+        // §5.5/D03: a cell borrow may not cross a yield.  In this lowering a
+        // shared-cell access is wrapped in a `Critical` (a single straight-line
+        // statement) and yields are hoisted out as separate `BusXfer`s, so a
+        // `Critical` containing a `BusXfer` would be a yield inside a held
+        // section — reject it (defensive; the lowering does not produce it).
+        for r in &out[first..] {
+            if critical_contains_yield(&r.body) {
+                self.err(prog.span, "a cell critical section may not span a yield (§5.5/D03)");
+            }
+        }
 
         module_vars.extend(vars);
 
@@ -1236,6 +1250,11 @@ impl Resolver {
         for f in &sim.faults {
             self.fault_injections.push(SirFaultInjection { at_ns: f.at.to_ns(), addr: f.addr });
         }
+        for (code, times) in &sim.bus_faults {
+            for _ in 0..*times {
+                self.bus_fault_queue.push(code.name.clone());
+            }
+        }
         if let Some(d) = sim.run_until {
             self.run_until_ns = Some(d.to_ns());
         }
@@ -1291,6 +1310,16 @@ fn stmt_touches_cell(stmt: &SirStmt, cell: &str) -> bool {
         SirStmt::DeviceOp { args, .. } => args.iter().any(|a| expr_touches_cell(a, cell)),
         SirStmt::BusXfer { args, .. } => args.iter().any(|a| expr_touches_cell(a, cell)),
     }
+}
+
+/// True if any `Critical` section in the body (transitively) contains a yielding
+/// bus transfer — the §5.5/D03 violation.
+fn critical_contains_yield(stmts: &[SirStmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        SirStmt::Critical { body, .. } => body_yields(body) || critical_contains_yield(body),
+        SirStmt::If { then, .. } => critical_contains_yield(then),
+        _ => false,
+    })
 }
 
 /// True if a (possibly nested) statement list contains a yielding bus transfer.

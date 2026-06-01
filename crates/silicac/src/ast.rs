@@ -431,6 +431,9 @@ pub struct SimDef {
     pub injections: Vec<Injection>,
     /// `inject fault <addr> at <duration>` — Layer-3 hardware-fault injections.
     pub faults: Vec<FaultInjection>,
+    /// `inject bus_fault <code> times <n>` — fail the next n bus transactions
+    /// with `code` (for exercising the fault path / retry, §12).
+    pub bus_faults: Vec<(Ident, u32)>,
     /// `run until <duration>` — virtual-time horizon.
     pub run_until: Option<Duration>,
     pub span: Span,

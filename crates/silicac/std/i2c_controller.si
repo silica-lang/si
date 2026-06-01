@@ -1,0 +1,24 @@
+// std-lib leaf I²C controller — `implements i2c`.  Its transfer ops are
+// *primitives* (empty body + `yields`): on the host they are serviced by the
+// simulator's bus model (a mock implementing the same ops, §7.1); on metal
+// (increment 2) they lower to the controller's MMIO start/addr/data/stop
+// sequence.  Either way, composed devices call these as transactions (§6.6).
+
+device i2c_controller implements i2c {
+  regs {
+    // Modelled for the metal increment; the sim services the ops via its bus
+    // model and does not touch these.
+    CR   : reg32 at 0x00 access rw {}
+    SR   : reg32 at 0x04 access ro {}
+    DR   : reg32 at 0x10 access rw {}
+  }
+
+  needs {
+    clock : clock_source
+  }
+
+  ops {
+    op read_reg(addr: u32, reg: u32) -> u32 or fault{nak, timeout, arblost} yields
+    op write_reg(addr: u32, reg: u32, val: u32) -> () or fault{nak, timeout, arblost} yields
+  }
+}

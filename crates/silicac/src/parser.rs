@@ -1159,6 +1159,7 @@ impl Parser {
         self.eat(&Token::LBrace)?;
         let mut injections = Vec::new();
         let mut faults = Vec::new();
+        let mut bus_faults = Vec::new();
         let mut run_until = None;
         while self.peek() != Some(&Token::RBrace) {
             if self.at_end() {
@@ -1177,6 +1178,18 @@ impl Parser {
                         self.eat_optional_semi();
                         let iend = self.prev_span().end;
                         faults.push(FaultInjection { addr, at, span: Span::new(istart, iend) });
+                    } else if matches!(self.peek(), Some(Token::Ident(s)) if s == "bus_fault") {
+                        // `inject bus_fault <code> times <n>`
+                        self.advance();
+                        let code = self.eat_ident()?;
+                        let times = if matches!(self.peek(), Some(Token::Ident(s)) if s == "times") {
+                            self.advance();
+                            self.expect_int_lit()? as u32
+                        } else {
+                            1
+                        };
+                        self.eat_optional_semi();
+                        bus_faults.push((code, times));
                     } else {
                         let event = self.parse_event_ref()?;
                         self.eat(&Token::KwAt)?;
@@ -1209,7 +1222,7 @@ impl Parser {
         }
         let end = self.current_span().end;
         self.eat(&Token::RBrace)?;
-        Ok(SimDef { name, program, injections, faults, run_until, span: Span::new(start, end) })
+        Ok(SimDef { name, program, injections, faults, bus_faults, run_until, span: Span::new(start, end) })
     }
 
     // ── Block & statements ──────────────────────────────────────────────────
