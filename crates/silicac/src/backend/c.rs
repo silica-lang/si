@@ -203,10 +203,10 @@ impl CBackend {
                     let val = emit_expr(value);
                     self.line(&format!("{} = {};", name, val));
                 }
-                SirPlace::Reg { device, reg_offset, field_mask, field_shift, access, .. } => {
+                place @ SirPlace::Reg { device, reg_offset, .. } => {
                     match self.target {
                         Target::MetalNrf52840 => {
-                            let stmt = self.emit_mmio_store(*device, *reg_offset, *field_mask, *field_shift, *access, value);
+                            let stmt = self.emit_mmio_store(place, value);
                             for l in stmt {
                                 self.line(&l);
                             }
@@ -405,31 +405,42 @@ impl CBackend {
     /// #3).  A read/write register is a barrier-bracketed read-modify-write; a
     /// write-1-to-set/clear register writes the field directly (no RMW, so a
     /// status bit in the same register is never clobbered).
-    fn emit_mmio_store(
-        &self,
-        device: usize,
-        offset: u64,
-        mask: u64,
-        shift: u8,
-        access: SirRegAccess,
-        value: &SirExpr,
-    ) -> Vec<String> {
-        let base = self.device_bases.get(&device).copied().unwrap_or(0);
+    fn emit_mmio_store(&self, place: &SirPlace, value: &SirExpr) -> Vec<String> {
+        let SirPlace::Reg { device, reg_offset: offset, width, field_mask: mask, field_shift: shift, access } = place
+        else {
+            return vec!["#error \"internal: emit_mmio_store on a non-register place\"".into()];
+        };
+        let (device, offset, width, mask, shift, access) = (*device, *offset, *width, *mask, *shift, *access);
+        // A missing base would silently write to 0x0; refuse instead.
+        let Some(&base) = self.device_bases.get(&device) else {
+            return vec![format!(
+                "#error \"device {} has no MMIO base address (instance needs `at <addr>`)\"",
+                device
+            )];
+        };
+        let cty = match width {
+            8 => "uint8_t",
+            16 => "uint16_t",
+            32 => "uint32_t",
+            _ => return vec![format!("#error \"unsupported register width {} (expected 8/16/32)\"", width)],
+        };
         let addr = base + offset;
         let v = emit_expr(value);
-        let mut out = vec![format!("{{ /* MMIO store: device {} reg 0x{:x} (§4.2 ordered) */", device, offset)];
-        out.push(format!("    volatile uint32_t *__p = (volatile uint32_t *)0x{:08x}UL;", addr));
+        // Field math is computed in uint32_t then narrowed to the register width.
+        let field = format!("(((uint32_t)({}) << {}) & 0x{:x}UL)", v, shift, mask);
+        let mut out = vec![format!("{{ /* MMIO store: device {} reg 0x{:x} ({}-bit, §4.2 ordered) */", device, offset, width)];
+        out.push(format!("    volatile {ct} *__p = (volatile {ct} *)0x{:08x}UL;", addr, ct = cty));
         match access {
             // write-1-to-clear / write-only: write just the field, no RMW.
             SirRegAccess::W1c | SirRegAccess::Wo => {
                 out.push("    __DMB();".into());
-                out.push(format!("    *__p = (uint32_t)(((uint32_t)({}) << {}) & 0x{:x}UL);", v, shift, mask));
+                out.push(format!("    *__p = ({ct})({field});", ct = cty, field = field));
                 out.push("    __DMB();".into());
             }
             // read/write: read-modify-write the field, bracketed by barriers.
             _ => {
-                out.push("    uint32_t __v = *__p;".into());
-                out.push(format!("    __v = (__v & ~0x{:x}UL) | (((uint32_t)({}) << {}) & 0x{:x}UL);", mask, v, shift, mask));
+                out.push(format!("    {ct} __v = *__p;", ct = cty));
+                out.push(format!("    __v = ({ct})(((uint32_t)__v & ~0x{:x}UL) | {field});", mask, ct = cty, field = field));
                 out.push("    __DMB();".into());
                 out.push("    *__p = __v;".into());
                 out.push("    __DMB();".into());
@@ -464,18 +475,27 @@ impl CBackend {
         }
         self.line("/* fault record (read by the host decoder) — structured, no strings (§4.3) */");
         self.line("volatile uint32_t __fault_addr = 0U;");
-        self.line("volatile uint32_t __fault_owner = 0xFFFFFFFFUL; /* index, or 0xFFFFFFFF = unclaimed */");
+        self.line("volatile uint32_t __fault_owner = 0xFFFFFFFFUL; /* index, or 0xFFFFFFFF = unclaimed/invalid */");
+        self.line("volatile uint32_t __fault_cfsr = 0U;");
         self.line("volatile uint32_t __fault_pending = 0U;");
         self.line("void HardFault_Handler(void) {");
         self.indent += 1;
-        self.line("uint32_t __a = *(volatile uint32_t *)0xE000ED38UL; /* SCB BFAR: faulting address */");
+        self.line("uint32_t __cfsr = *(volatile uint32_t *)0xE000ED28UL; /* SCB CFSR */");
+        self.line("uint32_t __a = 0U;");
         self.line("uint32_t __o = 0xFFFFFFFFUL;");
+        // BFAR holds the faulting address only when CFSR.BFARVALID (bit 15) is set;
+        // otherwise it is stale/undefined, so don't attribute an address.
+        self.line("if (__cfsr & 0x00008000UL) { /* BFARVALID */");
+        self.indent += 1;
+        self.line("__a = *(volatile uint32_t *)0xE000ED38UL; /* SCB BFAR */");
         self.line("for (uint32_t __i = 0U; __i < __OWNER_COUNT; __i++) {");
         self.indent += 1;
         self.line("if (__a >= __owner_start[__i] && __a < __owner_end[__i]) { __o = __i; break; }");
         self.indent -= 1;
         self.line("}");
-        self.line("__fault_addr = __a; __fault_owner = __o; __fault_pending = 1U;");
+        self.indent -= 1;
+        self.line("}");
+        self.line("__fault_addr = __a; __fault_owner = __o; __fault_cfsr = __cfsr; __fault_pending = 1U;");
         self.line("for (;;) { /* halt; safe-state drive is a later phase (§5.6) */ }");
         self.indent -= 1;
         self.line("}");
@@ -646,12 +666,16 @@ impl CBackend {
         if !outputs.is_empty() {
             self.line("/* configure output pin directions */");
             for pin in outputs {
-                let mask = 1u64 << pin.index;
+                let place = SirPlace::Reg {
+                    device: pin.device,
+                    reg_offset: pin.dir_reg_offset,
+                    width: pin.dir_reg_width,
+                    field_mask: 1u64 << pin.index,
+                    field_shift: pin.index,
+                    access: SirRegAccess::Rw,
+                };
                 let value = SirExpr::Bool(true);
-                let stmt = self.emit_mmio_store(
-                    pin.device, pin.dir_reg_offset, mask, pin.index, SirRegAccess::Rw, &value,
-                );
-                for l in stmt {
+                for l in self.emit_mmio_store(&place, &value) {
                     self.line(&l);
                 }
             }
@@ -882,7 +906,17 @@ pub fn ram_budget(module: &SirModule) -> Result<RamBudget, String> {
         .iter()
         .find(|r| r.is_ram())
         .ok_or("no RAM region found in board.soc.memory")?;
-    let statics: u64 = module.vars.iter().map(|v| v.ty.byte_size()).sum();
+    // Model the generated C layout conservatively: lay statics out in declaration
+    // order, aligning each to its natural alignment (so a u8 before a u64 incurs
+    // the padding the C compiler would), so the gate doesn't undercount.
+    let mut off = 0u64;
+    for v in &module.vars {
+        let size = v.ty.byte_size();
+        let align = size.max(1); // scalars: align == size (1/2/4/8); Bytes/ptr = 4
+        off = off.div_ceil(align) * align;
+        off += size;
+    }
+    let statics = off;
     let budget = RamBudget { statics, stack_reserve: STACK_RESERVE, ram_size: ram.size };
     if budget.used() > budget.ram_size {
         return Err(format!(

@@ -1,9 +1,11 @@
 # Phase 0 — on-metal backend scope (nRF52840 / Renode)
 
-> Scope document for the next increment. Status: planned, not yet implemented.
+> Scope + status document for the on-metal backend. **Status: implemented** — all
+> five stages (A–E) and the Layer-3 fault decoder are done; per-stage progress and
+> the final status are recorded inline below.
 > Companion to [`DESIGN.md`](DESIGN.md) §6.2/§6.4 (backend), §4.2 (registers),
-> §5.5 (atomicity), §11 (roadmap). The sim-side reactive-core slice is already
-> built; this closes the on-metal half of Phase 0.
+> §5.5 (atomicity), §11 (roadmap). The sim-side reactive-core slice was built
+> first; this closed the on-metal half of Phase 0.
 
 ## Context
 

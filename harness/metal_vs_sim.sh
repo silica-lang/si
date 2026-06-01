@@ -14,8 +14,10 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 EX="${1:-$REPO/examples/blink_button_nrf52840.si}"
 RENODE="${RENODE:-renode}"
-ELF="$(mktemp -d)/metal.elf"
+ELFDIR="$(mktemp -d)"
+ELF="$ELFDIR/metal.elf"
 RESC="$(mktemp).resc"
+trap 'rm -rf "$ELFDIR" "$RESC"' EXIT
 
 echo "== reference: host simulator =="
 # LED writes to gpio0 bit13, in order; drop the t=0 sys.start write so the 7

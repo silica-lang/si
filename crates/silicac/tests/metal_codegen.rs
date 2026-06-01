@@ -254,6 +254,58 @@ fn metal_emits_layer3_fault_decoder() {
 }
 
 #[test]
+fn mmio_access_width_follows_register_width() {
+    // An 8-bit register must lower to a `volatile uint8_t *` access, not uint32_t
+    // (wrong size / misaligned MMIO otherwise).
+    let src = r#"
+device tiny {
+  regs { CTRL : reg8 at 0x0 access rw {} }
+  ops { op set(level: bool) -> () {} }
+}
+board b {
+  soc s { memory { flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K } }
+  t0 : tiny at 0x4000_0000
+  led : tiny.pin = t0.pin(2) as output
+}
+program p {
+  use board b as dev
+  let led = dev.led
+  on sys.start { led.set(true) }
+}
+"#;
+    let sir = compile(src);
+    let out = c::CBackend::with_target(Target::MetalNrf52840).emit(&sir);
+    assert!(out.contains("volatile uint8_t *__p"), "8-bit MMIO access:\n{out}");
+    assert!(!out.contains("volatile uint32_t *__p = (volatile uint32_t *)0x40000000UL"),
+        "must not use a 32-bit access for an 8-bit register");
+}
+
+#[test]
+fn missing_mmio_base_is_a_hard_error() {
+    // A device instance without `at <addr>` must not silently lower to address 0.
+    let src = r#"
+device tiny {
+  regs { CTRL : reg32 at 0x0 access rw {} }
+  ops { op set(level: bool) -> () {} }
+}
+board b {
+  soc s { memory { flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K } }
+  t0 : tiny
+  led : tiny.pin = t0.pin(2) as output
+}
+program p {
+  use board b as dev
+  let led = dev.led
+  on sys.start { led.set(true) }
+}
+"#;
+    let sir = compile(src);
+    let out = c::CBackend::with_target(Target::MetalNrf52840).emit(&sir);
+    assert!(out.contains("#error") && out.contains("no MMIO base address"),
+        "expected a #error for the missing base:\n{out}");
+}
+
+#[test]
 fn host_target_still_emits_hosted_main() {
     // The host path is unchanged: it still produces a libc `main`, proving the
     // target switch did not regress the existing consumer.

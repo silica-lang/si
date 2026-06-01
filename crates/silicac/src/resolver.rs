@@ -118,6 +118,9 @@ pub struct Resolver {
     /// Per-program board context, so a `sim` block resolves against its own
     /// program's board rather than whichever program was lowered last.
     program_ctx: HashMap<String, BoardContext>,
+    /// Boards already built, so a board used by more than one program (or used
+    /// twice) does not append its devices/memory/pins to the module twice.
+    boards_built: HashMap<String, BoardContext>,
 }
 
 impl Default for Resolver {
@@ -144,6 +147,7 @@ impl Resolver {
             dev_types: HashMap::new(),
             board_ctx: None,
             program_ctx: HashMap::new(),
+            boards_built: HashMap::new(),
         }
     }
 
@@ -302,6 +306,13 @@ impl Resolver {
     /// Build a board's device instances + pin bindings, populate `self.devices`
     /// and the `BoardContext`, and run the duplicate-pad check.
     fn build_board(&mut self, board_name: &str, use_span: Span) {
+        // If this board was already built (another program uses it), reuse its
+        // context instead of appending its devices/memory/pins to the module
+        // again.
+        if let Some(ctx) = self.boards_built.get(board_name) {
+            self.board_ctx = Some(ctx.clone());
+            return;
+        }
         let board = match self.boards.get(board_name) {
             Some(b) => b.clone(),
             None => return,
@@ -418,7 +429,9 @@ impl Resolver {
         }
 
         let _ = use_span;
-        self.board_ctx = Some(BoardContext { pins });
+        let ctx = BoardContext { pins };
+        self.boards_built.insert(board_name.to_string(), ctx.clone());
+        self.board_ctx = Some(ctx);
     }
 
     /// If `expr` is `<board-alias>.<pin-binding>`, resolve it to a [`PinRef`].
