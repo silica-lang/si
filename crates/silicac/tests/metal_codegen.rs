@@ -312,6 +312,131 @@ program p {
     assert!(!out.contains("TODO(metal): MMIO load"), "RegLoad stub must be lowered:\n{out}");
 }
 
+const SENSOR: &str = r#"
+board b {
+  soc s {
+    memory { flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+  i2c0 : i2c_controller at 0x4000_3000 { needs { clock = soc.sysclk } }
+  env  : bme280 { needs { bus = i2c0 } }
+}
+program app {
+  use board b as bd
+  let sensor = bd.env
+  cell samples : u32 = 0
+  every 1000ms on fault retry(max = 3) {
+    let t = sensor.read_temp()?
+    samples += 1
+  }
+}
+"#;
+
+#[test]
+fn bus_xfer_lowers_to_bounded_poll_over_declared_registers() {
+    // A composed-device read (`sensor.read_temp()` → `i2c read_reg`) lowers to a
+    // bounded-poll transaction over the controller's *declared* registers
+    // (CR/SR/SA/RA/DR, base 0x4000_3000), not a stub.
+    let sir = compile(SENSOR);
+    let out = c::CBackend::with_target(Target::MetalNrf52840).emit(&sir);
+    // Addresses come from the controller's declared register offsets.
+    assert!(out.contains("0x40003008UL = (uint32_t)(118ULL); /* SA */"), "slave addr 0x76 to SA:\n{out}");
+    assert!(out.contains("0x4000300cUL = (uint32_t)(250ULL); /* RA */"), "reg 0xFA to RA:\n{out}");
+    assert!(out.contains("0x40003000UL = (__I2C_CR_START | __I2C_CR_DIR_RD)"), "CR kick (read):\n{out}");
+    assert!(out.contains("0x40003004UL; /* SR */"), "poll SR:\n{out}");
+    assert!(out.contains("0x40003010UL; /* DR (read result) */"), "read DR on done:\n{out}");
+    // Success requires `done` AND no error bit — a controller that raises both
+    // must fault, not read DR.
+    assert!(out.contains("(__sr & __I2C_SR_DONE) && !(__sr & __I2C_SR_ERR)"), "done-without-error success:\n{out}");
+    // Bounded poll → timeout, and ordered MMIO.
+    assert!(out.contains("__spins > __I2C_POLL_BOUND"), "bounded busy-wait:\n{out}");
+    assert!(out.contains("__DMB();"), "ordering barriers around the kick:\n{out}");
+    // No stub left behind.
+    assert!(!out.contains("TODO(metal)") && !out.contains("increment 2"), "BusXfer stub must be gone:\n{out}");
+}
+
+#[test]
+fn propagated_bus_fault_lowers_to_the_reaction_disposition() {
+    // `retry(max = 3)` wraps the body in a bounded loop that `continue`s on a
+    // propagated fault and escalates (returns) once retries are exhausted,
+    // mirroring the simulator's `dispose`.
+    let sir = compile(SENSOR);
+    let out = c::CBackend::with_target(Target::MetalNrf52840).emit(&sir);
+    assert!(out.contains("for (uint32_t __retry = 0U; ; __retry++)"), "retry loop:\n{out}");
+    assert!(out.contains("if (__retry < 3U) continue;"), "retry up to max:\n{out}");
+    assert!(out.contains("return; /* retries exhausted → escalate */"), "escalate after exhaustion:\n{out}");
+    // The post-fault body only runs on success (guarded by `if (__faulted)`).
+    assert!(out.contains("if (__faulted) {"), "fault guard:\n{out}");
+}
+
+#[test]
+fn safe_disposition_drives_safe_state_on_metal() {
+    // A `safe` disposition over a bus fault calls the emitted `__drive_safe`,
+    // which runs each device's bounded safe-op register writes, then holds.
+    let src = r#"
+device motor {
+  regs { CTRL : reg32 at 0x00 access rw { enable: bit[0] } }
+  states { running, off }
+  safe_state = off
+  ops { op run() -> () { CTRL.enable = 1 }  op safe() -> () { CTRL.enable = 0 } }
+}
+board b {
+  soc s {
+    memory { flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+  i2c0 : i2c_controller at 0x4000_3000 { needs { clock = soc.sysclk } }
+  env  : bme280 { needs { bus = i2c0 } }
+  m    : motor at 0x5001_0000
+}
+program app {
+  use board b as bd
+  let sensor = bd.env
+  let mot = bd.m
+  on sys.start { mot.run() }
+  every 1000ms on fault safe { let t = sensor.read_temp()? }
+}
+"#;
+    let sir = compile(src);
+    let out = c::CBackend::with_target(Target::MetalNrf52840).emit(&sir);
+    assert!(out.contains("static void __drive_safe(void)"), "drive_safe emitted:\n{out}");
+    // The motor's safe op (CTRL.enable = 0) writes its MMIO @ 0x5001_0000.
+    assert!(out.contains("(volatile uint32_t *)0x50010000UL"), "safe register write:\n{out}");
+    assert!(out.contains("__drive_safe();"), "disposition calls drive_safe:\n{out}");
+    assert!(out.contains("for (;;) { __asm__ volatile(\"wfi\"); }"), "hold after safe:\n{out}");
+    // Interrupts must be masked BEFORE driving safe-state (no concurrent ISR);
+    // the cpsid must precede the __drive_safe() call.
+    let cpsid = out.find("cpsid i").expect("cpsid emitted");
+    let drive = out.find("__drive_safe();").expect("drive_safe call");
+    assert!(cpsid < drive, "interrupts masked before driving safe-state:\n{out}");
+}
+
+#[test]
+fn safe_disposition_without_a_safe_device_still_defines_drive_safe() {
+    // `on fault safe` with no device declaring a `safe_state` leaves `safe_seqs`
+    // empty.  The disposition still calls `__drive_safe()`, so the function must
+    // be defined (with an empty body) — otherwise the firmware fails to link.
+    let src = r#"
+board b {
+  soc s {
+    memory { flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+  i2c0 : i2c_controller at 0x4000_3000 { needs { clock = soc.sysclk } }
+  env  : bme280 { needs { bus = i2c0 } }
+}
+program app {
+  use board b as bd
+  let sensor = bd.env
+  every 1000ms on fault safe { let t = sensor.read_temp()? }
+}
+"#;
+    let sir = compile(src);
+    let out = c::CBackend::with_target(Target::MetalNrf52840).emit(&sir);
+    assert!(out.contains("static void __drive_safe(void)"), "drive_safe must be defined even with no safe_seqs:\n{out}");
+    assert!(out.contains("__drive_safe();"), "disposition calls drive_safe:\n{out}");
+}
+
 #[test]
 fn missing_mmio_base_is_a_hard_error() {
     // A device instance without `at <addr>` must not silently lower to address 0.

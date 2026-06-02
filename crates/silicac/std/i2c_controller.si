@@ -1,16 +1,23 @@
 // std-lib leaf I²C controller — `implements i2c`.  Its transfer ops are
 // *primitives* (empty body + `yields`): on the host they are serviced by the
-// simulator's bus model (a mock implementing the same ops, §7.1); on metal
-// (increment 2) they lower to the controller's MMIO start/addr/data/stop
-// sequence.  Either way, composed devices call these as transactions (§6.6).
+// simulator's bus model (a mock implementing the same ops, §7.1); on metal the
+// backend lowers a `read_reg`/`write_reg` `BusXfer` to a bounded-poll sequence
+// over the registers below (resolved by name).  Either way, composed devices
+// call these as transactions (§6.6).
+//
+// The register *bit conventions* (start/dir, done/nak/...) are documented on
+// the fields and encoded in the metal backend's `BusXfer` lowering — the same
+// nRF-target/SIR-neutral split used for GPIOTE/SysTick.
 
 device i2c_controller implements i2c {
   regs {
-    // Modelled for the metal increment; the sim services the ops via its bus
-    // model and does not touch these.
-    CR   : reg32 at 0x00 access rw {}
-    SR   : reg32 at 0x04 access ro {}
-    DR   : reg32 at 0x10 access rw {}
+    // Control — write to begin a transaction.
+    CR   : reg32 at 0x00 access rw { start: bit[0], dir: bit[1] }  // dir: 0=write 1=read
+    // Status (read-only) — the poll target until `done` or an error bit.
+    SR   : reg32 at 0x04 access ro { done: bit[0], nak: bit[1], arblost: bit[2], timeout: bit[3] }
+    SA   : reg32 at 0x08 access rw {}   // slave address  (the `addr` arg)
+    RA   : reg32 at 0x0C access rw {}   // remote register (the `reg` arg)
+    DR   : reg32 at 0x10 access rw {}   // data: write value in / read result out
   }
 
   needs {
