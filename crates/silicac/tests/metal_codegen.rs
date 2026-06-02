@@ -345,6 +345,9 @@ fn bus_xfer_lowers_to_bounded_poll_over_declared_registers() {
     assert!(out.contains("0x40003000UL = (__I2C_CR_START | __I2C_CR_DIR_RD)"), "CR kick (read):\n{out}");
     assert!(out.contains("0x40003004UL; /* SR */"), "poll SR:\n{out}");
     assert!(out.contains("0x40003010UL; /* DR (read result) */"), "read DR on done:\n{out}");
+    // Success requires `done` AND no error bit — a controller that raises both
+    // must fault, not read DR.
+    assert!(out.contains("(__sr & __I2C_SR_DONE) && !(__sr & __I2C_SR_ERR)"), "done-without-error success:\n{out}");
     // Bounded poll → timeout, and ordered MMIO.
     assert!(out.contains("__spins > __I2C_POLL_BOUND"), "bounded busy-wait:\n{out}");
     assert!(out.contains("__DMB();"), "ordering barriers around the kick:\n{out}");
@@ -401,6 +404,11 @@ program app {
     assert!(out.contains("(volatile uint32_t *)0x50010000UL"), "safe register write:\n{out}");
     assert!(out.contains("__drive_safe();"), "disposition calls drive_safe:\n{out}");
     assert!(out.contains("for (;;) { __asm__ volatile(\"wfi\"); }"), "hold after safe:\n{out}");
+    // Interrupts must be masked BEFORE driving safe-state (no concurrent ISR);
+    // the cpsid must precede the __drive_safe() call.
+    let cpsid = out.find("cpsid i").expect("cpsid emitted");
+    let drive = out.find("__drive_safe();").expect("drive_safe call");
+    assert!(cpsid < drive, "interrupts masked before driving safe-state:\n{out}");
 }
 
 #[test]

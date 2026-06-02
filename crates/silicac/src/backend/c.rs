@@ -343,16 +343,22 @@ impl CBackend {
         out.push("    uint32_t __sr = 0U, __spins = 0U;".into());
         out.push("    for (;;) {".into());
         out.push(format!("        __sr = *(volatile uint32_t *)0x{:08x}UL; /* SR */", sr));
-        out.push("        if (__sr & __I2C_SR_DONE) break;".into());
+        // Check error before done: if the controller raises both in the same
+        // read, the transfer is a fault, not a success.
         out.push("        if (__sr & __I2C_SR_ERR) break;".into());
+        out.push("        if (__sr & __I2C_SR_DONE) break;".into());
         out.push("        if (++__spins > __I2C_POLL_BOUND) { __sr = __I2C_SR_TIMEOUT; break; }".into());
         out.push("    }".into());
+        // Success only on `done` with no error bit set.
         if is_read {
-            out.push("    if (__sr & __I2C_SR_DONE) {".into());
+            out.push("    if ((__sr & __I2C_SR_DONE) && !(__sr & __I2C_SR_ERR)) {".into());
             out.push(format!("        {} = *(volatile uint32_t *)0x{:08x}UL; /* DR (read result) */", dst, dr));
             out.push("    } else { __faulted = 1U; }".into());
         } else {
-            out.push(format!("    if (__sr & __I2C_SR_DONE) {{ {} = 0U; }} else {{ __faulted = 1U; }}", dst));
+            out.push(format!(
+                "    if ((__sr & __I2C_SR_DONE) && !(__sr & __I2C_SR_ERR)) {{ {} = 0U; }} else {{ __faulted = 1U; }}",
+                dst
+            ));
         }
         out.push("}".into());
         out
@@ -369,10 +375,13 @@ impl CBackend {
             }
             SirDisposition::Skip => self.line("return; /* skip: drop this activation */"),
             SirDisposition::Safe => {
-                // Mask interrupts before holding so no other reaction can run —
+                // Mask interrupts *before* driving safe-state so no other ISR /
+                // reaction can run concurrently with the safe writes or after —
                 // the sim's `drive_safe` halts the whole machine (`stop = true`).
+                // The `memory` clobber keeps the mask from being reordered past
+                // the device writes.
+                self.line("__asm__ volatile(\"cpsid i\" ::: \"memory\"); /* no further reactions */");
                 self.line("__drive_safe();");
-                self.line("__asm__ volatile(\"cpsid i\"); /* no further reactions */");
                 self.line("for (;;) { __asm__ volatile(\"wfi\"); } /* hold in safe state */");
             }
             SirDisposition::Escalate => self.line("return; /* escalate → Layer-3 */"),
