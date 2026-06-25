@@ -197,12 +197,16 @@ Closing the sim≡metal gap for the Phase-1 keystone (composition + yields). Don
   IRQ, so the owner stays in flight and the watchdog catches it (§5.6) — now
   matching the simulator's `Hang` exactly.
 
-  *Remaining (E1):* end-to-end Renode validation of the *interleaving* (a
-  higher-priority reaction running during the bus suspension) needs a matching
-  **mock I²C controller** peripheral implementing the std `CR/SR/SA/RA/DR`
-  protocol and raising the completion IRQ — Renode does not model the abstract
-  controller. The simulator already proves the interleaving; this lands the
-  on-hardware trace-order parity check.
+  *On-hardware interleaving (E1) — done.* `harness/bus_parity.sh` +
+  `harness/MockBusController.cs` validate the §5.2 interleaving on nRF52840 in
+  Renode: the mock controller implements the std `CR/SR/SA/RA/DR` protocol at
+  `0x4000_3000` (Renode does not model the abstract controller) and raises the
+  completion IRQ (NVIC #8) after a latency. Running
+  `examples/bus_interleave_nrf52840.si`, a higher-priority button reaction runs
+  **during** the sensor's bus suspension — sampled mid-window as `hits=1,
+  samples=0`, post-window as `hits=1, samples=1`, an ordering impossible under a
+  busy-poll. This matches the simulator's trace order exactly, closing the
+  Phase-1 metal interleaving gap.
 
 ## How the Phase-0 gates close
 

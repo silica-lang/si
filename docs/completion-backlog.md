@@ -71,7 +71,12 @@ pick the spec-consistent default and note it in the PR.
 - [ ] D3 `await <cond> within <d>` (§3.2/§5.2) `[metal]`  (dep: D2)
 
 ### Cluster E — Renode Phase-1 closure + fault depth
-- [ ] E1 Mock I²C controller Renode peripheral + trace-order parity harness `[metal]`  (dep: D2)
+- [x] E1 Mock I²C controller Renode peripheral + trace-order parity harness `[metal]` — PR #15.
+      harness/MockBusController.cs (async bus controller @ 0x40003000, IRQ→NVIC#8) +
+      harness/bus_parity.sh + examples/bus_interleave_nrf52840.si. On Renode: button runs
+      DURING the sensor's bus suspension (mid-window hits=1,samples=0; post hits=1,samples=1)
+      — trace-order parity with sim, impossible under a busy-poll. **Headline "device on
+      Renode with trace-order parity" criterion met.** Hermetic sim oracle guards the example.
 - [ ] E2 `when`-typestate + Layer-3 site map (§4.1/§5.4) `[metal]`
 - [ ] E3 Bus arbitration / queues / scheduler overflow policy (§3.5/D06, §5.1/D02) `[metal]`
 - [ ] E4 `reaction … within <d>` deadline → watchdog starve (§4.5/§5.6) `[metal]`
