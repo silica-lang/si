@@ -1,0 +1,28 @@
+// std-lib leaf SPI controller — `implements spi`.  Mirrors `i2c_controller`:
+// its transfer ops are *primitives* (empty body + `yields`); on the host the
+// simulator's bus model services them, and on metal the backend lowers a
+// `read_reg`/`write_reg` `BusXfer` to the same bounded-poll sequence over the
+// registers below (resolved by name — CR/SR/SA/RA/DR).  The shared register
+// shape is deliberate: it is the generic register-based-bus protocol, reused
+// unchanged for a second bus interface.
+
+device spi_controller implements spi {
+  regs {
+    // Control — write to begin a transaction.
+    CR : reg32 at 0x00 access rw { start: bit[0], dir: bit[1] }  // dir: 0=write 1=read
+    // Status (read-only) — the poll target until `done` or an error bit.
+    SR : reg32 at 0x04 access ro { done: bit[0], overrun: bit[1], timeout: bit[3] }
+    SA : reg32 at 0x08 access rw {}   // chip-select line  (the `cs` arg)
+    RA : reg32 at 0x0C access rw {}   // remote register   (the `reg` arg)
+    DR : reg32 at 0x10 access rw {}   // data: TX value in / RX result out
+  }
+
+  needs {
+    clock : clock_source
+  }
+
+  ops {
+    op read_reg(cs: u32, reg: u32) -> u32 or fault{timeout, overrun} yields
+    op write_reg(cs: u32, reg: u32, val: u32) -> () or fault{timeout, overrun} yields
+  }
+}

@@ -56,9 +56,11 @@ hardware** (nRF52840), from the same source.
 SIR (Silica IR) is the contract (§6.1): the host simulator and the C/metal backend are
 *consumers* of the same IR, keeping a future LLVM backend reachable.
 
-This completes the Phase-0 reactive core (DESIGN.md §11). Not yet built (deferred, not
-foreclosed — see §10/§11): composed devices over buses (`i2c`/`spi`), the Layer-3 *site map*
-(when-state-violation decode), typed overlays, and the DTS→Silica fact importer.
+This completes the Phase-0 reactive core (DESIGN.md §11). Phase 1 adds composed devices
+over buses — both `i2c` and `spi` controllers, with composed sensors (BME280 over I²C,
+a BMP280-style sensor over SPI). Not yet built (deferred, not foreclosed — see §10/§11):
+the Layer-3 *site map* (when-state-violation decode), typed overlays, and the DTS→Silica
+fact importer.
 
 ## Build & run
 
