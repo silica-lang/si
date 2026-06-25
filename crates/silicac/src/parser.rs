@@ -698,7 +698,9 @@ impl Parser {
             let ty = self.parse_type()?;
             let constraint = if self.peek() == Some(&Token::KwWhere) {
                 self.advance();
-                Some(self.parse_expr()?)
+                // Parse below assignment precedence so a following `= <default>`
+                // is not swallowed into the constraint as an assignment expr.
+                Some(self.parse_or()?)
             } else {
                 None
             };

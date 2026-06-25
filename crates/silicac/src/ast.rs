@@ -269,7 +269,7 @@ pub struct ConfigSection {
 pub struct ConfigField {
     pub name: Ident,
     pub ty: TypeExpr,
-    /// `where <expr>` constraint (parsed, not yet enforced).
+    /// `where <expr>` constraint, const-evaluated and enforced at instantiation (§4.1).
     pub constraint: Option<Expr>,
     pub default: Option<Expr>,
     pub span: Span,

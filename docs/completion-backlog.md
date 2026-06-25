@@ -29,7 +29,8 @@ Plan: `~/.claude/plans/serene-crafting-prism.md`. One item per loop iteration; e
 ## Backlog (check off as completed; record PR #)
 
 ### Cluster A — enforcement on already-parsed syntax
-- [ ] A1 `where`-constraint enforcement (§3.2/§4.1)
+- [x] A1 `where`-constraint enforcement (§3.2/§4.1) — PR #12. Also fixed a parser
+      greediness bug where `where <expr> = <default>` swallowed the default.
 - [ ] A2 Number model: casts / mixed-sign / odd-width / endianness (§4.3)
 - [ ] A3 instant/duration type rules + `now()` (§4.5)
 - [ ] A4 Disposition completeness vs declared codes (§4.4/D14)
