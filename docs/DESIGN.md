@@ -616,6 +616,19 @@ fixed-width volatile pointers (§6.2, D09).
 > **Remaining (deferred):** `rc` read-clear for reads buried in conditions (not assignment RHS), and
 > `reserved`/`width=` enforcement.
 
+> **Status (implemented — ARM-conformant barriers, audit #35 P1-1).** The emitted barriers now match
+> the Cortex-M architecture rather than over-/under-barriering. **Cheaper:** Device-memory accesses
+> are kept in program order by the architecture (and `volatile` blocks compiler reordering), so a
+> register store emits a *single trailing* `__DMB()` (the ordering point) instead of the old
+> before-and-after pair. **More correct:** `__ISB()` is now defined and emitted after `MSR BASEPRI`
+> so the raised priority-ceiling is in effect before the protected access (the RTIC pattern, replacing
+> a `__DMB`); a `__DSB()` is emitted after an interrupt-source clear (GPIOTE `EVENTS_IN`) before the
+> handler returns, and `__DSB();__ISB()` after the bus NVIC-disable, so an interrupt does not
+> spuriously re-enter; a `__DSB()` precedes the bus completion-IRQ enable, and an `__ISB()` follows
+> the global `cpsie i`. Verified by `metal_codegen.rs` (single-DMB-per-store, ISB-after-BASEPRI,
+> DSB-at-event-clear) and the `metal_vs_sim` + `bus_parity` Renode gates. **Remaining (deferred):**
+> fully eliminating the trailing `__DMB()` for runs with no Normal↔Device dependency.
+
 ### 4.3 The number / data model
 
 Fixed-width integers are first-class and width is **always explicit**: `u8 u16 u32 u64` and signed
@@ -993,6 +1006,15 @@ on parts that have one — not a runtime mystery.
 > with no firmware emitted). **Remaining:** the **frame-union** optimisation (overlapping
 > disjoint-lifetime frames) is not yet applied — it can only make the budget smaller.
 
+> **Status (implemented — flash / code-size budget, audit #35 P1-3).** Symmetric to RAM, metal builds
+> now report **flash** usage for cost visibility: after link, `arm-none-eabi-size` (derived from the
+> `cc` prefix) sizes the ELF and `silicac` prints `flash budget <.text+.rodata + .data> of <flash
+> region> B` (e.g. blink 520 B of 1 MiB). `backend::c::{flash_region_size, parse_size, enforce_flash}`
+> compute it; the linker's region check is the first-line enforcer of the hard limit (a too-small
+> flash fails the link), with `enforce_flash` as the clean-message backstop (delete-the-ELF contract).
+> Covered by `tests/flash_budget.rs` + `harness/flash_budget.sh` (healthy reports a budget; an
+> oversized program is rejected with no firmware emitted).
+
 **Frame *union* keeps the static cost affordable (Gemini SIL-005).** Allocating a separate frame for
 every async handler would exhaust RAM on an 8–32 KB part, so the compiler does the opposite of
 wasteful: from the static call-graph and priority map it computes which handler frames have
@@ -1137,6 +1159,12 @@ driver layer underneath Silica devices.
 > runtime**; C is merely one printer of SIR. Concretely, SIR uses only fixed-width types, explicit
 > memory ops, and explicit control flow — nothing that *needs* a C semantic to be meaningful. The
 > LLVM path (below) is the proof obligation that keeps the C backend honest.
+
+> **Status (implemented — optimisation level, audit #35 P1-2).** Metal builds default to **`-Os`**
+> (size — flash is the scarce embedded resource), not `-O1`. A `--opt <level>` CLI flag overrides it
+> (e.g. `--opt 2`, `--opt z`): `backend::opt_override_flag` forms the `-O…` flag and `run()` drops the
+> default `-O…` in its favour. Verified (`backend::tests`, and blink text size `-Os` 512 B vs `-O2`
+> 552 B); `metal_vs_sim` Renode gate PASS at `-Os`.
 
 The flip side of "C is just a printer" is that the printer must **dodge C's undefined behaviour**,
 or the language's guarantees (checked overflow, fixed widths, ordered MMIO) leak away in codegen

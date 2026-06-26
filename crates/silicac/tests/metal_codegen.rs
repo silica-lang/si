@@ -238,6 +238,35 @@ fn on_event_emits_gpiote_handler_and_nvic_config() {
 }
 
 #[test]
+fn mmio_store_has_a_single_trailing_dmb() {
+    // §4.2/P1-1: Device-memory accesses are architecturally ordered, so a store
+    // emits ONE trailing __DMB() (the ordering point) — not the old before+after
+    // pair.
+    let src = c::CBackend::with_target(Target::MetalNrf52840).emit(&compile(GPIO));
+    let i = src.find("0x50000504UL").expect("OUT store"); // gpio0 OUT @ +0x504
+    let block = &src[i..i + src[i..].find('}').expect("store block end")];
+    assert_eq!(block.matches("__DMB();").count(), 1, "exactly one DMB per store:\n{block}");
+}
+
+#[test]
+fn barriers_are_arm_conformant() {
+    // §4.2/§5.5/P1-1: ISB after raising BASEPRI; DSB after clearing the GPIOTE
+    // event before the handler returns; both barrier macros defined.
+    let src = c::CBackend::with_target(Target::MetalNrf52840).emit(&compile(BLINK_BTN));
+
+    assert!(src.contains("#define __ISB()"), "ISB macro defined:\n{src}");
+    // The priority-ceiling raise is followed by an ISB (not a DMB).
+    let raise = src.find("__set_BASEPRI(0x20U)").expect("BASEPRI raise");
+    let isb = src[raise..].find("__ISB();").expect("ISB after raise");
+    let dmb = src[raise..].find("__DMB();").unwrap_or(usize::MAX);
+    assert!(isb < dmb, "ISB must immediately follow the BASEPRI raise:\n{}", &src[raise..raise + 120]);
+    // The GPIOTE handler clears its event and then DSBs before returning.
+    let after = &src[src.find("void GPIOTE_IRQHandler(void)").expect("GPIOTE handler")..];
+    let clr = after.find("clear EVENTS_IN").expect("event clear");
+    assert!(after[clr..].contains("__DSB();"), "DSB after the event clear:\n{}", &after[..400]);
+}
+
+#[test]
 fn shared_cell_critical_lowers_to_basepri_ceiling() {
     // `lit` is shared by the timer and the button (different priorities), so the
     // critical section masks to the ceiling via BASEPRI (§5.5).

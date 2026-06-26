@@ -636,10 +636,11 @@ impl CBackend {
         if let Some(val) = &val_arg {
             out.push(format!("*(volatile uint32_t *)0x{:08x}UL = (uint32_t)({}); /* DR (write) */", dr, val));
         }
-        out.push("__DMB();".into());
+        out.push("__DMB(); /* arm: SA/RA/DR committed before the CR kick */".into());
         let cr_kick = if is_read { "__I2C_CR_START | __I2C_CR_DIR_RD" } else { "__I2C_CR_START" };
         out.push(format!("*(volatile uint32_t *)0x{:08x}UL = ({}); /* CR: kick */", cr, cr_kick));
-        out.push("__DMB();".into());
+        // DSB so the kick is committed before its completion IRQ is enabled (P1-1).
+        out.push("__DSB();".into());
         out.push(format!("__bus_owner = (int32_t){}; /* this reaction now owns the bus */", n));
         out.push("__bus_irq_enable();".into());
         out
@@ -871,10 +872,15 @@ impl CBackend {
                     self.indent += 1;
                     self.line("uint32_t __bp_saved = __get_BASEPRI();");
                     self.line(&format!("__set_BASEPRI(0x{:02x}U);", bp));
-                    self.line("__DMB();");
+                    // §5.5: an ISB after `MSR BASEPRI` so the raised priority is in
+                    // effect before the protected access (a DMB orders memory but
+                    // does not guarantee the new mask is live for the next
+                    // instructions — the RTIC pattern).
+                    self.line("__ISB();");
                     for s in body {
                         self.emit_stmt(s);
                     }
+                    // Order the protected writes before lowering the mask.
                     self.line("__DMB();");
                     self.line("__set_BASEPRI(__bp_saved);");
                     self.indent -= 1;
@@ -1075,18 +1081,22 @@ impl CBackend {
         let field = format!("(((uint32_t)({}) << {}) & 0x{:x}UL)", v, shift, mask);
         let mut out = vec![format!("{{ /* MMIO store: device {} reg 0x{:x} ({}-bit, §4.2 ordered) */", device, offset, width)];
         out.push(format!("    volatile {ct} *__p = (volatile {ct} *)0x{:08x}UL;", addr, ct = cty));
+        // §4.2/§6.2 (audit #35 P1-1): Cortex-M Device-memory accesses are kept in
+        // program order by the architecture (and `volatile` stops compiler
+        // reordering), so a barrier between same-peripheral accesses is redundant.
+        // Emit a *single* trailing `__DMB()` as the ordering point of this device
+        // write w.r.t. subsequent memory/peripheral accesses — not the old
+        // before-and-after pair.
         match access {
             // write-1-to-clear / write-only: write just the field, no RMW.
             SirRegAccess::W1c | SirRegAccess::Wo => {
-                out.push("    __DMB();".into());
                 out.push(format!("    *__p = ({ct})({field});", ct = cty, field = field));
                 out.push("    __DMB();".into());
             }
-            // read/write: read-modify-write the field, bracketed by barriers.
+            // read/write: read-modify-write the field, then one ordering barrier.
             _ => {
                 out.push(format!("    {ct} __v = *__p;", ct = cty));
                 out.push(format!("    __v = ({ct})(((uint32_t)__v & ~0x{:x}UL) | {field});", mask, ct = cty, field = field));
-                out.push("    __DMB();".into());
                 out.push("    *__p = __v;".into());
                 out.push("    __DMB();".into());
             }
@@ -1138,8 +1148,8 @@ impl CBackend {
             device, offset, width, writes.len()
         )];
         out.push(format!("    volatile {ct} *__p = (volatile {ct} *)0x{:08x}UL;", addr, ct = cty));
+        // Single trailing barrier (P1-1) — see emit_mmio_store.
         if single_write {
-            out.push("    __DMB();".into());
             out.push(format!("    *__p = ({ct})({combined});", ct = cty, combined = combined));
             out.push("    __DMB();".into());
         } else {
@@ -1148,7 +1158,6 @@ impl CBackend {
                 "    __v = ({ct})(((uint32_t)__v & ~0x{:x}UL) | ({combined}));",
                 union_mask, ct = cty, combined = combined
             ));
-            out.push("    __DMB();".into());
             out.push("    *__p = __v;".into());
             out.push("    __DMB();".into());
         }
@@ -1339,6 +1348,7 @@ impl CBackend {
         self.line("/* Memory barriers (§4.2/§6.2): ordered MMIO + DMA/IRQ hand-off. */");
         self.line("#define __DSB() __asm__ volatile(\"dsb 0xf\" ::: \"memory\")");
         self.line("#define __DMB() __asm__ volatile(\"dmb 0xf\" ::: \"memory\")");
+        self.line("#define __ISB() __asm__ volatile(\"isb 0xf\" ::: \"memory\")");
         self.line("");
         if module_has_bus_xfer(module) {
             self.line("/* I²C controller bit protocol (§3.5) — see std/i2c_controller.si.  The");
@@ -1505,6 +1515,9 @@ impl CBackend {
                 self.line(&format!("if (*(volatile uint32_t *)0x{:08x}UL != 0U) {{", events_in));
                 self.indent += 1;
                 self.line(&format!("*(volatile uint32_t *)0x{:08x}UL = 0U; /* clear EVENTS_IN[{}] */", events_in, ch));
+                // §4.2/P1-1: ensure the event clear reaches the peripheral before
+                // dispatch/return, so the interrupt does not spuriously re-enter.
+                self.line("__DSB();");
                 for id in rs {
                     self.line(&format!("{}();", reaction_fn_name(*id)));
                 }
@@ -1524,6 +1537,10 @@ impl CBackend {
             self.line("void __BUS_IRQHandler(void) {");
             self.indent += 1;
             self.line("__bus_irq_disable();");
+            // §4.2/P1-1: DSB+ISB so the NVIC disable takes effect (no further
+            // instances of this IRQ are taken) before the handler proceeds.
+            self.line("__DSB();");
+            self.line("__ISB();");
             self.line("int32_t __o = __bus_owner;");
             self.line("__bus_owner = -1;");
             self.line("switch (__o) {");
@@ -1748,6 +1765,8 @@ impl CBackend {
         if needs_systick || timer.is_some() || !events.is_empty() || module_has_bus_xfer(module) {
             self.line("__DSB();");
             self.line("__asm__ volatile(\"cpsie i\"); /* enable interrupts */");
+            // ISB so any interrupt unmasked above is recognised immediately (P1-1).
+            self.line("__ISB();");
             self.emit_newline();
         }
 
@@ -2227,6 +2246,44 @@ pub fn ram_budget(module: &SirModule) -> Result<RamBudget, String> {
         ));
     }
     Ok(budget)
+}
+
+/// The flash/code region size from `board.soc.memory` — the ceiling for the
+/// flash budget gate (audit #35 P1-3).  `None` if no flash region is declared.
+pub fn flash_region_size(module: &SirModule) -> Option<u64> {
+    module.memory.iter().find(|r| !r.is_ram()).map(|r| r.size)
+}
+
+/// Parse Berkeley-format `arm-none-eabi-size <elf>` output into `(text, data,
+/// bss)` bytes (audit #35 P1-3).  Looks for the numeric data row under the
+/// `text data bss …` header.
+pub fn parse_size(output: &str) -> Option<(u64, u64, u64)> {
+    for line in output.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() >= 3 {
+            if let (Ok(t), Ok(d), Ok(b)) =
+                (cols[0].parse::<u64>(), cols[1].parse::<u64>(), cols[2].parse::<u64>())
+            {
+                return Some((t, d, b));
+            }
+        }
+    }
+    None
+}
+
+/// Enforce the flash/code-size budget (audit #35 P1-3), symmetric to the RAM
+/// gate.  Flash footprint = `.text+.rodata` (`text`) + the `.data` LMA (`data`,
+/// copied to RAM at startup); `.bss` is RAM-only.  Returns the bytes used or an
+/// error when the firmware does not fit the flash region.
+pub fn enforce_flash(text: u64, data: u64, flash_size: u64) -> Result<u64, String> {
+    let used = text.saturating_add(data);
+    if used > flash_size {
+        return Err(format!(
+            "flash budget exceeded: {} B (.text+.rodata {} + .data {}) > {} B flash region",
+            used, text, data, flash_size
+        ));
+    }
+    Ok(used)
 }
 
 /// The worst-case stack high-water mark (§5.3/SIL-005), in bytes.  A sound

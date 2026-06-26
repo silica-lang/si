@@ -259,7 +259,7 @@ pub fn cleanup_dump_dir(dir: &Path, base: &str) {
 mod tests {
     use super::*;
 
-    // Verbatim shapes from arm-none-eabi-gcc 15.2 (-O1 inlines single-use
+    // Verbatim shapes from arm-none-eabi-gcc 15.2 (-Os inlines single-use
     // statics, so leaf/__react_*_run fold into __reaction_0's frame).
     const SU: &str = "/tmp/x.c:5:6:__reaction_0\t56\tstatic\n\
                       /tmp/x.c:6:6:SysTick_Handler\t8\tstatic\n\

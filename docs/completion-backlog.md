@@ -277,15 +277,23 @@ gate, and `every` on real timer hardware instead of a 1ms SysTick grid. Plan:
 `~/.claude/plans/as-an-embedded-firmware-functional-pebble.md`. Each item is its own branch
 (`feat/p1-<id>`, **independent off `main`**) + PR targeting `main` (not auto-merged). All `[metal]`.
 
-- [ ] P1-1 Barrier model: ARM-conformant + de-duplicated `[metal]` — define `__ISB`; `__ISB` after
-      `MSR BASEPRI` raise (not `__DMB`); `__DSB` after interrupt-source clear before ISR return
-      (GPIOTE/bus) + `__DSB;__ISB` after NVIC ISER enable; collapse the redundant double-`__DMB` per
-      MMIO store to the architecturally-required Normal↔Device boundaries only.
-- [ ] P1-2 Default `-Os` + `--opt <level>` override `[metal]` — flip metal `-O1`→`-Os` in `cc_flags`,
-      add a CLI opt-level override injected in `run()`; keep `-fstack-usage`/`-fcallgraph-info`.
-- [ ] P1-3 Flash / code-size budget gate `[metal]` — `flash_budget()`/`enforce_flash()` symmetric to
-      the RAM gate; measure `.text+.rodata+.data` via `arm-none-eabi-size` on the linked ELF vs the
-      flash region, hard-error + delete ELF on overflow; `harness/flash_budget.sh`. (After P1-2.)
+- [x] P1-1 Barrier model: ARM-conformant + de-duplicated `[metal]` — PR #48. Defined `__ISB`; `__ISB`
+      after `MSR BASEPRI` raise (replaces `__DMB`); `__DSB` after the GPIOTE event clear before ISR
+      return + `__DSB;__ISB` after the bus NVIC-disable; `__DSB` before the bus completion-IRQ enable;
+      `__ISB` after `cpsie i`. Collapsed the double-`__DMB` per MMIO store to a single trailing one
+      (Device memory is architecturally ordered). tests/metal_codegen.rs (single-DMB, ISB-after-BASEPRI,
+      DSB-at-event-clear); metal_vs_sim + bus_parity Renode gates PASS. NOTE: fully dropping the
+      trailing `__DMB` for runs with no Normal↔Device dependency is a deferred follow-up.
+- [x] P1-2 Default `-Os` + `--opt <level>` override `[metal]` — PR #49. Metal `cc_flags` now `-Os`;
+      `backend::opt_override_flag` + a `--opt` CLI flag drop the default `-O…` and append the override
+      in `run()` (keeps cc_flags `&'static`). backend::tests (default -Os; flag forming). Blink text
+      512B (-Os) vs 552B (-O2) proves it reaches cc; metal_vs_sim Renode gate PASS at -Os.
+- [x] P1-3 Flash / code-size budget gate `[metal]` — PR #50/#52. `flash_region_size`/
+      `parse_size`/`enforce_flash` in backend/c.rs; `run()` sizes the ELF via `arm-none-eabi-size`
+      (derived from the cc prefix) and prints `flash budget … of … B` (blink 520 B of 1 MiB), deleting
+      the ELF + erroring on overflow. The linker region check is the first-line hard enforcer;
+      enforce_flash is the clean-message backstop. tests/flash_budget.rs + examples/flash_over_budget_
+      nrf52840.si + harness/flash_budget.sh (healthy reports; oversized rejected, no ELF). metal_vs_sim PASS.
 - [x] P1-4 `every` on a hardware timer `[metal]` — PR #51. `every` lowers onto nRF52840 TIMER1
       (1MHz free-running 32-bit, one CC channel per reaction, `TIMER1_IRQHandler` re-arms `CC+=period`;
       `timer_plan` does exact-or-error period→ticks at 1µs — `every 1500us` now works, no 1ms grid/
