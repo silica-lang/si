@@ -1,0 +1,53 @@
+// Composed-device over a *second* bus interface (§3.5): a BMP280-style sensor
+// reached over an SPI bus instead of I²C.  `sensor.read_temp()` is a fallible,
+// **yielding** transaction over the bus — the handler suspends while the
+// transfer runs, faults propagate via `?`, and a `retry` disposition recovers
+// from a transient timeout.  This is `sensor_i2c.si` retargeted to `spi`,
+// demonstrating the bus machinery is generic across interfaces.
+//
+//   silicac --sim examples/sensor_spi.si
+//
+// (spi / spi_controller are std-lib devices loaded from crates/silicac/std.)
+
+// A composed SPI sensor — no `regs` of its own; its op is a transaction over the
+// `spi` bus it needs (cs = 0, remote temperature register 0xFA).
+device bmp280_spi {
+  needs {
+    bus : spi
+  }
+  ops {
+    op read_temp() -> u32 or fault{timeout, overrun} yields {
+      return bus.read_reg(0, 0xFA)?
+    }
+  }
+}
+
+board sensor_board {
+  soc s {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+
+  spi0 : spi_controller at 0x4000_3000 { needs { clock = soc.sysclk } }
+  env  : bmp280_spi { needs { bus = spi0 } }
+}
+
+program app {
+  use board sensor_board as b
+
+  let sensor = b.env
+  cell samples : u32 = 0
+
+  every 1000ms on fault retry(max = 3) {
+    let t = sensor.read_temp()?
+    samples += 1
+  }
+}
+
+sim app_sim for app {
+  inject bus_fault timeout times 1   // the first transfer times out; retry recovers
+  run until 2500ms
+}

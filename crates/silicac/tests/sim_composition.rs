@@ -146,3 +146,62 @@ program app {
 fn sir_run_strings(sir: &SirModule) -> Vec<String> {
     sim::run(sir).render(sir).lines().map(|s| s.to_string()).collect()
 }
+
+#[test]
+fn spi_sensor_retry_recovers_over_a_second_bus_interface() {
+    // The same composition keystone over `spi` instead of `i2c`: the first
+    // transfer times out, `?` propagates it, and `retry(max=3)` recovers — proof
+    // the bus machinery (BusXfer, the sim bus model) is generic across bus
+    // interfaces, not special-cased to I²C (§3.5/D1).
+    let src = r#"
+device bmp280_spi {
+  needs { bus : spi }
+  ops {
+    op read_temp() -> u32 or fault{timeout, overrun} yields {
+      return bus.read_reg(0, 0xFA)?
+    }
+  }
+}
+board demo {
+  soc s { memory { flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K } clocks { sysclk : clock_source = 64MHz } }
+  spi0 : spi_controller at 0x4000_3000 { needs { clock = soc.sysclk } }
+  env  : bmp280_spi { needs { bus = spi0 } }
+}
+program app {
+  use board demo as b
+  let sensor = b.env
+  cell samples : u32 = 0
+  every 1000ms on fault retry(max = 3) {
+    let t = sensor.read_temp()?
+    samples += 1
+  }
+}
+sim app_sim for app {
+  inject bus_fault timeout times 1
+  run until 1100ms
+}
+"#;
+    let sir = compile(src);
+    let r = sim::run(&sir);
+    let t = &r.trace;
+    // The first transfer faults (BusDone with a `timeout` code) and a retry
+    // disposition fires, then a later transfer succeeds (BusDone, code = None).
+    let fault = t
+        .iter()
+        .position(|x| matches!(&x.kind, TraceKind::BusDone { code: Some(c), .. } if c == "timeout"))
+        .expect("timeout fault");
+    assert!(
+        t.iter().any(|x| matches!(&x.kind, TraceKind::Dispose { action, .. } if action.contains("retry"))),
+        "a retry disposition fires:\n{:#?}", t
+    );
+    let ok = t
+        .iter()
+        .rposition(|x| matches!(&x.kind, TraceKind::BusDone { code: None, .. }))
+        .expect("successful transfer");
+    assert!(fault < ok, "the timeout fault is followed by a successful retry:\n{:#?}", t);
+    // And the sample was ultimately taken (retry recovered).
+    assert!(
+        t.iter().any(|x| matches!(&x.kind, TraceKind::CellWrite { value, .. } if *value == 1)),
+        "samples reaches 1 after retry recovery:\n{:#?}", t
+    );
+}

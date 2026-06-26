@@ -1,0 +1,17 @@
+// std-lib SPI bus interface (§3.5) — a register-mapped, full-duplex serial bus.
+// Like `i2c` it is a *contract*: a named set of yielding, fallible register
+// transactions that controllers provide (`implements spi`) and composed devices
+// require (`needs bus: spi`).  SPI selects a peripheral by a chip-select line
+// rather than an on-wire address, so a transaction's first argument is the CS
+// line index.  Its existence alongside `i2c` shows the bus machinery (BusXfer,
+// composition, the sim bus model, the metal bounded-poll lowering) is generic
+// across bus *interfaces*, not special-cased to I²C (§2).
+
+interface spi {
+  // One register read/write over the bus, selecting `cs` and addressing the
+  // peripheral's remote register `reg`.  Each is one indivisible transaction
+  // that suspends once (§3.5/SIL-003) and can fault (clock-stall timeout or an
+  // RX overrun, §4.4/D14).
+  op read_reg(cs: u32, reg: u32) -> u32 or fault{timeout, overrun} yields
+  op write_reg(cs: u32, reg: u32, val: u32) -> () or fault{timeout, overrun} yields
+}

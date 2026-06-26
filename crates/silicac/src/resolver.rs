@@ -465,6 +465,64 @@ impl Resolver {
             instance_ids.insert(inst.name.name.clone(), id);
         }
 
+        // §3.2/§4.1 — enforce `where` constraints on config fields. Each field's
+        // effective value (instance override, else device default) is bound, then
+        // every constrained field's predicate is const-evaluated; anything that does
+        // not evaluate to `true` is a compile error rather than a parsed-but-ignored
+        // annotation.
+        for inst in &board.instances {
+            let Some(def) = self.device_defs.get(&inst.device_ty.name).cloned() else { continue };
+            let Some(cfg) = def.sections.config.as_ref() else { continue };
+            // Effective config environment (constants only).
+            let mut env: HashMap<String, ConstVal> = HashMap::new();
+            for f in &cfg.fields {
+                let val_expr = inst
+                    .config
+                    .iter()
+                    .find(|(k, _)| k.name == f.name.name)
+                    .map(|(_, e)| e)
+                    .or(f.default.as_ref());
+                if let Some(e) = val_expr {
+                    if let Some(v) = const_eval(e, &env) {
+                        env.insert(f.name.name.clone(), v);
+                    }
+                }
+            }
+            for f in &cfg.fields {
+                let Some(c) = &f.constraint else { continue };
+                if !env.contains_key(&f.name.name) {
+                    continue; // no concrete value (e.g. required field unset) — nothing to check
+                }
+                match const_eval(c, &env) {
+                    Some(ConstVal::Bool(true)) => {}
+                    Some(ConstVal::Bool(false)) => {
+                        let span = inst
+                            .config
+                            .iter()
+                            .find(|(k, _)| k.name == f.name.name)
+                            .map(|(_, e)| e.span)
+                            .unwrap_or(inst.span);
+                        let shown = match env.get(&f.name.name) {
+                            Some(ConstVal::Int(n)) => format!(" = {}", n),
+                            _ => String::new(),
+                        };
+                        self.err(
+                            span,
+                            format!(
+                                "instance '{}': config `{}`{} violates its `where` constraint (§4.1)",
+                                inst.name.name, f.name.name, shown
+                            ),
+                        );
+                    }
+                    Some(ConstVal::Int(_)) => self.err(
+                        c.span,
+                        format!("`where` constraint on `{}` must be a boolean expression (§4.1)", f.name.name),
+                    ),
+                    None => {} // non-constant constraint — left unchecked, not a hard error
+                }
+            }
+        }
+
         // Resolve each instance's `needs` relations (e.g. `bus = i2c0`) so a
         // composed device's op body can reach its substrate.  A `needs` typed by
         // an interface must be satisfied by an instance whose device implements
@@ -1709,6 +1767,62 @@ fn ast_binop_to_sir(op: BinOp) -> SirBinOp {
     }
 }
 
+// ─── Compile-time constant evaluation (§3.2/§4.1 `where`-constraints) ──────────
+
+/// A constant value produced by [`const_eval`]. Durations are already lowered to
+/// `IntLit` nanoseconds by the parser, so every numeric constant is an `Int`.
+#[derive(Clone, Copy)]
+enum ConstVal {
+    Int(u64),
+    Bool(bool),
+}
+
+/// Evaluate a constraint/config expression against the bound config `env`.
+/// Returns `None` for anything not reducible to a constant (the caller decides
+/// whether that is an error in context); never panics on bad operands.
+fn const_eval(e: &Expr, env: &HashMap<String, ConstVal>) -> Option<ConstVal> {
+    match &e.kind {
+        ExprKind::IntLit(n) => Some(ConstVal::Int(*n)),
+        ExprKind::BoolLit(b) => Some(ConstVal::Bool(*b)),
+        ExprKind::Ident(id) => env.get(&id.name).copied(),
+        ExprKind::Not(inner) => match const_eval(inner, env)? {
+            ConstVal::Bool(b) => Some(ConstVal::Bool(!b)),
+            ConstVal::Int(_) => None,
+        },
+        ExprKind::BinOp { op, lhs, rhs } => {
+            let l = const_eval(lhs, env)?;
+            let r = const_eval(rhs, env)?;
+            const_binop(*op, l, r)
+        }
+        _ => None,
+    }
+}
+
+fn const_binop(op: BinOp, l: ConstVal, r: ConstVal) -> Option<ConstVal> {
+    use ConstVal::{Bool, Int};
+    match (op, l, r) {
+        // Integer arithmetic (saturating on the rare overflow; div/rem-by-zero → None).
+        (BinOp::Add, Int(a), Int(b)) => Some(Int(a.saturating_add(b))),
+        (BinOp::Sub, Int(a), Int(b)) => Some(Int(a.saturating_sub(b))),
+        (BinOp::Mul, Int(a), Int(b)) => Some(Int(a.saturating_mul(b))),
+        (BinOp::Div, Int(a), Int(b)) => (b != 0).then(|| Int(a / b)),
+        (BinOp::Rem, Int(a), Int(b)) => (b != 0).then(|| Int(a % b)),
+        // Integer comparisons → Bool.
+        (BinOp::EqEq, Int(a), Int(b)) => Some(Bool(a == b)),
+        (BinOp::NotEq, Int(a), Int(b)) => Some(Bool(a != b)),
+        (BinOp::Lt, Int(a), Int(b)) => Some(Bool(a < b)),
+        (BinOp::Le, Int(a), Int(b)) => Some(Bool(a <= b)),
+        (BinOp::Gt, Int(a), Int(b)) => Some(Bool(a > b)),
+        (BinOp::Ge, Int(a), Int(b)) => Some(Bool(a >= b)),
+        // Boolean logic.
+        (BinOp::And, Bool(a), Bool(b)) => Some(Bool(a && b)),
+        (BinOp::Or, Bool(a), Bool(b)) => Some(Bool(a || b)),
+        (BinOp::EqEq, Bool(a), Bool(b)) => Some(Bool(a == b)),
+        (BinOp::NotEq, Bool(a), Bool(b)) => Some(Bool(a != b)),
+        _ => None, // type-mismatched operands
+    }
+}
+
 // ─── Public entry point ───────────────────────────────────────────────────────
 
 pub fn resolve(module: &Module) -> Result<SirModule, Vec<ResolveError>> {
@@ -1928,4 +2042,36 @@ program p {{
         let errs = resolve_src(&src).expect_err("expected unknown-event error");
         assert!(errs.iter().any(|e| e.msg.contains("does not emit event 'rising'")));
     }
+
+    /// §3.2/§4.1 — a `where` constraint on a config field is enforced at
+    /// instantiation, not merely parsed and ignored.
+    #[test]
+    fn config_where_constraint_is_enforced() {
+        let board = |speed: &str| {
+            format!(
+                r#"
+device throttle {{
+    regs {{ CR : reg32 at 0x00 access rw {{}} }}
+    config {{ speed : u32 where speed <= 400_000 = 100_000 }}
+    needs {{ clock : clock_source }}
+}}
+board b {{
+    soc s {{ clocks {{ sysclk : clock_source = 8MHz }} }}
+    t : throttle at 0x4000_0000 {{ config {{ speed = {speed} }} needs {{ clock = soc.sysclk }} }}
+}}
+program p {{ use board b as dev  on sys.start {{ }} }}
+"#
+            )
+        };
+        // Within the bound (boundary value): resolves cleanly.
+        assert!(resolve_src(&board("400_000")).is_ok(), "in-range config should resolve");
+        // Over the bound: a compile error naming the field and its constraint.
+        let errs = resolve_src(&board("500_000")).expect_err("expected where-constraint violation");
+        assert!(
+            errs.iter().any(|e| e.msg.contains("where") && e.msg.contains("speed")),
+            "expected a `where`-constraint violation on `speed`, got: {:?}",
+            errs
+        );
+    }
 }
+

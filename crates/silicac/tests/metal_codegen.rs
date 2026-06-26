@@ -471,3 +471,51 @@ fn host_target_still_emits_hosted_main() {
     assert!(src.contains("int main(void)"));
     assert!(!src.contains("Reset_Handler"));
 }
+
+/// A composed sensor over the **SPI** bus (a second bus interface) lowers its
+/// `BusXfer` through the same generic bounded-poll path as I²C — proving the
+/// metal bus lowering is not special-cased to one interface (§3.5/D1).
+const SENSOR_SPI: &str = r#"
+device bmp280_spi {
+  needs { bus : spi }
+  ops {
+    op read_temp() -> u32 or fault{timeout, overrun} yields {
+      return bus.read_reg(0, 0xFA)?
+    }
+  }
+}
+board b {
+  soc s {
+    memory { flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+  spi0 : spi_controller at 0x4000_3000 { needs { clock = soc.sysclk } }
+  env  : bmp280_spi { needs { bus = spi0 } }
+}
+program app {
+  use board b as bd
+  let sensor = bd.env
+  cell samples : u32 = 0
+  every 1000ms on fault retry(max = 3) {
+    let t = sensor.read_temp()?
+    samples += 1
+  }
+}
+"#;
+
+#[test]
+fn spi_bus_xfer_lowers_to_bounded_poll_over_declared_registers() {
+    let sir = compile(SENSOR_SPI);
+    let out = c::CBackend::with_target(Target::MetalNrf52840).emit(&sir);
+    // cs = 0 → SA; remote reg 0xFA (250) → RA; both at the spi controller's
+    // declared offsets off base 0x4000_3000.
+    assert!(out.contains("0x40003008UL = (uint32_t)(0ULL); /* SA */"), "cs 0 to SA:\n{out}");
+    assert!(out.contains("0x4000300cUL = (uint32_t)(250ULL); /* RA */"), "reg 0xFA to RA:\n{out}");
+    assert!(out.contains("0x40003000UL = (__I2C_CR_START | __I2C_CR_DIR_RD)"), "CR kick (read):\n{out}");
+    assert!(out.contains("0x40003004UL; /* SR */"), "poll SR:\n{out}");
+    assert!(out.contains("0x40003010UL; /* DR (read result) */"), "read DR on done:\n{out}");
+    // Same bounded-poll + ordering as i2c; no stub.
+    assert!(out.contains("__spins > __I2C_POLL_BOUND"), "bounded busy-wait:\n{out}");
+    assert!(out.contains("__DMB();"), "ordering barriers:\n{out}");
+    assert!(!out.contains("not yet lowered"), "no unlowered-device-op stub:\n{out}");
+}

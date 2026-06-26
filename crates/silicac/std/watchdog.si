@@ -15,6 +15,8 @@ device wdt implements watchdog {
     KR  : reg32 at 0x08 access wo {}
   }
   config {
-    timeout : duration = 100ms
+    // §4.1 `where`-constraint, now enforced at instantiation: a system watchdog
+    // window must be a positive, sub-second duration (durations lower to ns).
+    timeout : duration where timeout > 0ns and timeout <= 1s = 100ms
   }
 }

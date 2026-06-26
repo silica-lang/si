@@ -26,10 +26,20 @@ Plan: `~/.claude/plans/serene-crafting-prism.md`. One item per loop iteration; e
   ```
 - Baseline gate (blink/button `sim ≡ metal`): **PASS** — `1 0 1 0 1 0 1` both sides.
 
+## Sequencing (revised after A1)
+Investigation found cluster A is **not** mostly "enforce already-parsed syntax": only A1
+was parse-complete. A2 needs a numeric **cast** spelling; A3 needs `instant`/`now()`; A4
+needs the **`match`** construct (lexer-token only today); A5 needs interface **properties**.
+So A2–A5 are full feature builds. Per user decision: **keystone-first** — do D (spi →
+yields state machine) and E (Renode I²C parity) first (the concrete path to "device on
+Renode with trace-order parity"), then return to A–C/B/F. New surface-syntax decisions:
+pick the spec-consistent default and note it in the PR.
+
 ## Backlog (check off as completed; record PR #)
 
 ### Cluster A — enforcement on already-parsed syntax
-- [ ] A1 `where`-constraint enforcement (§3.2/§4.1)
+- [x] A1 `where`-constraint enforcement (§3.2/§4.1) — PR #12. Also fixed a parser
+      greediness bug where `where <expr> = <default>` swallowed the default.
 - [ ] A2 Number model: casts / mixed-sign / odd-width / endianness (§4.3)
 - [ ] A3 instant/duration type rules + `now()` (§4.5)
 - [ ] A4 Disposition completeness vs declared codes (§4.4/D14)
@@ -44,7 +54,11 @@ Plan: `~/.claude/plans/serene-crafting-prism.md`. One item per loop iteration; e
 - [ ] C3 Typed overlays — language construct only (§3.6)
 
 ### Cluster D — Phase-1 yields keystone
-- [ ] D1 spi controller leaf + composed example (§3.5) `[metal]`
+- [x] D1 spi controller leaf + composed example (§3.5) `[metal]` — PR #13. std/spi.si +
+      std/spi_controller.si + examples/sensor_spi.si (bmp280-over-spi). Reuses the generic
+      BusXfer path with **zero backend change** (metal emitter resolves CR/SR/SA/RA/DR by
+      name). Metal firmware compiles + links with arm-gcc; full Renode bus execution lands
+      with E1's mock controller.
 - [ ] D2 Real IRQ-driven yields state machine (§5.2/§6.1) `[metal]`  ← critical path
 - [ ] D3 `await <cond> within <d>` (§3.2/§5.2) `[metal]`  (dep: D2)
 
