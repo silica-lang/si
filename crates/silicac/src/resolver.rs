@@ -1677,6 +1677,20 @@ impl Resolver {
             ExprKind::Try(inner) => self.expr_sirtype(inner, scope),
             ExprKind::BinOp { lhs, .. } => self.expr_sirtype(lhs, scope),
             ExprKind::FixedLit(..) => SirType::Fixed { int_bits: 16, frac_bits: 16, signed: true },
+            // A composed-device op call adopts the op's declared return type — so
+            // `let t = sensor.read_temp_c()` is `fixed<…>`, not the default u32.
+            ExprKind::Call { callee, .. } => {
+                if let ExprKind::Field(dev_expr, op) = &callee.kind {
+                    if let Some(root) = expr_root_ident(dev_expr) {
+                        if let Some(Binding::Device(inst)) = scope.lookup(root) {
+                            if let Some(op_decl) = self.find_op(&inst.ty, &op.name) {
+                                return resolve_type_expr(&op_decl.ret.ty);
+                            }
+                        }
+                    }
+                }
+                SirType::U32
+            }
             _ => SirType::U32,
         }
     }

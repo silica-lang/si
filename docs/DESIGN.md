@@ -704,8 +704,14 @@ silent soft-float fallback. In the toy we *refuse* rather than emit slow soft-fl
 > P0-3b).** Decimal (`0.5`, `3.25`) and the documented voltage form (`3v3`, `1v8`) lex to
 > `Token::FixedLit(mantissa, frac_digits)` → `ExprKind::FixedLit`, and adopt the enclosing
 > `fixed<I,F>` scale (default Q16.16): `raw = round(mantissa·2^F / 10^digits)`. `examples/fixed.si`
-> (sum 7, prod 12, half 3, gained 4 = 3.0·1.5), `tests/fixed.rs`. **Remaining:** the BME280 datasheet
-> compensation that puts all of this to work end-to-end (P0-3d).
+> (sum 7, prod 12, half 3, gained 4 = 3.0·1.5), `tests/fixed.rs`. **End-to-end proof (audit #35
+> P0-3d).** `std/bme280.si` no longer elides its compensation: `read_temp_c()` reads a raw ADC word
+> over the I²C bus (a yielding transaction) and returns a compensated `fixed<16,16>` °C value via
+> cast + subtract + fixed-divide — `(adc − T0)/span`. The sim mock's raw `0x5AB0` (23216) compensates
+> to exactly 25.00 °C (`examples/sensor_temp_c.si`, `tests/bme280.rs`); `bus_parity` Renode parity
+> still holds. **Finding 3 complete** — the FPU-less numeric path is functional, and the composition
+> keystone now does the awkward part the audit flagged. **Remaining (deferred):** the full BME280
+> t_fine polynomial (more terms, same shape) and unsigned/`>64`-bit fixed.
 
 ### 4.4 Fallibility and faults
 
