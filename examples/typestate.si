@@ -1,0 +1,58 @@
+// Static typestate via `when`/`become` (§4.1/D07).
+//
+// A device declares `states { … }`; an op may be guarded `when <state>` and is
+// then callable only when the device is provably in that state.  An op
+// transitions the device with `become <state>`.  Where a dominating `become`
+// proves the state at a call site (straight-line control flow), the guard is a
+// **static typestate check with zero runtime cost** — calling a guarded op in
+// the wrong state is a compile error, not undefined behaviour.
+//
+// Here `read()` is guarded `when ready`; the reaction powers the device on first,
+// so the call type-checks statically.  Deleting the `power_on()` line would make
+// it a compile error (the device would still be in its initial `idle` state).
+//
+//   silicac --sim examples/typestate.si
+
+device thermostat {
+  regs {
+    CTRL : reg32 at 0x00 access rw { enable: bit[0] }
+    TEMP : reg32 at 0x04 access ro {}
+  }
+  states { idle, ready }
+  ops {
+    op power_on() -> () {
+      CTRL.enable = 1
+      become ready
+    }
+    op read() when ready -> u32 {
+      return TEMP
+    }
+  }
+}
+
+board demo {
+  soc s {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+  t : thermostat at 0x5000_0000
+}
+
+program app {
+  use board demo as b
+  let dev = b.t
+  cell samples : u32 = 0
+
+  every 100ms {
+    dev.power_on()         // become ready
+    let v = dev.read()     // `when ready` — proven by the power_on above
+    samples = samples + 1
+  }
+}
+
+sim app_sim for app {
+  run until 250ms
+}

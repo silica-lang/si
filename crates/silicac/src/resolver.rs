@@ -144,6 +144,9 @@ pub struct Resolver {
     /// Stack of result-locals for ops currently being inlined; `return X` in an
     /// op body binds the top.
     op_result: Vec<String>,
+    /// §4.1/D07 static typestate: device id → its provable current state within
+    /// the reaction being lowered (cleared at each reaction boundary).
+    device_states: HashMap<usize, String>,
 
     // ── output accumulators ──
     devices: Vec<SirDevice>,
@@ -189,6 +192,7 @@ impl Resolver {
             instance_needs: HashMap::new(),
             tmp_counter: 0,
             op_result: Vec::new(),
+            device_states: HashMap::new(),
             devices: Vec::new(),
             events: Vec::new(),
             cells: Vec::new(),
@@ -236,6 +240,7 @@ impl Resolver {
             if let Item::Device(d) = item {
                 self.check_conformance(d);
                 self.check_regs(d);
+                self.check_states(d);
             }
         }
 
@@ -722,11 +727,60 @@ impl Resolver {
             Trigger::Every(dur) => (SirTrigger::EveryNs(dur.to_ns()), 1),
         };
 
+        // §4.1/D07: each reaction starts with every device in its declared
+        // initial state — typestate is not carried across an event boundary.
+        self.device_states.clear();
         let body = self.lower_block(&r.body, scope, vars);
         let yields = body_yields(&body);
         let disposition = lower_disposition(&r.fault_disp);
         let deadline_ns = r.within.as_ref().map(|d| d.to_ns());
         Some(SirReaction { id, trigger, body, priority, disposition, yields, deadline_ns })
+    }
+
+    /// §4.1/D07 — validate a device's typestate declarations: every op `when S`
+    /// and every `become X` must name a state the device declares.
+    fn check_states(&mut self, d: &DeviceDef) {
+        let declared: Vec<String> = d
+            .sections
+            .states
+            .as_ref()
+            .map(|s| s.states.iter().map(|i| i.name.clone()).collect())
+            .unwrap_or_default();
+        let Some(ops) = &d.sections.ops else { return };
+        for OpsItem::Op(op) in &ops.items {
+            if let Some(when) = &op.when {
+                if !declared.contains(&when.name) {
+                    self.err(when.span, format!(
+                        "op '{}' is guarded `when {}`, but device '{}' declares no such state (§4.1)",
+                        op.name.name, when.name, d.name.name
+                    ));
+                }
+            }
+            for stmt in &op.body.stmts {
+                if let Stmt::Become(state, span) = stmt {
+                    if !declared.contains(&state.name) {
+                        self.err(*span, format!(
+                            "`become {}` in op '{}', but device '{}' declares no such state (§4.1)",
+                            state.name, op.name.name, d.name.name
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The device's provable current typestate (§4.1/D07): the tracked state if a
+    /// `become` has run this reaction, else the type's declared initial state
+    /// (the first listed), or `None` if the type declares no states.
+    fn current_device_state(&self, device_id: usize, ty: &str) -> Option<String> {
+        if let Some(s) = self.device_states.get(&device_id) {
+            return Some(s.clone());
+        }
+        self.device_defs
+            .get(ty)
+            .and_then(|d| d.sections.states.as_ref())
+            .and_then(|s| s.states.first())
+            .map(|i| i.name.clone())
     }
 
     /// Build the register bindings for a device type (its `regs` + fields), to
@@ -1104,6 +1158,29 @@ impl Resolver {
             self.err(span, format!("device type '{}' has no op '{}'", inst.ty, op_name));
             return SirExpr::U64(0);
         };
+        // §4.1/D07 — static typestate check: a `when S` op is callable only when
+        // the device is provably in state S (a dominating `become` in this
+        // reaction's straight-line flow).  Otherwise it is a compile error.
+        if let Some(required) = &op.when {
+            let current = self.current_device_state(inst.device, &inst.ty);
+            if current.as_deref() != Some(required.name.as_str()) {
+                self.err(
+                    span,
+                    format!(
+                        "op '{}' requires device type '{}' to be in state '{}', but it is in state '{}' here — add a `become {}` before the call (§4.1/D07)",
+                        op_name,
+                        inst.ty,
+                        required.name,
+                        current.as_deref().unwrap_or("<unknown>"),
+                        required.name,
+                    ),
+                );
+            }
+        }
+        // Apply this op's typestate transition, if it ends by `become`-ing a state.
+        if let Some(target) = op_become_target(&op) {
+            self.device_states.insert(inst.device, target);
+        }
         if args.len() != op.params.len() {
             self.err(span, format!("op '{}' takes {} arg(s), got {}", op_name, op.params.len(), args.len()));
             return SirExpr::U64(0);
@@ -1758,6 +1835,15 @@ fn expr_touches_cell(expr: &SirExpr, cell: &str) -> bool {
 }
 
 /// Extract the root identifier name from an expression like `foo` or `foo.bar`.
+/// The typestate an op transitions the device to, if its body ends by `become`-ing
+/// a state (the last top-level `become` wins).  `None` if it makes no transition.
+fn op_become_target(op: &OpDecl) -> Option<String> {
+    op.body.stmts.iter().rev().find_map(|s| match s {
+        Stmt::Become(state, _) => Some(state.name.clone()),
+        _ => None,
+    })
+}
+
 fn expr_root_ident(expr: &Expr) -> Option<&str> {
     match &expr.kind {
         ExprKind::Ident(ident) => Some(&ident.name),
