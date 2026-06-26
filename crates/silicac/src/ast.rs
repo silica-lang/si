@@ -673,6 +673,9 @@ pub enum TypeKind {
     Bytes,
     /// `buffer<N>`
     Buffer(Box<Expr>),
+    /// `ring<T, N>` — a bounded ring buffer of `N` elements of integer type `T`
+    /// (§5.3): the canonical producer/consumer queue between handlers.
+    Ring(Box<TypeExpr>, Box<Expr>),
     /// `fixed<I, F>` — fixed-point.
     Fixed(u32, u32),
     /// `enum { a, b, c }` — anonymous enum.

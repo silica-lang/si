@@ -1,0 +1,44 @@
+// Bounded ring buffer (§5.3) — the canonical producer/consumer queue.
+//
+// Memory in Silica is bounded, not absent: a `ring<T, N>` is N slots of T plus
+// head/tail/count indices, and the compiler sums it into the static RAM budget
+// (no heap).  `push`/`pop`/`len`/`is_empty`/`is_full` are the ops; on a full
+// ring `push` overwrites the oldest element (a defined, bounded overflow policy).
+//
+// Here a fast producer fills the ring and a slower consumer drains it, so the
+// 4-slot ring saturates and the oldest samples are dropped — visibly bounded.
+//
+//   silicac --sim examples/ring.si
+
+board demo {
+  soc s {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+}
+
+program app {
+  use board demo as b
+  cell q        : ring<u32, 4> = 0   // bounded queue (init ignored)
+  cell produced : u32 = 0
+  cell consumed : u32 = 0
+
+  // Producer: one sample every 100ms.
+  every 100ms {
+    produced = produced + 1
+    q.push(produced)
+  }
+
+  // Consumer: drains one every 300ms — slower, so the ring fills and saturates.
+  every 300ms {
+    let v = q.pop()
+    consumed = consumed + v
+  }
+}
+
+sim app_sim for app {
+  run until 750ms
+}
