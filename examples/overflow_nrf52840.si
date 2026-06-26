@@ -1,0 +1,36 @@
+// Overflow-trap-by-default on metal (§4.3 / SIL-004) — the on-hardware companion
+// to the sim overflow test.  A u8 accumulator is advanced by 85 every 100ms:
+//   tick 1 → 85, tick 2 → 170, tick 3 → 255, tick 4 → 340  ← does not fit u8.
+// The fourth add traps: the generated helper calls __silica_overflow_trap, which
+// drives the system to its safe state and halts.  `ticks` therefore freezes at 4.
+//
+// The harness also builds a wrapping control (`+%` instead of `+`), which never
+// traps and runs every tick, so `ticks` keeps climbing — the observable proof
+// that the default `+` trapped rather than silently wrapping.
+//
+//   RENODE=… ./harness/overflow_trap.sh
+
+board demo {
+  soc s {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+}
+
+program app {
+  use board demo as b
+  cell ticks : u32 = 0   // advances each tick until the system halts
+  cell acc   : u8  = 0   // overflows on the 4th tick under plain `+`
+
+  every 100ms {
+    ticks = ticks + 1
+    acc   = acc + 85
+  }
+}
+
+sim app_sim for app {
+  run until 450ms
+}

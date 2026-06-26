@@ -1,0 +1,45 @@
+// Width-checked integer arithmetic (§4.3 / SIL-004).
+//
+// Plain `+`/`-`/`*` TRAP on overflow by default — the silent-wraparound footgun
+// the language exists to prevent.  The width is the assignment target's type, so
+// the same `+ 100` is safe in a u32 cell and a trap risk in a u8 cell.  When
+// wraparound or clamping is actually wanted, it must be spelled explicitly:
+//   `+%` `-%` `*%`  wrap (two's-complement, at the target width)
+//   `+|` `-|` `*|`  saturate (clamp to the type's min/max)
+//
+// This demo never trips the trap: each narrow counter uses the operator whose
+// semantics it wants.  Switching `wrapped`/`saturated` to a plain `+` (or
+// letting `safe32` exceed 2^32) would drive the system to its safe state.
+//
+//   silicac --sim examples/overflow.si
+
+board demo {
+  soc s {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+}
+
+program app {
+  use board demo as b
+
+  // u8 counters that deliberately exceed 255 — each opts into a defined
+  // overflow behaviour rather than trapping.
+  cell wrapped   : u8  = 200   // +% 100, +100 → 44 (mod 256)
+  cell saturated : u8  = 200   // +| 100 → clamps to 255 and stays
+  // A u32 accumulator with headroom: plain `+` is checked but never overflows.
+  cell safe32    : u32 = 0
+
+  every 100ms {
+    wrapped   = wrapped   +% 100
+    saturated = saturated +| 100
+    safe32    = safe32    +  1000
+  }
+}
+
+sim app_sim for app {
+  run until 450ms
+}

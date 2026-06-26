@@ -89,6 +89,29 @@ output ends with:
 PASS: a wedged reaction starves the watchdog → reset; a healthy one is fed (§5.6).
 ```
 
+## `overflow_trap.sh` — overflow-trap-by-default gate (§4.3 / SIL-004)
+
+`overflow_trap.sh` proves a plain `+` whose result does not fit its target type
+**traps** on metal — the generated helper drives the system to its safe state and
+halts — rather than silently wrapping. This is the silent-wraparound footgun the
+number model (§4.3) exists to kill, now machine-checked on nRF52840.
+
+```sh
+RENODE=/path/to/renode ./harness/overflow_trap.sh
+```
+
+Default program: `examples/overflow_nrf52840.si` (a `u8` accumulator advanced by
+85 every 100ms, plus a `u32` `ticks` counter). The harness builds it twice: the
+trapping original (`acc + 85`) and a wrapping control derived by `sed`
+(`acc +% 85`). The `u8` overflows on the 4th tick: the trap build halts there
+(`ticks` frozen ≈4), the wrapping build runs every tick (`ticks` ≈10 over ~1.05s).
+The gap is the proof the default `+` trapped. `ticks` is read from its `.bss`
+symbol via `arm-none-eabi-nm`. Expected output ends with:
+
+```
+PASS: the default `+` trapped on overflow and halted (safe-state); `+%` wrapped and kept running (§4.3/SIL-004).
+```
+
 ## Notes
 
 - The hermetic codegen tests in `crates/silicac/tests/metal_codegen.rs` run in CI

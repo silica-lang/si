@@ -44,6 +44,9 @@ pub struct CBackend {
     /// timeout (§3.2) inside it routes to the right Layer-2 terminal.  None
     /// outside a reaction body.
     current_disposition: Option<SirDisposition>,
+    /// Distinct width-checked-arithmetic shapes used in the module (§4.3); each
+    /// gets a `static inline` helper emitted once in the preamble.
+    arith_combos: HashSet<(SirArithOp, OverflowMode, u8, bool)>,
 }
 
 impl CBackend {
@@ -63,6 +66,7 @@ impl CBackend {
             frame_vars: HashSet::new(),
             frame_name: None,
             current_disposition: None,
+            arith_combos: HashSet::new(),
         }
     }
 
@@ -99,11 +103,13 @@ impl CBackend {
         }
         self.global_vars = module.vars.iter().map(|v| v.name.clone()).collect();
         self.max_priority = module.reactions.iter().map(|r| r.priority).max().unwrap_or(0);
+        self.arith_combos = collect_arith(module);
         match self.target {
             Target::Host => {
                 self.emit_header(module);
                 self.emit_newline();
                 self.emit_globals(module);
+                self.emit_arith_helpers();
                 self.emit_newline();
                 self.emit_reaction_fns(module);
                 self.emit_newline();
@@ -113,8 +119,8 @@ impl CBackend {
                 self.emit_header_metal(module);
                 self.emit_newline();
                 self.emit_globals(module);
-                self.emit_newline();
                 self.emit_drive_safe(module);
+                self.emit_arith_helpers();
                 self.emit_reaction_fns(module);
                 self.emit_newline();
                 self.emit_metal_startup(module);
@@ -204,6 +210,38 @@ impl CBackend {
             let comment = if var.is_cell { " /* cell */" } else { "" };
             let decl = format!("{} {} {} = {};{}", qualifier, c_ty, var.name, c_init, comment);
             self.line(&decl);
+        }
+        self.emit_newline();
+    }
+
+    /// Emit the `static inline` helpers for every width-checked arithmetic shape
+    /// used in the module (§4.3 / SIL-004).  Trap helpers use the compiler's
+    /// `__builtin_*_overflow` and drive the system to safe-state on overflow;
+    /// wrapping/saturating helpers implement the explicit `%`/`|` operators.
+    fn emit_arith_helpers(&mut self) {
+        if self.arith_combos.is_empty() {
+            return;
+        }
+        let mut combos: Vec<_> = self.arith_combos.iter().copied().collect();
+        combos.sort_by_key(|(op, mode, w, s)| (*w, *s as u8, *op as u8, *mode as u8));
+        self.line("/* §4.3 width-checked integer arithmetic (SIL-004): plain +/-/* trap on */");
+        self.line("/* overflow; `+%`-family wrap, `+|`-family saturate, at the target width. */");
+        if combos.iter().any(|(_, m, _, _)| *m == OverflowMode::Trap) {
+            match self.target {
+                Target::MetalNrf52840 => {
+                    self.line("static void __silica_overflow_trap(void) {");
+                    self.line("    __asm__ volatile(\"cpsid i\" ::: \"memory\"); /* overflow → halt */");
+                    self.line("    __drive_safe();");
+                    self.line("    for (;;) { __asm__ volatile(\"wfi\"); } /* hold in safe state (§4.3) */");
+                    self.line("}");
+                }
+                Target::Host => {
+                    self.line("static void __silica_overflow_trap(void) { __builtin_trap(); }");
+                }
+            }
+        }
+        for (op, mode, w, s) in combos {
+            self.line(&arith_helper_def(op, mode, w, s));
         }
         self.emit_newline();
     }
@@ -551,7 +589,13 @@ impl CBackend {
             .reactions
             .iter()
             .any(|r| matches!(r.disposition, SirDisposition::Safe));
-        if module.safe_seqs.is_empty() && !has_safe_disp {
+        // An overflow trap (§4.3) also drives the safe state, so the function
+        // must exist whenever any arithmetic can trap.
+        let has_arith_trap = self
+            .arith_combos
+            .iter()
+            .any(|(_, m, _, _)| *m == OverflowMode::Trap);
+        if module.safe_seqs.is_empty() && !has_safe_disp && !has_arith_trap {
             return;
         }
         self.line("/* Safe-state drive (§5.6): bounded, non-yielding register writes. */");
@@ -902,6 +946,11 @@ impl CBackend {
                     SirBinOp::Ge => ">=",
                 };
                 format!("({} {} {})", l, op_str, r)
+            }
+            SirExpr::Arith { op, mode, width, signed, lhs, rhs } => {
+                let l = self.emit_expr(lhs);
+                let r = self.emit_expr(rhs);
+                format!("{}({}, {})", arith_helper_name(*op, *mode, *width, *signed), l, r)
             }
         }
     }
@@ -1400,6 +1449,132 @@ fn strip_amp(s: &str) -> &str {
 
 /// Does any statement in `stmts` (recursing into `Critical`/`If` bodies)
 /// satisfy `pred`?
+// ── Width-checked arithmetic helpers (§4.3 / SIL-004) ───────────────────────
+
+/// The C type name for a `(width, signed)` scalar (`uint32_t`, `int8_t`, …).
+fn arith_cint(width: u8, signed: bool) -> String {
+    format!("{}int{}_t", if signed { "" } else { "u" }, width)
+}
+
+/// Stable name for the helper implementing one arithmetic shape.
+fn arith_helper_name(op: SirArithOp, mode: OverflowMode, width: u8, signed: bool) -> String {
+    let o = match op {
+        SirArithOp::Add => "add",
+        SirArithOp::Sub => "sub",
+        SirArithOp::Mul => "mul",
+    };
+    let m = match mode {
+        OverflowMode::Trap => "trap",
+        OverflowMode::Wrap => "wrap",
+        OverflowMode::Saturate => "sat",
+    };
+    format!("__si_{}_{}_{}{}", o, m, if signed { "s" } else { "u" }, width)
+}
+
+/// The full `static inline` definition for one arithmetic helper.
+fn arith_helper_def(op: SirArithOp, mode: OverflowMode, width: u8, signed: bool) -> String {
+    let name = arith_helper_name(op, mode, width, signed);
+    let t = arith_cint(width, signed);
+    let ut = arith_cint(width, false);
+    let (c_op, bop) = match op {
+        SirArithOp::Add => ("+", "add"),
+        SirArithOp::Sub => ("-", "sub"),
+        SirArithOp::Mul => ("*", "mul"),
+    };
+    match mode {
+        // Wrap: compute in the unsigned counterpart (defined two's-complement
+        // wraparound) and reinterpret at the result type.
+        OverflowMode::Wrap => format!(
+            "static inline {t} {name}({t} a, {t} b) {{ return ({t})(({ut})a {c_op} ({ut})b); }}"
+        ),
+        // Trap: the default (SIL-004).  Overflow → safe-state.
+        OverflowMode::Trap => format!(
+            "static inline {t} {name}({t} a, {t} b) {{ {t} __r; \
+             if (__builtin_{bop}_overflow(a, b, &__r)) __silica_overflow_trap(); return __r; }}"
+        ),
+        // Saturate: clamp to the type's min/max in the overflow direction.
+        OverflowMode::Saturate => {
+            let max = if signed {
+                format!("({t})(((({ut})~(({ut})0)) >> 1))")
+            } else {
+                format!("({t})~(({ut})0)")
+            };
+            let min = if signed {
+                format!("({t})(-__max - 1)")
+            } else {
+                format!("({t})0")
+            };
+            // Direction of a saturating overflow.
+            let pos = if !signed {
+                // unsigned: add/mul can only overflow high; sub only underflows.
+                if op == SirArithOp::Sub { "0" } else { "1" }.to_string()
+            } else {
+                match op {
+                    SirArithOp::Add | SirArithOp::Sub => "(a >= 0)".to_string(),
+                    SirArithOp::Mul => "((a < 0) == (b < 0))".to_string(),
+                }
+            };
+            format!(
+                "static inline {t} {name}({t} a, {t} b) {{ {t} __r; \
+                 if (__builtin_{bop}_overflow(a, b, &__r)) {{ {t} __max = {max}; {t} __min = {min}; \
+                 __r = ({pos}) ? __max : __min; }} return __r; }}"
+            )
+        }
+    }
+}
+
+/// Collect every distinct arithmetic shape used in the module so each gets one
+/// emitted helper.
+fn collect_arith(module: &SirModule) -> HashSet<(SirArithOp, OverflowMode, u8, bool)> {
+    let mut set = HashSet::new();
+    for r in &module.reactions {
+        collect_arith_stmts(&r.body, &mut set);
+    }
+    for v in &module.vars {
+        collect_arith_expr(&v.init, &mut set);
+    }
+    for s in &module.safe_seqs {
+        collect_arith_stmts(&s.body, &mut set);
+    }
+    set
+}
+
+fn collect_arith_stmts(stmts: &[SirStmt], set: &mut HashSet<(SirArithOp, OverflowMode, u8, bool)>) {
+    for s in stmts {
+        match s {
+            SirStmt::Assign { value, .. } => collect_arith_expr(value, set),
+            SirStmt::If { cond, then } => {
+                collect_arith_expr(cond, set);
+                collect_arith_stmts(then, set);
+            }
+            SirStmt::Exit(e) => collect_arith_expr(e, set),
+            SirStmt::Critical { body, .. } => collect_arith_stmts(body, set),
+            SirStmt::Poll { cond, .. } => collect_arith_expr(cond, set),
+            SirStmt::DeviceOp { args, .. } | SirStmt::BusXfer { args, .. } => {
+                args.iter().for_each(|a| collect_arith_expr(a, set));
+            }
+            SirStmt::Intrinsic(SirIntrinsic::HostIoPrint(e)) => collect_arith_expr(e, set),
+            SirStmt::Intrinsic(_) => {}
+        }
+    }
+}
+
+fn collect_arith_expr(expr: &SirExpr, set: &mut HashSet<(SirArithOp, OverflowMode, u8, bool)>) {
+    match expr {
+        SirExpr::Not(i) => collect_arith_expr(i, set),
+        SirExpr::BinOp(_, l, r) => {
+            collect_arith_expr(l, set);
+            collect_arith_expr(r, set);
+        }
+        SirExpr::Arith { op, mode, width, signed, lhs, rhs } => {
+            set.insert((*op, *mode, *width, *signed));
+            collect_arith_expr(lhs, set);
+            collect_arith_expr(rhs, set);
+        }
+        _ => {}
+    }
+}
+
 fn any_stmt(stmts: &[SirStmt], pred: &dyn Fn(&SirStmt) -> bool) -> bool {
     stmts.iter().any(|s| {
         pred(s)
