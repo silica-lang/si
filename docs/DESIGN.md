@@ -440,6 +440,15 @@ applied but the result is nonsense" failure mode that text-based Devicetree over
 Because edits address **named paths** and never textual positions, an agent can emit them
 deterministically, and they are the natural unit for a future content-addressed store (§9.5).
 
+> **Status (implemented — compile-time `set`/`remove`).** `overlay <name> for board.<b> { … }` is
+> parsed (`Item::Overlay`) and applied to the target board *before* it is built, so the existing §4.1
+> config `where`-check validates the patched value. `set <inst>.config.<field> = <value>` checks the
+> instance and config field exist and overrides the value (an out-of-range value fails its `where`
+> constraint); `remove <name>` deletes an instance/pin binding and errors if it doesn't exist; an
+> overlay targeting an unknown board is rejected. **Remaining:** `extend <inst>.needs { … }` is
+> parsed-rejected (a noted follow-up), the `remove` dangling-reference check (nothing still uses it)
+> is not yet enforced, and the agent overlay-edit *API* stays out of scope (Phase 2).
+
 ---
 
 ## 4. Type system

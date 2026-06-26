@@ -99,7 +99,13 @@ pick the spec-consistent default and note it in the PR.
       auto-critical (ring ops are cell touches). examples/ring.si + tests/ring.rs (4). Sim gate +
       metal compiles. NOTE: pool/arena/buffer/bytes deferred (ring proves the pattern); T is an
       integer scalar; fault-on-full/empty variant is a follow-up.
-- [ ] C3 Typed overlays — language construct only (§3.6)
+- [x] C3 Typed overlays — compile-time `set`/`remove` (§3.6) — PR #27. `overlay <name> for
+      board.<b> { set <inst>.config.<field> = <v>; remove <name> }` (Item::Overlay). Applied to the
+      target board before build_board, so the §4.1 config `where`-check validates the patched value.
+      `set` checks instance+field exist & overrides (out-of-range → where violation); `remove` deletes
+      an instance/pin-binding (errors if absent); unknown-board target rejected. examples/overlay.si +
+      tests/overlay.rs (6). Sim/resolve gate. NOTE: `extend …needs` parse-rejected (follow-up); remove
+      dangling-ref check not yet enforced; agent overlay-edit API out of scope (Phase 2).
 
 ### Cluster D — Phase-1 yields keystone
 - [x] D1 spi controller leaf + composed example (§3.5) `[metal]` — PR #13. std/spi.si +

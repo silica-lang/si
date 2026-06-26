@@ -113,12 +113,13 @@ impl Parser {
             Some(Token::KwDevice) => Ok(Item::Device(self.parse_device()?)),
             Some(Token::KwBoard) => Ok(Item::Board(self.parse_board()?)),
             Some(Token::KwInterface) => Ok(Item::Interface(self.parse_interface()?)),
+            Some(Token::KwOverlay) => Ok(Item::Overlay(self.parse_overlay()?)),
             // `sim` is a contextual keyword (like `safe_state`) so it stays a
             // plain identifier elsewhere.
             Some(Token::Ident(s)) if s == "sim" => Ok(Item::Sim(self.parse_sim()?)),
             other => Err(ParseError {
                 span: self.current_span(),
-                msg: format!("expected top-level item (program/device/board/interface/sim), got {:?}", other),
+                msg: format!("expected top-level item (program/device/board/interface/sim/overlay), got {:?}", other),
             }),
         }
     }
@@ -1221,6 +1222,84 @@ impl Parser {
     }
 
     // ── Sim script ────────────────────────────────────────────────────────────
+
+    /// `overlay <name> for [board.]<target> { set …; remove …; }` (§3.6).
+    fn parse_overlay(&mut self) -> Result<OverlayDef, ParseError> {
+        let start = self.current_span().start;
+        self.eat(&Token::KwOverlay)?;
+        let name = self.eat_ident()?;
+        self.eat(&Token::KwFor)?;
+        // Target: `board.<name>` or a bare `<name>`.
+        if self.peek() == Some(&Token::KwBoard) {
+            self.advance();
+            self.eat(&Token::Dot)?;
+        }
+        let target = self.eat_ident()?;
+        self.eat(&Token::LBrace)?;
+        let mut edits = Vec::new();
+        while self.peek() != Some(&Token::RBrace) {
+            if self.at_end() {
+                return Err(self.error("unexpected EOF in overlay body"));
+            }
+            let estart = self.current_span().start;
+            match self.peek() {
+                Some(Token::Ident(s)) if s == "set" => {
+                    self.advance();
+                    let path = self.parse_overlay_path()?;
+                    self.eat(&Token::Eq)?;
+                    let value = self.parse_or()?;
+                    self.eat_optional_semi();
+                    edits.push(OverlayEdit::Set { path, value, span: Span::new(estart, self.prev_span().end) });
+                }
+                Some(Token::Ident(s)) if s == "remove" => {
+                    self.advance();
+                    let path = self.parse_overlay_path()?;
+                    self.eat_optional_semi();
+                    edits.push(OverlayEdit::Remove { path, span: Span::new(estart, self.prev_span().end) });
+                }
+                Some(Token::Ident(s)) if s == "extend" => {
+                    return Err(self.error("overlay `extend` is not yet supported (use `set`/`remove`)"));
+                }
+                other => {
+                    return Err(ParseError {
+                        span: self.current_span(),
+                        msg: format!("expected `set`/`remove` in overlay body, got {:?}", other),
+                    })
+                }
+            }
+        }
+        let end = self.current_span().end;
+        self.eat(&Token::RBrace)?;
+        Ok(OverlayDef { name, target, edits, span: Span::new(start, end) })
+    }
+
+    /// A dotted overlay path whose segments may be section keywords
+    /// (`config`/`needs`) as well as plain identifiers.
+    fn parse_overlay_path(&mut self) -> Result<Vec<Ident>, ParseError> {
+        let mut path = vec![self.eat_path_segment()?];
+        while self.peek() == Some(&Token::Dot) {
+            self.advance();
+            path.push(self.eat_path_segment()?);
+        }
+        Ok(path)
+    }
+
+    fn eat_path_segment(&mut self) -> Result<Ident, ParseError> {
+        let span = self.current_span();
+        let name = match self.peek() {
+            Some(Token::Ident(s)) => s.clone(),
+            Some(Token::KwConfig) => "config".to_string(),
+            Some(Token::KwNeeds) => "needs".to_string(),
+            other => {
+                return Err(ParseError {
+                    span,
+                    msg: format!("expected an overlay path segment, got {:?}", other),
+                })
+            }
+        };
+        self.advance();
+        Ok(Ident::new(name, span))
+    }
 
     fn parse_sim(&mut self) -> Result<SimDef, ParseError> {
         let start = self.current_span().start;
