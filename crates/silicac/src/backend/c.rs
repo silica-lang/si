@@ -2170,6 +2170,44 @@ pub fn ram_budget(module: &SirModule) -> Result<RamBudget, String> {
     Ok(budget)
 }
 
+/// The flash/code region size from `board.soc.memory` — the ceiling for the
+/// flash budget gate (audit #35 P1-3).  `None` if no flash region is declared.
+pub fn flash_region_size(module: &SirModule) -> Option<u64> {
+    module.memory.iter().find(|r| !r.is_ram()).map(|r| r.size)
+}
+
+/// Parse Berkeley-format `arm-none-eabi-size <elf>` output into `(text, data,
+/// bss)` bytes (audit #35 P1-3).  Looks for the numeric data row under the
+/// `text data bss …` header.
+pub fn parse_size(output: &str) -> Option<(u64, u64, u64)> {
+    for line in output.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() >= 3 {
+            if let (Ok(t), Ok(d), Ok(b)) =
+                (cols[0].parse::<u64>(), cols[1].parse::<u64>(), cols[2].parse::<u64>())
+            {
+                return Some((t, d, b));
+            }
+        }
+    }
+    None
+}
+
+/// Enforce the flash/code-size budget (audit #35 P1-3), symmetric to the RAM
+/// gate.  Flash footprint = `.text+.rodata` (`text`) + the `.data` LMA (`data`,
+/// copied to RAM at startup); `.bss` is RAM-only.  Returns the bytes used or an
+/// error when the firmware does not fit the flash region.
+pub fn enforce_flash(text: u64, data: u64, flash_size: u64) -> Result<u64, String> {
+    let used = text.saturating_add(data);
+    if used > flash_size {
+        return Err(format!(
+            "flash budget exceeded: {} B (.text+.rodata {} + .data {}) > {} B flash region",
+            used, text, data, flash_size
+        ));
+    }
+    Ok(used)
+}
+
 /// The worst-case stack high-water mark (§5.3/SIL-005), in bytes.  A sound
 /// over-approximation from the SIR: the sum, over distinct static priority
 /// levels, of the largest reaction frame at that level (+ an exception frame),

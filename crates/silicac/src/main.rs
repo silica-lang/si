@@ -261,10 +261,51 @@ fn run(cfg: &Config) -> Result<(), String> {
                     );
                 }
             }
+
+            // Flash / code-size budget gate (§5.3, audit #35, P1-3): size the
+            // linked ELF and hard-error if .text+.rodata+.data exceeds the flash
+            // region — symmetric to the RAM gate, same delete-the-ELF contract.
+            if let Some(flash_size) = backend::c::flash_region_size(&sir) {
+                let size_tool = size_tool_for(&cc);
+                match process::Command::new(&size_tool).arg(&cfg.output).output() {
+                    Ok(out) if out.status.success() => {
+                        let text = String::from_utf8_lossy(&out.stdout);
+                        match backend::c::parse_size(&text) {
+                            Some((t, d, _bss)) => match backend::c::enforce_flash(t, d, flash_size) {
+                                Ok(used) => eprintln!(
+                                    "silicac: flash budget {} B used (.text+.rodata {} + .data {}) of {} B",
+                                    used, t, d, flash_size
+                                ),
+                                Err(e) => {
+                                    let _ = std::fs::remove_file(&cfg.output);
+                                    return Err(e);
+                                }
+                            },
+                            None => eprintln!(
+                                "silicac: note: could not parse '{}' output; flash budget not enforced",
+                                size_tool
+                            ),
+                        }
+                    }
+                    _ => eprintln!(
+                        "silicac: note: '{}' unavailable; flash budget not enforced",
+                        size_tool
+                    ),
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+/// Derive the `size` tool path from the C compiler (`arm-none-eabi-gcc` →
+/// `arm-none-eabi-size`); fall back to the ARM `size` (audit #35 P1-3).
+fn size_tool_for(cc: &str) -> String {
+    match cc.strip_suffix("gcc") {
+        Some(prefix) => format!("{prefix}size"),
+        None => "arm-none-eabi-size".to_string(),
+    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

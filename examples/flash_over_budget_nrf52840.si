@@ -1,0 +1,35 @@
+// P1-3 (audit #35, §5.3): a program whose code does not fit a deliberately tiny
+// flash region — the build must be REJECTED rather than producing firmware that
+// would not fit the part.  Used by harness/flash_budget.sh.
+//
+//   silicac --target metal-nrf52840 examples/flash_over_budget_nrf52840.si -o /dev/null
+//   # → build fails (flash region overflowed)
+//
+// The only change from the canonical blink is `flash ... size 256` (256 bytes),
+// which the vector table + .text cannot fit.
+
+board tiny_flash {
+  soc nrf52840 {
+    memory {
+      flash : region at 0x0 size 256
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks {
+      sysclk : clock_source = 64MHz
+    }
+  }
+
+  gpio0 : nrf_gpio at 0x5000_0000
+  led_user : nrf_gpio.pin = gpio0.pin(13) as output
+}
+
+program over_flash {
+  use board tiny_flash as dev
+  let led = dev.led_user
+  cell lit : bool = false
+
+  every 500ms {
+    lit = not lit
+    led.set(lit)
+  }
+}

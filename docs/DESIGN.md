@@ -982,6 +982,15 @@ on parts that have one — not a runtime mystery.
 > with no firmware emitted). **Remaining:** the **frame-union** optimisation (overlapping
 > disjoint-lifetime frames) is not yet applied — it can only make the budget smaller.
 
+> **Status (implemented — flash / code-size budget, audit #35 P1-3).** Symmetric to RAM, metal builds
+> now report **flash** usage for cost visibility: after link, `arm-none-eabi-size` (derived from the
+> `cc` prefix) sizes the ELF and `silicac` prints `flash budget <.text+.rodata + .data> of <flash
+> region> B` (e.g. blink 520 B of 1 MiB). `backend::c::{flash_region_size, parse_size, enforce_flash}`
+> compute it; the linker's region check is the first-line enforcer of the hard limit (a too-small
+> flash fails the link), with `enforce_flash` as the clean-message backstop (delete-the-ELF contract).
+> Covered by `tests/flash_budget.rs` + `harness/flash_budget.sh` (healthy reports a budget; an
+> oversized program is rejected with no firmware emitted).
+
 **Frame *union* keeps the static cost affordable (Gemini SIL-005).** Allocating a separate frame for
 every async handler would exhaust RAM on an 8–32 KB part, so the compiler does the opposite of
 wasteful: from the static call-graph and priority map it computes which handler frames have
