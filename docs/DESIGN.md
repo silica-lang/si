@@ -927,11 +927,15 @@ on parts that have one — not a runtime mystery.
 > frame at each level (+ a Cortex-M exception frame per level) plus a base context — the worst-case
 > ISR nest, since a reaction cannot preempt one at its own level (non-reentrant, run-to-completion).
 > **Recursion is banned**: the resolver rejects an op that re-enters itself on the active inline path
-> (`§5.3/SIL-005`), which also keeps the inliner — and the bound — finite. **Remaining:** the estimate
-> is a sound *over-approximation* (it uses conservative fixed frame overheads and counts a yielding
-> reaction's static `__rf` temps as if on-stack) rather than the toolchain's exact `-fstack-usage`
-> numbers; and the **frame-union** optimisation (overlapping disjoint-lifetime frames) is not yet
-> applied — both can only make the summed budget *smaller*, never unknowable.
+> (`§5.3/SIL-005`), which also keeps the inliner — and the bound — finite. **Measured bound (audit
+> #35, P0-1a).** Metal builds now also compile with `-fcallgraph-info=su,da` (`.ci`) / `-fstack-usage`
+> (`.su`) and `backend::stackinfo` folds the toolchain's *own* per-function frames over the
+> recursion-banned (acyclic) call graph — `silicac` prints this `measured worst-case stack … B`
+> beside the SIR estimate (e.g. blink: estimate 992 B vs measured 704 B). The `.ci` walk is the
+> sound source; `.su` is a conservative fallback. **Remaining:** P0-1b folds the measured number into
+> the `ram_budget()` gate as the enforced bound (hard-erroring on over-RAM or any non-static frame),
+> with the SIR estimate kept as the host/unit-test fallback; the **frame-union** optimisation
+> (overlapping disjoint-lifetime frames) is not yet applied.
 
 **Frame *union* keeps the static cost affordable (Gemini SIL-005).** Allocating a separate frame for
 every async handler would exhaust RAM on an 8–32 KB part, so the compiler does the opposite of

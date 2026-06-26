@@ -15,6 +15,9 @@ use std::process;
 const USAGE: &str =
     "usage: silicac <input.si> [-o <output>] [--emit-c] [--sim] [--target host|metal-nrf52840] [--cc <compiler>] [--std <dir>]";
 
+/// `-dumpbase` for the metal stack-accounting dumps (`silica_stack.{su,ci}`).
+const STACK_DUMP_BASE: &str = "silica_stack";
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cfg = match Config::parse(&args[1..]) {
@@ -180,11 +183,18 @@ fn run(cfg: &Config) -> Result<(), String> {
         // Metal needs the generated linker script (§6.4); it must persist for
         // the link, so write it next to the output.
         let ld_path = cfg.output.with_extension("ld");
+        let dump_dir = std::env::temp_dir();
         if cfg.target == Target::MetalNrf52840 {
             let ld = backend::c::emit_linker_script(&sir)?;
             std::fs::write(&ld_path, ld)
                 .map_err(|e| format!("cannot write '{}': {}", ld_path.display(), e))?;
             cmd.arg("-T").arg(&ld_path);
+            // Pin where GCC writes the `-fstack-usage`/`-fcallgraph-info` dumps
+            // (audit #35, §5.3) so we can read them deterministically below.
+            cmd.arg("-dumpdir")
+                .arg(format!("{}{}", dump_dir.display(), std::path::MAIN_SEPARATOR))
+                .arg("-dumpbase")
+                .arg(STACK_DUMP_BASE);
         }
         let status = cmd
             .arg("-o")
@@ -199,6 +209,24 @@ fn run(cfg: &Config) -> Result<(), String> {
             return Err(format!("C compiler '{}' exited with status {}", cc, status.code().unwrap_or(-1)));
         }
         eprintln!("silicac: compiled '{}' → '{}'", cfg.input.display(), cfg.output.display());
+
+        // Measured worst-case stack (§5.3, audit #35): fold the toolchain's own
+        // frame accounting over the (recursion-banned, acyclic) call graph and
+        // report it beside the SIR estimate printed in the budget gate above.
+        if cfg.target == Target::MetalNrf52840 {
+            if let Some(m) = backend::stackinfo::from_dump_dir(&dump_dir, STACK_DUMP_BASE) {
+                let warn = if m.any_dynamic {
+                    "  [!] non-static (alloca/VLA) frame present — bound is not sound"
+                } else {
+                    ""
+                };
+                eprintln!(
+                    "silicac: measured worst-case stack {} B ({} source){}",
+                    m.bytes, m.source, warn
+                );
+            }
+            backend::stackinfo::cleanup_dump_dir(&dump_dir, STACK_DUMP_BASE);
+        }
     }
 
     Ok(())
