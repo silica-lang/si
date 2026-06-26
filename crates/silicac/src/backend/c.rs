@@ -1191,6 +1191,19 @@ impl CBackend {
                 let cty = format!("{}int{}_t", if *signed { "" } else { "u" }, to_width);
                 format!("(({}){})", cty, self.emit_expr(inner))
             }
+            // Fixed-point rescale (§4.3, P0-3a): shift the binary point in a
+            // 64-bit (sign-aware) intermediate, then narrow to the target type.
+            SirExpr::FixedCast { inner, shift, to_width, signed } => {
+                let cty = format!("{}int{}_t", if *signed { "" } else { "u" }, to_width);
+                let wide = if *signed { "int64_t" } else { "uint64_t" };
+                let v = self.emit_expr(inner);
+                let scaled = if *shift >= 0 {
+                    format!("(({}){} << {})", wide, v, shift)
+                } else {
+                    format!("(({}){} >> {})", wide, v, -(*shift as i32))
+                };
+                format!("(({}){})", cty, scaled)
+            }
             // Bounded-ring reads (§5.3).
             SirExpr::RingLen(r) => format!("__ring_{}_count", r),
             SirExpr::RingEmpty(r) => format!("(__ring_{}_count == 0U)", r),
@@ -1843,6 +1856,7 @@ fn collect_arith_expr(expr: &SirExpr, set: &mut HashSet<(SirArithOp, OverflowMod
             collect_arith_expr(lhs, set);
             collect_arith_expr(rhs, set);
         }
+        SirExpr::Cast { inner, .. } | SirExpr::FixedCast { inner, .. } => collect_arith_expr(inner, set),
         _ => {}
     }
 }

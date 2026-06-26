@@ -690,6 +690,17 @@ silent soft-float fallback. In the toy we *refuse* rather than emit slow soft-fl
 > *arithmetic* at runtime (sim ops, float literals) is a follow-up, so today a `float` value is
 > carried/stored but not computed on.
 
+> **Status (implemented — `fixed<I,F>` type + casts + add/sub, audit #35 P0-3a).** `fixed<I,F>` is a
+> first-class `SirType::Fixed { int_bits, frac_bits, signed }` stored in a 2's-complement integer of
+> the smallest of 8/16/32/64 bits that holds `I+F` (e.g. Q16.16 → `int32_t`). It is a **distinct**
+> `ValType` from integers: mixing fixed with an integer, or two different `fixed<I,F>` scales, is a
+> compile error (cast explicitly). A cast touching fixed-point rescales by shifting the binary point
+> (`SirExpr::FixedCast`): int→fixed `<< F`, fixed→int `>> F`, fixed→fixed by the frac-bit difference.
+> Same-scale **add/sub** are raw integer ops at the storage width (so they are overflow-checked exactly
+> like the backing integer). `examples/fixed.si`, `tests/fixed.rs`. **Remaining:** fixed **multiply/
+> divide** with rescale (P0-3c), decimal/voltage **literals** like `0.5`/`3v3` (P0-3b), and the BME280
+> compensation that uses them (P0-3d).
+
 ### 4.4 Fallibility and faults
 
 Three distinct layers, kept distinct.
