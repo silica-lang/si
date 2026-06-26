@@ -581,7 +581,7 @@ impl Resolver {
             // Instance config `timeout` overrides the device default; if present
             // it must be a constant (don't silently fall back to the default).
             let from_inst = inst.config.iter().find(|(k, _)| k.name == "timeout").map(|(_, e)| {
-                if let ExprKind::IntLit(n) = e.kind { Some(n) } else {
+                if let Some(n) = lit_int(&e.kind) { Some(n) } else {
                     self.err(e.span, "watchdog `timeout` must be a constant duration");
                     None
                 }
@@ -594,7 +594,7 @@ impl Resolver {
                     .and_then(|d| d.sections.config.as_ref())
                     .and_then(|c| c.fields.iter().find(|f| f.name.name == "timeout"))
                     .and_then(|f| f.default.as_ref())
-                    .and_then(|e| if let ExprKind::IntLit(n) = e.kind { Some(n) } else { None }),
+                    .and_then(|e| lit_int(&e.kind)),
             };
             self.watchdog_timeout_ns = timeout;
             self.watchdog_device = instance_ids.get(&inst.name.name).copied();
@@ -935,7 +935,18 @@ impl Resolver {
         match stmt {
             Stmt::Expr(expr) => self.lower_expr_stmt(expr, scope, vars, out),
             Stmt::Let(l) => {
-                let ty = infer_type_from_expr(&l.init);
+                // §4.5: infer the binding's time-kind so `let t = now()` is an
+                // `instant` and `let dt = now() - t0` is a `duration`.  An explicit
+                // annotation wins but is checked against the initialiser's kind.
+                let tk = self.time_kind(&l.init, scope);
+                let ty = match &l.ty {
+                    Some(t) => {
+                        let ann = resolve_type_expr(t);
+                        self.check_assign_time(sirtype_time_kind(&ann), tk, l.init.span);
+                        ann
+                    }
+                    None => time_kind_sirtype(tk).unwrap_or_else(|| infer_type_from_expr(&l.init)),
+                };
                 let value = self.lower_expr_emit(&l.init, scope, vars, out);
                 scope.insert(&l.name.name, Binding::Local(l.name.name.clone(), ty));
                 out.push(SirStmt::Assign { target: SirPlace::Var(l.name.name.clone()), value });
@@ -960,6 +971,7 @@ impl Resolver {
                 // Bounded busy-wait, no suspension.  Lower the condition; the
                 // metal backend turns `within` into a spin bound, the sim checks
                 // it deterministically.
+                let _ = self.time_kind(cond, scope); // §4.5 time-type the condition
                 let cond = self.lower_expr_emit(cond, scope, vars, out);
                 out.push(SirStmt::Poll {
                     cond,
@@ -986,7 +998,134 @@ impl Resolver {
         }
     }
 
+    /// Recursively compute an expression's time-logical kind (§4.5), emitting an
+    /// error on an illegal `instant`/`duration` combination.  Called once per
+    /// statement-root expression, so each node is visited exactly once.
+    fn time_kind(&mut self, expr: &Expr, scope: &Scope) -> TimeKind {
+        match &expr.kind {
+            ExprKind::Call { callee, args, .. } if is_now_call(callee) => {
+                if !args.is_empty() {
+                    self.err(expr.span, "now() takes no arguments");
+                }
+                TimeKind::Instant
+            }
+            ExprKind::Ident(id) => match scope.lookup(&id.name) {
+                Some(Binding::Local(_, t)) | Some(Binding::Cell(_, t)) => sirtype_time_kind(t),
+                _ => TimeKind::Scalar,
+            },
+            ExprKind::DurationLit(_) => TimeKind::Duration,
+            ExprKind::BinOp { op, lhs, rhs } => {
+                let l = self.time_kind(lhs, scope);
+                let r = self.time_kind(rhs, scope);
+                self.combine_time(*op, l, r, expr.span)
+            }
+            ExprKind::Not(inner) => {
+                let _ = self.time_kind(inner, scope);
+                TimeKind::Scalar
+            }
+            ExprKind::Assign(lhs, rhs) => {
+                let target = self.place_time_kind(lhs, scope);
+                let val = self.time_kind(rhs, scope);
+                self.check_assign_time(target, val, expr.span);
+                val
+            }
+            ExprKind::CompoundAssign(op, lhs, rhs) => {
+                let target = self.place_time_kind(lhs, scope);
+                let r = self.time_kind(rhs, scope);
+                let combined = self.combine_time(*op, target, r, expr.span);
+                self.check_assign_time(target, combined, expr.span);
+                combined
+            }
+            ExprKind::Try(inner) => self.time_kind(inner, scope),
+            _ => TimeKind::Scalar,
+        }
+    }
+
+    /// The time-kind of an assignment target (a cell/local's declared type).
+    fn place_time_kind(&self, lhs: &Expr, scope: &Scope) -> TimeKind {
+        match &lhs.kind {
+            ExprKind::Ident(id) => match scope.lookup(&id.name) {
+                Some(Binding::Local(_, t)) | Some(Binding::Cell(_, t)) => sirtype_time_kind(t),
+                _ => TimeKind::Scalar,
+            },
+            _ => TimeKind::Scalar,
+        }
+    }
+
+    /// The result kind of `l <op> r`, enforcing the §4.5 arithmetic rules.
+    fn combine_time(&mut self, op: BinOp, l: TimeKind, r: TimeKind, span: Span) -> TimeKind {
+        use TimeKind::{Duration, Instant, Scalar};
+        if l == Scalar && r == Scalar {
+            return Scalar; // ordinary integer arithmetic — no time rules apply
+        }
+        match op {
+            BinOp::Add => match (l, r) {
+                (Instant, Instant) => {
+                    self.err(span, "cannot add two instants (§4.5) — add a duration to an instant");
+                    Instant
+                }
+                (Instant, Duration) | (Duration, Instant) => Instant,
+                (Instant, Scalar) | (Scalar, Instant) => {
+                    self.err(span, "can only add a duration to an instant, not a bare integer (§4.5)");
+                    Instant
+                }
+                _ => Duration, // duration + duration / scalar
+            },
+            BinOp::Sub => match (l, r) {
+                (Instant, Instant) => Duration, // elapsed time between two instants
+                (Instant, Duration) => Instant, // instant minus a span
+                (Instant, Scalar) => {
+                    self.err(span, "can only subtract a duration from an instant, not a bare integer (§4.5)");
+                    Instant
+                }
+                (_, Instant) => {
+                    self.err(span, "cannot subtract an instant from a non-instant (§4.5)");
+                    Instant
+                }
+                _ => Duration,
+            },
+            BinOp::Mul | BinOp::Div | BinOp::Rem => {
+                if l == Instant || r == Instant {
+                    self.err(span, "cannot scale an instant (§4.5) — only duration arithmetic is defined");
+                    Instant
+                } else {
+                    Duration
+                }
+            }
+            BinOp::EqEq | BinOp::NotEq | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                if matches!((l, r), (Instant, Instant)) {
+                    Scalar // comparing two instants is fine → bool
+                } else if l == Instant || r == Instant {
+                    self.err(span, "cannot compare an instant with a non-instant (§4.5)");
+                    Scalar
+                } else {
+                    Scalar
+                }
+            }
+            BinOp::And | BinOp::Or => Scalar,
+        }
+    }
+
+    /// Reject assigning an `instant` to a non-instant target (or vice versa).
+    fn check_assign_time(&mut self, target: TimeKind, val: TimeKind, span: Span) {
+        let bad = matches!(
+            (target, val),
+            (TimeKind::Instant, TimeKind::Duration)
+                | (TimeKind::Instant, TimeKind::Scalar)
+                | (TimeKind::Duration, TimeKind::Instant)
+                | (TimeKind::Scalar, TimeKind::Instant)
+        );
+        if bad {
+            self.err(
+                span,
+                "instant and non-instant values don't mix in an assignment (§4.5)",
+            );
+        }
+    }
+
     fn lower_expr_stmt(&mut self, expr: &Expr, scope: &mut Scope, vars: &[SirVar], out: &mut Vec<SirStmt>) {
+        // §4.5 time-type check over the whole statement expression (single pass).
+        let _ = self.time_kind(expr, scope);
         match &expr.kind {
             ExprKind::Assign(lhs, rhs) => {
                 if let Some(place) = self.expr_to_place(lhs, scope) {
@@ -1314,7 +1453,7 @@ impl Resolver {
     fn lower_expr(&mut self, expr: &Expr, scope: &Scope) -> SirExpr {
         match &expr.kind {
             ExprKind::BoolLit(b) => SirExpr::Bool(*b),
-            ExprKind::IntLit(n) => SirExpr::U64(*n),
+            ExprKind::IntLit(n) | ExprKind::DurationLit(n) => SirExpr::U64(*n),
             ExprKind::StringLit(s) => SirExpr::Bytes(s.as_bytes().to_vec()),
             ExprKind::Ident(ident) => match scope.lookup(&ident.name) {
                 Some(Binding::Local(name, _)) | Some(Binding::Cell(name, _)) => SirExpr::Load(name.clone()),
@@ -1349,6 +1488,13 @@ impl Resolver {
             ExprKind::CompoundAssign(_, _, rhs) => self.lower_expr(rhs, scope),
             ExprKind::Try(inner) => self.lower_expr(inner, scope), // fault `?` — Phase 1
             ExprKind::Call { callee, args, named: _ } => {
+                // `now()` — the current time as an `instant` (§4.5).
+                if is_now_call(callee) {
+                    if !args.is_empty() {
+                        self.err(expr.span, "now() takes no arguments");
+                    }
+                    return SirExpr::Now;
+                }
                 // A pin *read* op used as a value (`pin.get()`).  Only a
                 // read-shaped op (declared, parameterless) lowers to a register
                 // read — using the op name and arity, so `led.set(true)` in
@@ -1771,8 +1917,48 @@ fn infer_type_from_expr(expr: &Expr) -> SirType {
     match &expr.kind {
         ExprKind::BoolLit(_) => SirType::Bool,
         ExprKind::IntLit(_) => SirType::U32,
+        ExprKind::DurationLit(_) => SirType::Duration,
         ExprKind::StringLit(_) => SirType::Bytes,
         _ => SirType::U32,
+    }
+}
+
+/// The constant integer value of an integer or duration literal (ns), if either.
+fn lit_int(kind: &ExprKind) -> Option<u64> {
+    match kind {
+        ExprKind::IntLit(n) | ExprKind::DurationLit(n) => Some(*n),
+        _ => None,
+    }
+}
+
+/// `true` if `callee` is the bare `now` identifier — `now()` reads the clock.
+fn is_now_call(callee: &Expr) -> bool {
+    matches!(&callee.kind, ExprKind::Ident(id) if id.name == "now")
+}
+
+/// The time-logical category of a value (§4.5).  `Instant` and `Duration` are
+/// both `u64` ns at runtime but obey distinct arithmetic rules; everything else
+/// is `Scalar` (a plain integer / bool).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TimeKind {
+    Instant,
+    Duration,
+    Scalar,
+}
+
+fn sirtype_time_kind(t: &SirType) -> TimeKind {
+    match t {
+        SirType::Instant => TimeKind::Instant,
+        SirType::Duration => TimeKind::Duration,
+        _ => TimeKind::Scalar,
+    }
+}
+
+fn time_kind_sirtype(k: TimeKind) -> Option<SirType> {
+    match k {
+        TimeKind::Instant => Some(SirType::Instant),
+        TimeKind::Duration => Some(SirType::Duration),
+        TimeKind::Scalar => None,
     }
 }
 
@@ -1790,6 +1976,8 @@ fn resolve_type_expr(ty: &TypeExpr) -> SirType {
             "s64" | "i64" => SirType::S64,
             "bool" => SirType::Bool,
             "bytes" => SirType::Bytes,
+            "instant" => SirType::Instant,
+            "duration" => SirType::Duration,
             _ => SirType::U32,
         },
         TypeKind::Unit => SirType::U8,
@@ -1831,7 +2019,7 @@ enum ConstVal {
 /// whether that is an error in context); never panics on bad operands.
 fn const_eval(e: &Expr, env: &HashMap<String, ConstVal>) -> Option<ConstVal> {
     match &e.kind {
-        ExprKind::IntLit(n) => Some(ConstVal::Int(*n)),
+        ExprKind::IntLit(n) | ExprKind::DurationLit(n) => Some(ConstVal::Int(*n)),
         ExprKind::BoolLit(b) => Some(ConstVal::Bool(*b)),
         ExprKind::Ident(id) => env.get(&id.name).copied(),
         ExprKind::Not(inner) => match const_eval(inner, env)? {

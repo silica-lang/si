@@ -1,0 +1,43 @@
+// The instant / duration time model (§4.5).
+//
+// `now()` returns the current time as an `instant` (a point in time, ns since
+// boot) — a type distinct from a plain integer.  The compiler enforces the
+// arithmetic that makes physical sense:
+//   instant - instant  → duration   (elapsed time)
+//   instant ± duration  → instant    (shift a point in time)
+//   instant + instant                ← rejected (adding two absolute times)
+//   instant vs scalar (compare)      ← rejected (mismatched kinds)
+// instant and duration are both u64 ns at runtime; the rules are compile-time.
+//
+// Here each tick records the moment it ran and reports the period since the
+// previous tick — `now() - last`, an `instant - instant` that yields a
+// `duration`.  After the first tick `period` settles at the 100ms cadence.
+//
+//   silicac --sim examples/instant.si
+
+board demo {
+  soc s {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+}
+
+program app {
+  use board demo as b
+  cell last   : instant  = 0   // when the previous tick ran
+  cell period : duration = 0   // measured gap between ticks
+  cell ticks  : u32      = 0
+
+  every 100ms {
+    ticks  = ticks + 1
+    period = now() - last   // instant - instant → duration
+    last   = now()          // instant ← instant
+  }
+}
+
+sim app_sim for app {
+  run until 350ms
+}

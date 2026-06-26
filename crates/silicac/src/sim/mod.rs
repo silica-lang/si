@@ -785,6 +785,8 @@ impl<'m> Sim<'m> {
                     SirBinOp::Ge => (a >= b) as u64,
                 }
             }
+            // `now()` — current virtual time in ns since boot (§4.5).
+            SirExpr::Now => self.now,
         }
     }
 }

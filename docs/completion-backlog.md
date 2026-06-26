@@ -41,7 +41,15 @@ pick the spec-consistent default and note it in the PR.
 - [x] A1 `where`-constraint enforcement (§3.2/§4.1) — PR #12. Also fixed a parser
       greediness bug where `where <expr> = <default>` swallowed the default.
 - [ ] A2 Number model: casts / mixed-sign / odd-width / endianness (§4.3)
-- [ ] A3 instant/duration type rules + `now()` (§4.5)
+- [x] A3 instant/duration type rules + `now()` (§4.5) — PR #22. `instant`/`duration` are distinct
+      `SirType`s (both u64 ns); `now()` is a bare-ident call lowered to `SirExpr::Now` (sim → virtual
+      time, host → `clock_gettime`, metal → SysTick uptime counter). A resolver `time_kind` pass
+      enforces §4.5: `instant - instant → duration`, `instant ± duration → instant`, and rejects
+      `instant + instant`, `now() + <bare int>`, scaling/comparing/assigning instants across kinds.
+      A new `ExprKind::DurationLit` keeps `500ms` type-distinct from `5`, so the doc's `now() + 500ms`
+      (ok) vs `now() + 5` (error) example holds. examples/instant.si + tests/instant.rs (8). Metal C
+      compiles (verified with arm-gcc); sim is the gate (not `[metal]`-tagged). NOTE: D15
+      exact-tick-rate conversion + `rounded` modes still unenforced; metal now() is 1ms resolution.
 - [ ] A4 Disposition completeness vs declared codes (§4.4/D14)
 - [ ] A5 Interface semantic-property checks (§4.1/D18)
 

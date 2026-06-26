@@ -1580,7 +1580,7 @@ impl Parser {
             Some(Token::DurationLit(v, u)) => {
                 let span = self.current_span();
                 self.advance();
-                Ok(Expr { kind: ExprKind::IntLit(u.to_ns(v)), span })
+                Ok(Expr { kind: ExprKind::DurationLit(u.to_ns(v)), span })
             }
             Some(Token::KwTrue) => {
                 let span = self.current_span();

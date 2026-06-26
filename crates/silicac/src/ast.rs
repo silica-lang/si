@@ -559,6 +559,10 @@ pub enum ExprKind {
     },
     /// Integer literal.
     IntLit(u64),
+    /// Duration literal in nanoseconds (e.g. `500ms` → 500_000_000).  Folded to
+    /// ns at parse time but kept distinct from a bare integer so the §4.5 time
+    /// model can tell `now() + 500ms` (ok) from `now() + 5` (a type error).
+    DurationLit(u64),
     /// Boolean literal.
     BoolLit(bool),
     /// String literal.
