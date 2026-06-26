@@ -910,6 +910,17 @@ sprinkled through user code (that is how watchdogs get defeated — fed by the v
 it is a property of the scheduler, like the critical sections of §5.5. v1 wires a single
 system watchdog; windowed/multi-stage watchdogs are deferred-not-foreclosed (§10).
 
+> **Status (implemented — `within` on metal).** Beyond the watchdog catching a handler that *never*
+> returns to idle, a per-reaction `within <d>` deadline is now enforced on metal for yielding
+> reactions when a watchdog is declared: the backend emits a `__deadline_N` countdown (in 1ms SysTick
+> ticks) armed at the trigger entry, decremented by SysTick, and disarmed when the frame returns to
+> idle; an overrun latches `__deadline_missed`, which gates off the idle-loop watchdog feed → reset.
+> This catches a handler that is merely *too slow* (would eventually complete), a tighter bound than
+> "never idle". Proven on nRF52840 in Renode (`harness/deadline_reset.sh`: a `within 30ms` read over
+> a ~50ms bus latches the flag; `within 80ms` does not). **Remaining:** it requires a declared
+> watchdog (the reset path); non-yielding reactions are bounded by ISR run-to-completion (no
+> mid-handler check); resolution is the 1ms SysTick base tick.
+
 ---
 
 ## 6. Compilation & backend

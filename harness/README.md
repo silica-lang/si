@@ -64,6 +64,32 @@ busy-poll. Expected output ends with:
 PASS: the button reaction ran DURING the sensor's bus suspension (trace-order parity with sim).
 ```
 
+## `deadline_reset.sh` — on-metal `within <d>` deadline gate (§4.5/§5.6)
+
+`deadline_reset.sh` proves the generated firmware **detects a reaction that
+overruns its declared `within` deadline** — a tighter bound than the bare
+watchdog (which only catches a handler that *never* returns to idle). The
+backend arms a per-reaction `__deadline_N` countdown at the trigger entry, ticks
+it down in SysTick, and latches `__deadline_missed` on an overrun; that flag
+gates off the watchdog feed, so the system resets.
+
+```sh
+RENODE=/path/to/renode ./harness/deadline_reset.sh
+```
+
+Default program: `examples/deadline_nrf52840.si` (a sensor read `every 100ms
+within 30ms`). The harness loads `MockBusController.cs` at a ~50ms latency and
+builds the program twice — the original (`within 30ms`, tighter than the bus) and
+a control derived by `sed` (`within 80ms`, looser). It reads `__deadline_missed`
+straight from RAM via its symbol (`arm-none-eabi-nm`): the tight budget overruns
+(`= 1`), the loose one completes in time (`= 0`). The feed-stop → reset half is
+already covered by the §5.6 watchdog harnesses, so this isolates the *detection*.
+Expected output ends with:
+
+```
+PASS: the metal firmware detects a within-deadline overrun (latches __deadline_missed → stops the watchdog feed, §4.5/§5.6).
+```
+
 ## Notes
 
 - The hermetic codegen tests in `crates/silicac/tests/metal_codegen.rs` run in CI

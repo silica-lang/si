@@ -110,7 +110,14 @@ pick the spec-consistent default and note it in the PR.
 - [ ] E5b Renode mock watchdog + reset validation `[metal]` — 0x40010000 is the DK's real nRF
       WDT, so on-hardware proof needs a MockWatchdog.cs (CR/RLR/KR; resets if unfed) + a harness
       hanging a reaction (mock bus with infinite latency) and observing the reset. Parallels E1.
-- [ ] E4-metal: enforce `within <d>` on metal (per-reaction deadline timer) — builds on E5.
+- [x] E4-metal: enforce `within <d>` on metal `[metal]` — PR #30. Per yielding reaction with a
+      deadline + a board watchdog: a `__deadline_N` countdown (SysTick ticks) armed at trigger entry,
+      ticked down in SysTick (disarmed when the frame returns to idle), latches `__deadline_missed` on
+      overrun — which gates off the idle-loop watchdog feed → reset. Catches a *too-slow* handler the
+      bare watchdog wouldn't. examples/deadline_nrf52840.si + harness/deadline_reset.sh (Renode PASS:
+      within 30ms over a 50ms bus → missed=1; within 80ms → 0) + tests/deadline_metal.rs (3).
+      metal_vs_sim + bus_parity gates still PASS. NOTE: needs a declared watchdog (the reset path);
+      non-yielding reactions are bounded by ISR run-to-completion; SysTick 1ms granularity.
 
 ### Cluster F — exactness & capabilities (last)
 - [ ] F1 Capabilities + float/FPU gating (§4.1/§4.3)
