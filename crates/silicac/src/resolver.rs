@@ -983,6 +983,75 @@ impl Resolver {
                 let val = self.lower_expr_emit(code, scope, vars, out);
                 out.push(SirStmt::Exit(val));
             }
+            Stmt::Match { scrutinee, arms, span } => {
+                self.lower_match(scrutinee, arms, *span, scope, vars, out);
+            }
+        }
+    }
+
+    /// Lower `match <scrut> { <pat> => <body>, … }` (§4.4/D14) to a guarded
+    /// if-chain, enforcing **totality**: exactly one `_` wildcard arm is required
+    /// (no case may be silently unhandled).  Literal arms are mutually exclusive,
+    /// so each is an independent `if __m == lit { … }`; the wildcard runs iff none
+    /// matched (`__matched == 0`).
+    fn lower_match(
+        &mut self,
+        scrutinee: &Expr,
+        arms: &[MatchArm],
+        span: Span,
+        scope: &mut Scope,
+        vars: &[SirVar],
+        out: &mut Vec<SirStmt>,
+    ) {
+        let wild_count = arms.iter().filter(|a| matches!(a.pattern, MatchPat::Wild)).count();
+        if wild_count == 0 {
+            self.err(span, "a `match` must be exhaustive — add a `_` arm (§4.4/D14)");
+        } else if wild_count > 1 {
+            self.err(span, "a `match` has more than one `_` arm");
+        }
+
+        let m = self.fresh("match");
+        let matched = self.fresh("matched");
+        let scrut_val = self.lower_expr_emit(scrutinee, scope, vars, out);
+        out.push(SirStmt::Assign { target: SirPlace::Var(m.clone()), value: scrut_val });
+        out.push(SirStmt::Assign { target: SirPlace::Var(matched.clone()), value: SirExpr::U64(0) });
+
+        let mut wildcard: Option<&MatchArm> = None;
+        let mut seen_lits: Vec<u64> = Vec::new();
+        for arm in arms {
+            match &arm.pattern {
+                MatchPat::Wild => wildcard = Some(arm),
+                MatchPat::Lit(lit) => {
+                    if let Some(k) = lit_const(lit) {
+                        if seen_lits.contains(&k) {
+                            self.err(arm.span, format!("duplicate match arm for `{k}`"));
+                        }
+                        seen_lits.push(k);
+                    } else {
+                        self.err(arm.span, "match patterns must be integer or boolean literals");
+                    }
+                    let cond = SirExpr::BinOp(
+                        SirBinOp::EqEq,
+                        Box::new(SirExpr::Load(m.clone())),
+                        Box::new(self.lower_expr(lit, scope)),
+                    );
+                    let mut then = self.lower_block(&arm.body, scope, vars);
+                    then.push(SirStmt::Assign {
+                        target: SirPlace::Var(matched.clone()),
+                        value: SirExpr::U64(1),
+                    });
+                    out.push(SirStmt::If { cond, then });
+                }
+            }
+        }
+        if let Some(arm) = wildcard {
+            let then = self.lower_block(&arm.body, scope, vars);
+            let cond = SirExpr::BinOp(
+                SirBinOp::EqEq,
+                Box::new(SirExpr::Load(matched.clone())),
+                Box::new(SirExpr::U64(0)),
+            );
+            out.push(SirStmt::If { cond, then });
         }
     }
 
@@ -1762,6 +1831,15 @@ fn expr_root_ident(expr: &Expr) -> Option<&str> {
     match &expr.kind {
         ExprKind::Ident(ident) => Some(&ident.name),
         ExprKind::Field(inner, _) => expr_root_ident(inner),
+        _ => None,
+    }
+}
+
+/// The constant value of an integer or boolean literal pattern, if it is one.
+fn lit_const(e: &Expr) -> Option<u64> {
+    match &e.kind {
+        ExprKind::IntLit(n) => Some(*n),
+        ExprKind::BoolLit(b) => Some(*b as u64),
         _ => None,
     }
 }

@@ -42,7 +42,12 @@ pick the spec-consistent default and note it in the PR.
       greediness bug where `where <expr> = <default>` swallowed the default.
 - [ ] A2 Number model: casts / mixed-sign / odd-width / endianness (§4.3)
 - [ ] A3 instant/duration type rules + `now()` (§4.5)
-- [ ] A4 Disposition completeness vs declared codes (§4.4/D14)
+- [x] A4 `match` + totality (§4.4/D14) — PR #24. `match <expr> { <lit> => …, _ => … }` as the first
+      surface conditional, lowered to a guarded if-chain over existing SirStmt::If (no SIR/sim/metal
+      change). Enforced **total**: a `_` wildcard arm is required (compile error otherwise), duplicate
+      literal arms rejected. Integer + bool literal patterns. examples/match.si + tests/match_stmt.rs
+      (5); sim gate + metal compiles. NOTE: `ok`/`fault f` op-result patterns and exhaustiveness vs an
+      op's declared fault-code set (the §4.4 `match usart2.write()` form) build on this — deferred.
 - [ ] A5 Interface semantic-property checks (§4.1/D18)
 
 ### Cluster B — arithmetic safety

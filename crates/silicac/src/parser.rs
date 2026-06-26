@@ -1295,6 +1295,7 @@ impl Parser {
                 self.eat_optional_semi();
                 Ok(Stmt::Poll { cond, within, fault_code, span: Span::new(start, self.prev_span().end) })
             }
+            Some(Token::KwMatch) => self.parse_match(start),
             Some(Token::KwBecome) => {
                 self.advance();
                 let state = self.eat_ident()?;
@@ -1324,6 +1325,42 @@ impl Parser {
                 Ok(Stmt::Expr(expr))
             }
         }
+    }
+
+    /// `match <expr> { <pat> => <body>, … }`.  A `<body>` is a block or a single
+    /// statement; arms are separated by optional commas.
+    fn parse_match(&mut self, start: usize) -> Result<Stmt, ParseError> {
+        self.eat(&Token::KwMatch)?;
+        let scrutinee = self.parse_or()?; // below assignment, so `=>` isn't swallowed
+        self.eat(&Token::LBrace)?;
+        let mut arms = Vec::new();
+        while self.peek() != Some(&Token::RBrace) {
+            if self.at_end() {
+                return Err(self.error("unexpected EOF in match"));
+            }
+            let arm_start = self.current_span().start;
+            // Pattern: `_` wildcard, or a literal expression.
+            let pattern = if matches!(self.peek(), Some(Token::Ident(s)) if s == "_") {
+                self.advance();
+                MatchPat::Wild
+            } else {
+                MatchPat::Lit(self.parse_or()?)
+            };
+            self.eat(&Token::FatArrow)?;
+            let body = if self.peek() == Some(&Token::LBrace) {
+                self.parse_block()?
+            } else {
+                let s = self.parse_stmt()?;
+                let span = self.prev_span();
+                Block { stmts: vec![s], span }
+            };
+            arms.push(MatchArm { pattern, body, span: Span::new(arm_start, self.prev_span().end) });
+            if self.peek() == Some(&Token::Comma) {
+                self.advance();
+            }
+        }
+        self.eat(&Token::RBrace)?;
+        Ok(Stmt::Match { scrutinee, arms, span: Span::new(start, self.prev_span().end) })
     }
 
     /// Parse an expression that may be an assignment; consume optional trailing `;`.
