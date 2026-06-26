@@ -230,8 +230,11 @@ Each item is its own branch (`feat/p0-<id>`) + PR behind the hard gate.
       examples/stack_over_budget_nrf52840.si + harness/stack_budget.sh (healthy reports measured;
       oversized rejected, no ELF) + enforce unit/integration tests. metal_vs_sim Renode gate PASS.
       Completes Finding 1. NOTE: frame-union optimisation not yet applied (only shrinks the budget).
-- [ ] P0-2a Thread per-field access resolver→SIR→backend (`RegInfo.fields` carries access; field
-      access falls back to register access); reject `Ro` writes / `Wo` reads.
+- [x] P0-2a Thread per-field access resolver→SIR→backend — PR #39. `RegInfo.fields` now carries
+      `(mask, shift, access)` (field qualifier, else register's); `reg_place`/`reg_load` take an
+      explicit access; reads/writes reject `ro` writes and `wo` reads (compile errors). Effect: a
+      `w1c` field in an `rw` register lowers to a single masked write (not a sibling-clobbering RMW).
+      tests/reg_access.rs (4 negative + a w1c-vs-rw codegen contrast). metal_vs_sim Renode sanity PASS.
 - [ ] P0-2b `rc`/`pop_on_read` as tracked read-effects — capture the swallowed modifiers; forbid
       implicit RMW of a read-side-effect register; model `rc` read-clear in the sim. `[metal]`
 - [ ] P0-2c Multi-field single write `REG{a=1, b=1}` — lexer/parser/AST + `SirStmt::RegWrite` with
