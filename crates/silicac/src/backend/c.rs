@@ -49,6 +49,10 @@ pub struct CBackend {
     arith_combos: HashSet<(SirArithOp, OverflowMode, u8, bool)>,
     /// Ring cell name → (element bytes, capacity), for ring op codegen (§5.3).
     ring_info: HashMap<String, (u8, u32)>,
+    /// Yielding-reaction id → its `within <d>` deadline in SysTick base ticks
+    /// (§4.5/§5.6).  Populated only when a watchdog exists (the reset mechanism);
+    /// an overrun sets `__deadline_missed`, which stops the watchdog feed.
+    deadline_ticks: HashMap<usize, u32>,
 }
 
 impl CBackend {
@@ -70,6 +74,7 @@ impl CBackend {
             current_disposition: None,
             arith_combos: HashSet::new(),
             ring_info: HashMap::new(),
+            deadline_ticks: HashMap::new(),
         }
     }
 
@@ -125,10 +130,25 @@ impl CBackend {
                 self.emit_main(module);
             }
             Target::MetalNrf52840 => {
+                // §4.5/§5.6 — per-reaction `within` deadlines are enforced on
+                // metal only when a watchdog exists (the reset mechanism): an
+                // overrun stops the feed.  Yielding reactions only — a non-yielding
+                // one runs to completion in its ISR and is bounded by construction.
+                if module.watchdog_device.is_some() {
+                    for r in &module.reactions {
+                        if r.yields {
+                            if let Some(ns) = r.deadline_ns {
+                                let ticks = ns.div_ceil(1_000_000).max(1) as u32; // 1ms SysTick base
+                                self.deadline_ticks.insert(r.id, ticks);
+                            }
+                        }
+                    }
+                }
                 self.emit_header_metal(module);
                 self.emit_newline();
                 self.emit_globals(module);
                 self.emit_now_helper(module);
+                self.emit_deadline_state();
                 self.emit_newline();
                 self.emit_drive_safe(module);
                 self.emit_arith_helpers();
@@ -235,10 +255,8 @@ impl CBackend {
         self.emit_newline();
     }
 
-    /// Emit the `static inline` helpers for every width-checked arithmetic shape
-    /// used in the module (§4.3 / SIL-004).  Trap helpers use the compiler's
-    /// `__builtin_*_overflow` and drive the system to safe-state on overflow;
-    /// wrapping/saturating helpers implement the explicit `%`/`|` operators.
+    // Emit the `static inline` helpers for every width-checked arithmetic shape
+    // used in the module (§4.3 / SIL-004).
     fn emit_arith_helpers(&mut self) {
         if self.arith_combos.is_empty() {
             return;
@@ -286,6 +304,22 @@ impl CBackend {
             }
         }
         self.emit_newline();
+    }
+
+    /// Declare the per-reaction `within`-deadline countdowns + the shared
+    /// `__deadline_missed` flag (§4.5/§5.6).  Referenced by the trigger fns
+    /// (arm), the SysTick handler (decrement), and the idle loop (gate the feed).
+    fn emit_deadline_state(&mut self) {
+        if self.deadline_ticks.is_empty() {
+            return;
+        }
+        self.line("/* §4.5/§5.6 `within` deadline countdowns (SysTick ticks); overrun stops the watchdog feed */");
+        let mut ids: Vec<usize> = self.deadline_ticks.keys().copied().collect();
+        ids.sort_unstable();
+        for id in ids {
+            self.line(&format!("static volatile uint32_t __deadline_{} = 0U;", id));
+        }
+        self.line("static volatile uint32_t __deadline_missed = 0U;");
     }
 
     // ── Reaction functions ────────────────────────────────────────────────────
@@ -474,6 +508,11 @@ impl CBackend {
                 self.indent -= 1;
                 self.line("}");
             }
+        }
+        // §4.5/§5.6 — arm this activation's `within` deadline (in SysTick ticks);
+        // if it is still in flight when the countdown elapses, it overran.
+        if let Some(ticks) = self.deadline_ticks.get(&n).copied() {
+            self.line(&format!("__deadline_{} = {}U; /* arm `within` deadline (§4.5) */", n, ticks));
         }
         self.line(&format!("__react_{}_run();", n));
         self.indent -= 1;
@@ -1261,6 +1300,18 @@ impl CBackend {
                 // 1ms base tick → advance the uptime clock backing now() (§4.5).
                 self.line("__uptime_ns += UINT64_C(1000000);");
             }
+            // §4.5/§5.6 — tick down each armed `within` deadline.  A reaction that
+            // is back to idle disarms; one still in flight when its countdown hits
+            // zero overran → latch `__deadline_missed` (stops the watchdog feed).
+            if !self.deadline_ticks.is_empty() {
+                let mut ids: Vec<usize> = self.deadline_ticks.keys().copied().collect();
+                ids.sort_unstable();
+                for id in ids {
+                    self.line(&format!(
+                        "if (__rf_{id}.__state == 0U) {{ __deadline_{id} = 0U; }} else if (__deadline_{id} != 0U && --__deadline_{id} == 0U) {{ __deadline_missed = 1U; }}",
+                    ));
+                }
+            }
             for (id, threshold) in &plan.thresholds {
                 self.line(&format!("if (--__systick_ctr_{} == 0U) {{", id));
                 self.indent += 1;
@@ -1511,14 +1562,18 @@ impl CBackend {
         // (yielding → frame state != 0), so it is not fed and the watchdog resets.
         if let Some(kr) = wdt_kr {
             let yielding: Vec<usize> = module.reactions.iter().filter(|r| r.yields).map(|r| r.id).collect();
-            let idle = if yielding.is_empty() {
+            let mut idle = if yielding.is_empty() {
                 "1".to_string()
             } else {
                 yielding.iter().map(|id| format!("__rf_{}.__state == 0U", id)).collect::<Vec<_>>().join(" && ")
             };
+            // §4.5/§5.6 — a missed `within` deadline permanently stops the feed.
+            if !self.deadline_ticks.is_empty() {
+                idle = format!("!__deadline_missed && ({})", idle);
+            }
             self.line("for (;;) {");
             self.indent += 1;
-            self.line(&format!("if ({}) {{ *(volatile uint32_t *)0x{:08x}UL = 0xAAAAUL; }} /* feed on clean idle */", idle, kr));
+            self.line(&format!("if ({}) {{ *(volatile uint32_t *)0x{:08x}UL = 0xAAAAUL; }} /* feed on clean idle (gated on deadline, §4.5/§5.6) */", idle, kr));
             self.line("__asm__ volatile(\"wfi\");");
             self.indent -= 1;
             self.line("}");

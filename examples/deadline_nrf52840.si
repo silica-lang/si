@@ -1,0 +1,44 @@
+// On-metal enforcement of a reaction `within <d>` deadline (§4.5/§5.6).
+//
+// A reaction may declare a deadline: it must return to idle within `d` of firing.
+// On metal this is enforced by a per-reaction countdown armed when the handler
+// fires and ticked down by SysTick; if the handler is still in flight (suspended
+// on the bus) when the countdown elapses, it OVERRAN — a flag latches and the
+// generated idle loop stops feeding the hardware watchdog, so the watchdog
+// resets the system.  The deadline therefore catches a handler that is merely
+// *too slow*, even if it would eventually complete — a tighter bound than the
+// bare "never returns to idle" the watchdog alone gives.
+//
+//   RENODE=… ./harness/deadline_reset.sh
+//
+// The harness runs a slow (~50ms) bus: with `within 30ms` the read overruns and
+// the watchdog fires; raising the budget above the bus latency keeps it fed.
+
+board demo {
+  soc s {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+  i2c0 : i2c_controller at 0x4000_3000 { needs { clock = soc.sysclk } }
+  env  : bme280 { needs { bus = i2c0 } }
+  wdt0 : wdt at 0x4001_0000 { config { timeout = 100ms } }
+}
+
+program app {
+  use board demo as b
+  let sensor = b.env
+  cell samples : u32 = 0
+
+  // Must finish within 30ms of each tick, else the watchdog resets the system.
+  every 100ms within 30ms {
+    let t = sensor.read_temp()?
+    samples = samples + 1
+  }
+}
+
+sim app_sim for app {
+  run until 350ms
+}
