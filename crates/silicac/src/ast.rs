@@ -525,6 +525,11 @@ pub enum Stmt {
     /// does **not** yield (§3.2/§5.2): spin until `cond` holds, or raise fault
     /// `code` once the bound elapses.  (Its suspending sibling is `await`.)
     Poll { cond: Expr, within: Duration, fault_code: Ident, span: Span },
+    /// `await <cond> within <d> else fault <code>` — a bounded *suspending* wait
+    /// (§3.2/§5.2): the handler yields to the scheduler and `cond` is re-checked
+    /// on a cadence until it holds (resume) or the `within` budget elapses (raise
+    /// fault `code`).  Same surface as `poll`; the difference is it suspends.
+    Await { cond: Expr, within: Duration, fault_code: Ident, span: Span },
     /// `atomic { <stmts> }` — an explicit multi-statement critical section
     /// (§5.5/D03): the whole block runs at the priority ceiling of every cell it
     /// touches, so a group of cell updates is indivisible w.r.t. other reactions.

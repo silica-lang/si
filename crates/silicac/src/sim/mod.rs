@@ -45,6 +45,9 @@ pub enum TraceKind {
     /// A `poll <cond> within <d>` was evaluated (§3.2): `satisfied` = the
     /// condition held; otherwise the bound elapsed and `code` was raised.
     Poll { code: String, satisfied: bool },
+    /// A suspending `await <cond> within <d>` resolved (§5.2): `resolved` = the
+    /// condition held; otherwise the budget elapsed and `code` was raised.
+    Await { code: String, resolved: bool },
     /// A reaction suspended on a bus transaction (§5.2/§3.5).
     BusStart { device: usize, op: String },
     /// A bus transaction completed: `code` = None on success, Some on fault.
@@ -113,6 +116,10 @@ impl SimResult {
                     true => format!("[{:>8.3}ms]   poll — satisfied", ms),
                     false => format!("[{:>8.3}ms]   poll — timeout, FAULT {}", ms, code),
                 },
+                TraceKind::Await { code, resolved } => match resolved {
+                    true => format!("[{:>8.3}ms]   await — condition met, resume (§5.2)", ms),
+                    false => format!("[{:>8.3}ms]   await — timeout, FAULT {}", ms, code),
+                },
                 TraceKind::BusStart { device, op } => {
                     format!("[{:>8.3}ms]   bus {}.{}() — suspend (yields)", ms, name_of(*device), op)
                 }
@@ -161,6 +168,9 @@ enum Payload {
         propagate: bool,
         outcome: Result<u64, String>,
     },
+    /// Re-check a suspended `await` (§5.2): re-enter the handler at the same `pc`
+    /// to re-evaluate its condition (or time out).
+    AwaitRecheck { act: Activation },
     /// The hardware watchdog deadline for arming generation `gen` (§5.6).
     WdtTimeout { gen: u64 },
     /// A reaction's `within <d>` deadline elapsed (§4.5/§5.6); if `reaction` is
@@ -186,6 +196,9 @@ struct Activation {
     locals: HashMap<String, u64>,
     /// Layer-2 retry count so far (§4.4).
     retries: u32,
+    /// Absolute time the current `await`'s `within` budget elapses (§5.2); set on
+    /// first reaching the await, cleared when it resolves.  `None` when not in one.
+    await_deadline: Option<u64>,
 }
 
 // ─── Simulator ──────────────────────────────────────────────────────────────────
@@ -363,6 +376,10 @@ impl<'m> Sim<'m> {
                 Payload::Resume { act, device, op, dst, propagate, outcome } => {
                     self.resume(act, device, op, dst, propagate, outcome);
                 }
+                Payload::AwaitRecheck { act } => {
+                    // Re-enter at the same pc — run_activation re-evaluates the await.
+                    self.run_activation(act);
+                }
                 Payload::WdtTimeout { gen } => {
                     // Fire a reset only if this is still the active arming — a
                     // later feed (clean idle) would have superseded it (§5.6).
@@ -462,7 +479,7 @@ impl<'m> Sim<'m> {
             at_ns: self.now,
             kind: TraceKind::ReactionFire { reaction: idx, source },
         });
-        let act = Activation { reaction: idx, pc: 0, locals: HashMap::new(), retries: 0 };
+        let act = Activation { reaction: idx, pc: 0, locals: HashMap::new(), retries: 0, await_deadline: None };
         self.run_activation(act);
     }
 
@@ -507,6 +524,35 @@ impl<'m> Sim<'m> {
                             });
                             return; // suspend — the scheduler runs other work meanwhile
                         }
+                    }
+                }
+                SirStmt::Await { cond, fault_code, within_ns, recheck_ns } => {
+                    // Suspending bounded wait (§5.2): set the budget on first entry,
+                    // then resume / time out / re-check.
+                    let deadline = *act.await_deadline.get_or_insert(self.now + *within_ns);
+                    if self.eval_expr(cond, &act.locals) != 0 {
+                        act.await_deadline = None;
+                        self.trace.push(TraceRecord {
+                            at_ns: self.now,
+                            kind: TraceKind::Await { code: fault_code.clone(), resolved: true },
+                        });
+                        act.pc += 1;
+                    } else if self.now >= deadline {
+                        act.await_deadline = None;
+                        self.trace.push(TraceRecord {
+                            at_ns: self.now,
+                            kind: TraceKind::Await { code: fault_code.clone(), resolved: false },
+                        });
+                        self.dispose(act, fault_code.clone());
+                        return;
+                    } else {
+                        // Suspend: re-check at the next cadence tick (capped at the
+                        // deadline), letting the scheduler run other work meanwhile.
+                        let next = (self.now + *recheck_ns).min(deadline);
+                        let seq = self.next_seq();
+                        let priority = module.reactions[act.reaction].priority;
+                        self.queue.push(QItem { at_ns: next, priority, seq, payload: Payload::AwaitRecheck { act } });
+                        return;
                     }
                 }
                 stmt => {
@@ -557,6 +603,7 @@ impl<'m> Sim<'m> {
                 });
                 act.pc = 0;
                 act.locals.clear();
+                act.await_deadline = None;
                 self.run_activation(act);
             }
             SirDisposition::Skip => {
@@ -674,6 +721,19 @@ impl<'m> Sim<'m> {
                 self.trace.push(TraceRecord {
                     at_ns: self.now,
                     kind: TraceKind::Poll { code: fault_code.clone(), satisfied: ok },
+                });
+                if !ok {
+                    self.pending_fault = Some(fault_code.clone());
+                }
+            }
+            SirStmt::Await { cond, fault_code, .. } => {
+                // Top-level `await` suspends in `run_activation`; this path is only
+                // reached for an `await` nested in an `if`/critical, which cannot
+                // suspend — fall back to a single deterministic check (§5.2).
+                let ok = self.eval_expr(cond, frame) != 0;
+                self.trace.push(TraceRecord {
+                    at_ns: self.now,
+                    kind: TraceKind::Await { code: fault_code.clone(), resolved: ok },
                 });
                 if !ok {
                     self.pending_fault = Some(fault_code.clone());

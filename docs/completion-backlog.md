@@ -77,13 +77,15 @@ pick the spec-consistent default and note it in the PR.
       bearing reactions get the fault/retry wrapper). examples/poll_usart.si + tests/poll.rs.
       Both Renode gates still PASS (no metal regression). Builds the `<cond> within <d>`
       parsing await will reuse.
-- [ ] D3b `await <cond> within <d>` (§3.2/§5.2) `[metal]`  (dep: D2) — DEFERRED, NEEDS A DESIGN CALL,
-      not autonomous-default-able. Findings: `await`/`poll`/`within`/`else` all lex but none
-      parse; `await` suspends on a *condition* but the spec doesn't pin the wakeup trigger
-      (re-check cadence? event-driven dep-tracking?); and the sim doesn't model hardware-
-      driven register changes, so a condition-wait can't naturally succeed without injection
-      machinery. Its non-suspending sibling `poll` is also unbuilt and is the parsing
-      prerequisite. Surface the resume-model decision before implementing.
+- [x] D3b `await <cond> within <d> else fault <code>` (§3.2/§5.2) `[metal]` — PR #33. The suspending
+      sibling of `poll`. **Resume model chosen: yield + periodic re-check** — on reaching `await` the
+      handler yields; cond is re-checked every `within/8` (≥1µs) until it holds (resume) or the budget
+      elapses (fault → Layer-2 disposition). Lex (existed) + parse (mirror poll) + SirStmt::Await. Sim:
+      true suspend via the event queue (Payload::AwaitRecheck, Activation.await_deadline), so another
+      reaction can make cond true (proven: resume strictly after fire). Exempt from the §5.5
+      auto-critical (an await polls its cond), rejected inside `atomic`. Metal: bounded re-check loop
+      (wfi between checks) respecting `within` — full D2-style frame suspend across await is the noted
+      follow-up. examples/await.si + tests/await.rs (5). metal_vs_sim + bus_parity gates PASS.
 
 ### Cluster E — Renode Phase-1 closure + fault depth
 - [x] E1 Mock I²C controller Renode peripheral + trace-order parity harness `[metal]` — PR #15.

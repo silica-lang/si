@@ -1,0 +1,47 @@
+// `await <cond> within <d> else fault <code>` — a bounded *suspending* wait
+// (§3.2/§5.2), the yielding sibling of `poll`.
+//
+// Resume model (the design choice this implements): on reaching `await` the
+// handler YIELDS to the scheduler; its condition is re-checked on a cadence (a
+// fraction of the budget) until it holds — then the handler resumes — or the
+// `within` budget elapses, raising `fault <code>` into the reaction's Layer-2
+// disposition.  Because the handler is suspended (not spinning), other reactions
+// run meanwhile; here a second reaction is what makes the condition true.
+//
+// Timeline: the worker fires at 100ms and awaits `ready == 1`.  It suspends; the
+// `arm` reaction sets `ready = 1` at 130ms; the worker's next re-check sees it
+// and resumes, so `done` advances.  (With no `arm`, the await would instead time
+// out and the fault disposition would fire.)
+//
+//   silicac --sim examples/await.si
+
+board demo {
+  soc s {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+}
+
+program app {
+  use board demo as b
+  cell ready : u32 = 0
+  cell done  : u32 = 0
+
+  // The worker waits (suspended) for `ready`, then records progress.
+  every 100ms on fault skip {
+    await ready == 1 within 500ms else fault not_ready
+    done = done + 1
+  }
+
+  // A separate reaction makes the awaited condition true.
+  every 130ms {
+    ready = 1
+  }
+}
+
+sim app_sim for app {
+  run until 400ms
+}
