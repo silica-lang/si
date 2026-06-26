@@ -223,8 +223,13 @@ Each item is its own branch (`feat/p0-<id>`) + PR behind the hard gate.
       estimate (blink: 704 measured vs 992 estimate). tests/stackinfo.rs + 6 unit tests over fixture
       `.ci`/`.su`. metal_vs_sim Renode gate PASS. NOTE: reporting only — P0-1b folds the measured
       number into the enforced `ram_budget()` and hard-errors on over-RAM / non-static frames.
-- [ ] P0-1b Enforce measured budget in `ram_budget()` — hard-error on over-RAM or any `dynamic`
-      frame; keep the SIR estimate as host/unit-test fallback; `harness/stack_budget.sh`. `[metal]`
+- [x] P0-1b Enforce measured budget in `ram_budget()` — PR #38. `backend::stackinfo::enforce` makes
+      the measured stack the authoritative metal budget: hard-errors on `statics + stack > RAM` or any
+      non-static (alloca/VLA) frame; `main.rs` runs it post-compile, deletes the over-budget ELF, and
+      prints `RAM budget (measured) …`. SIR estimate kept as pre-compile fast-fail / host fallback.
+      examples/stack_over_budget_nrf52840.si + harness/stack_budget.sh (healthy reports measured;
+      oversized rejected, no ELF) + enforce unit/integration tests. metal_vs_sim Renode gate PASS.
+      Completes Finding 1. NOTE: frame-union optimisation not yet applied (only shrinks the budget).
 - [ ] P0-2a Thread per-field access resolver→SIR→backend (`RegInfo.fields` carries access; field
       access falls back to register access); reject `Ro` writes / `Wo` reads.
 - [ ] P0-2b `rc`/`pop_on_read` as tracked read-effects — capture the swallowed modifiers; forbid
