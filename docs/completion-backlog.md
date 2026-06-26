@@ -270,5 +270,27 @@ Each item is its own branch (`feat/p0-<id>`) + PR behind the hard gate.
       (raw 0x5AB0 → 25.00 °C; deg 25, centi 2500; raw not passed through) + examples/sensor_temp_c.si.
       metal_vs_sim + bus_parity Renode gates PASS. **Completes Finding 3 and the P0 cluster.**
 
+### Cluster P1 — precision & cost visibility (audit #35)
+From the deep audit (issue #35), the performance/embedded recommendations: barriers that match the
+ARM architecture (cheaper *and* correct), `-Os` by default + a flash budget gate as hard as the RAM
+gate, and `every` on real timer hardware instead of a 1ms SysTick grid. Plan:
+`~/.claude/plans/as-an-embedded-firmware-functional-pebble.md`. Each item is its own branch
+(`feat/p1-<id>`, **independent off `main`**) + PR targeting `main` (not auto-merged). All `[metal]`.
+
+- [ ] P1-1 Barrier model: ARM-conformant + de-duplicated `[metal]` — define `__ISB`; `__ISB` after
+      `MSR BASEPRI` raise (not `__DMB`); `__DSB` after interrupt-source clear before ISR return
+      (GPIOTE/bus) + `__DSB;__ISB` after NVIC ISER enable; collapse the redundant double-`__DMB` per
+      MMIO store to the architecturally-required Normal↔Device boundaries only.
+- [ ] P1-2 Default `-Os` + `--opt <level>` override `[metal]` — flip metal `-O1`→`-Os` in `cc_flags`,
+      add a CLI opt-level override injected in `run()`; keep `-fstack-usage`/`-fcallgraph-info`.
+- [ ] P1-3 Flash / code-size budget gate `[metal]` — `flash_budget()`/`enforce_flash()` symmetric to
+      the RAM gate; measure `.text+.rodata+.data` via `arm-none-eabi-size` on the linked ELF vs the
+      flash region, hard-error + delete ELF on overflow; `harness/flash_budget.sh`. (After P1-2.)
+- [ ] P1-4 `every` on a hardware timer (full rewrite) `[metal]` — replace the 1ms SysTick-prescaler
+      engine with a hardware TIMER/RTC compare (extend `std/timer.si` with compare channels; resolver
+      allocates a channel per `every` with exact-or-error period→ticks; backend programs the timer +
+      IRQ dispatch; re-base `now()`/`within` off it; retire the 1ms grid). Largest/riskiest (Renode
+      timer fidelity — may need a mock peripheral).
+
 ## Completed log
 _(append `item — PR #NN — date` here as items land)_
