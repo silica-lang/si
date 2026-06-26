@@ -103,9 +103,14 @@ pick the spec-consistent default and note it in the PR.
       new item). Metal firmware still compiles (deadline_ns unused on metal); blink gate PASS.
 
 ### Cluster E (cont.) — discovered follow-ups
-- [ ] E5 Metal hardware watchdog wiring (§5.6) `[metal]` — the scheduler-fed watchdog is
-      sim-only today; the backend never feeds a `wdt` (RLR/KR). Needed before E4's deadline
-      and the watchdog reset are enforceable on metal. Renode-validatable once wired.
+- [x] E5 Metal hardware watchdog wiring (§5.6) `[metal]` — PR #19. SIR carries watchdog_device;
+      backend configures+starts the wdt at boot (RLR/CR/KR) and feeds it in the idle loop
+      gated on all yielding frames being idle (a hung/suspended reaction → never fed → reset).
+      Codegen test + compile/link; existing Renode gates unaffected (non-wdt programs unchanged).
+- [ ] E5b Renode mock watchdog + reset validation `[metal]` — 0x40010000 is the DK's real nRF
+      WDT, so on-hardware proof needs a MockWatchdog.cs (CR/RLR/KR; resets if unfed) + a harness
+      hanging a reaction (mock bus with infinite latency) and observing the reset. Parallels E1.
+- [ ] E4-metal: enforce `within <d>` on metal (per-reaction deadline timer) — builds on E5.
 
 ### Cluster F — exactness & capabilities (last)
 - [ ] F1 Capabilities + float/FPU gating (§4.1/§4.3)

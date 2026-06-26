@@ -533,3 +533,36 @@ fn spi_bus_xfer_lowers_to_irq_driven_segment_state_machine() {
     assert!(!out.contains("__I2C_POLL_BOUND") && !out.contains("__spins"), "busy-wait must be gone:\n{out}");
     assert!(!out.contains("not yet lowered"), "no unlowered-device-op stub:\n{out}");
 }
+
+/// §5.6 (E5) — the system watchdog is configured + started at boot and fed on a
+/// clean return to idle, gated on no yielding reaction being mid-transaction.
+const WDT_SENSOR: &str = r#"
+board b {
+  soc s {
+    memory { flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+  i2c0 : i2c_controller at 0x4000_3000 { needs { clock = soc.sysclk } }
+  env  : bme280 { needs { bus = i2c0 } }
+  wdt0 : wdt at 0x4001_0000 { config { timeout = 100ms } }
+}
+program app {
+  use board b as bd
+  let sensor = bd.env
+  cell samples : u32 = 0
+  every 1000ms { let t = sensor.read_temp()?  samples = samples + 1 }
+}
+"#;
+
+#[test]
+fn watchdog_is_configured_and_fed_only_when_idle_on_metal() {
+    let sir = compile(WDT_SENSOR);
+    let out = c::CBackend::with_target(Target::MetalNrf52840).emit(&sir);
+    // Boot: reload (100ms) → RLR, start → CR, initial feed → KR, off base 0x4001_0000.
+    assert!(out.contains("0x40010004UL = 100UL; /* RLR: reload (ms) */"), "reload from timeout:\n{out}");
+    assert!(out.contains("0x40010000UL = 0x1UL;  /* CR: start */"), "start:\n{out}");
+    assert!(out.contains("0x40010008UL = 0xAAAAUL; /* KR: feed */"), "initial feed:\n{out}");
+    // Idle loop feeds KR only when the yielding reaction's frame is idle (§5.6):
+    // a hung/suspended reaction (state != 0) is never fed → the watchdog resets.
+    assert!(out.contains("if (__rf_0.__state == 0U) { *(volatile uint32_t *)0x40010008UL = 0xAAAAUL; }"), "idle-gated feed:\n{out}");
+}

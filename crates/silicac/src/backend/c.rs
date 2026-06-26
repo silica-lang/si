@@ -1322,13 +1322,52 @@ impl CBackend {
             self.emit_newline();
         }
 
+        // Configure + start the system watchdog over its declared CR/RLR/KR
+        // (§5.6).  Reload = the timeout; CR.start begins it; a KR write feeds it.
+        let wdt_kr = module.watchdog_device.and_then(|wdt| {
+            let regs = self.device_regs.get(&wdt);
+            let (cr, rlr, kr) = match regs.and_then(|r| Some((r.get("CR")?, r.get("RLR")?, r.get("KR")?))) {
+                Some((cr, rlr, kr)) => (*cr, *rlr, *kr),
+                None => {
+                    self.line("#error \"watchdog device missing a CR/RLR/KR register or MMIO base (§5.6)\"");
+                    return None;
+                }
+            };
+            let timeout_ms = module.watchdog_timeout_ns.unwrap_or(0) / 1_000_000;
+            self.line("/* configure + start the system watchdog (§5.6) */");
+            self.line(&format!("*(volatile uint32_t *)0x{:08x}UL = {}UL; /* RLR: reload (ms) */", rlr, timeout_ms));
+            self.line(&format!("*(volatile uint32_t *)0x{:08x}UL = 0x1UL;  /* CR: start */", cr));
+            self.line(&format!("*(volatile uint32_t *)0x{:08x}UL = 0xAAAAUL; /* KR: feed */", kr));
+            self.emit_newline();
+            Some(kr)
+        });
+
         if systick.is_some() || !events.is_empty() || module_has_bus_xfer(module) {
             self.line("__DSB();");
             self.line("__asm__ volatile(\"cpsie i\"); /* enable interrupts */");
             self.emit_newline();
         }
 
-        self.line("for (;;) { __asm__ volatile(\"wfi\"); }");
+        // Idle loop.  With a watchdog, feed it on a clean return to idle — only
+        // when no yielding reaction is mid-transaction (§5.6).  A hung reaction
+        // never reaches here (non-yielding → stuck in its ISR) or never goes idle
+        // (yielding → frame state != 0), so it is not fed and the watchdog resets.
+        if let Some(kr) = wdt_kr {
+            let yielding: Vec<usize> = module.reactions.iter().filter(|r| r.yields).map(|r| r.id).collect();
+            let idle = if yielding.is_empty() {
+                "1".to_string()
+            } else {
+                yielding.iter().map(|id| format!("__rf_{}.__state == 0U", id)).collect::<Vec<_>>().join(" && ")
+            };
+            self.line("for (;;) {");
+            self.indent += 1;
+            self.line(&format!("if ({}) {{ *(volatile uint32_t *)0x{:08x}UL = 0xAAAAUL; }} /* feed on clean idle */", idle, kr));
+            self.line("__asm__ volatile(\"wfi\");");
+            self.indent -= 1;
+            self.line("}");
+        } else {
+            self.line("for (;;) { __asm__ volatile(\"wfi\"); }");
+        }
         self.indent -= 1;
         self.line("}");
     }
