@@ -253,8 +253,11 @@ Each item is its own branch (`feat/p0-<id>`) + PR behind the hard gate.
       int / different scales is a compile error); `SirExpr::FixedCast` rescales (int↔fixed `<<`/`>>F`,
       fixed↔fixed by frac diff) via scope-aware `expr_sirtype`; same-scale add/sub reuse `Arith` at the
       storage width. examples/fixed.si (sum=7) + tests/fixed.rs (6). metal_vs_sim Renode sanity PASS.
-- [ ] P0-3c Fixed multiply/divide with rescale — new `SirExpr::FixedArith` (mul: wider intermediate
-      then `>>F`; div: `<<F` then divide), obeying trap/wrap/saturate; C helpers + sim.
+- [x] P0-3c Fixed multiply/divide with rescale — PR #43. `FixedArithOp{Mul,Div}` + `SirExpr::FixedArith`;
+      `make_binop_typed` routes fixed `*`/`*%`/`*|`/`/` (add/sub stay raw `Arith`); backend
+      `__si_fixmul_*`/`__si_fixdiv_*` helpers (64-bit intermediate, mul `>>F`, div `<<F` then divide,
+      div0/out-of-range → trap), sim `eval_fixed`. tests/fixed.rs (+4: 2*3=6, (7/2)*2=7, mul overflow
+      traps, metal helper) + examples/fixed.si (prod 12, half 3). metal_vs_sim Renode sanity PASS.
 - [ ] P0-3b Decimal + voltage literals — lexer decimal-point path + documented `3v3`/`1v8` →
       `Token::FixedLit` → `ExprKind::FixedLit` typed as `fixed`.
 - [ ] P0-3d BME280 datasheet compensation end-to-end (the proof point) — replace the elided math in
