@@ -814,7 +814,12 @@ impl Resolver {
         let yields = body_yields(&body);
         let disposition = lower_disposition(&r.fault_disp);
         let deadline_ns = r.within.as_ref().map(|d| d.to_ns());
-        Some(SirReaction { id, trigger, body, priority, disposition, yields, deadline_ns })
+        let overflow = match r.overflow {
+            Some(OverflowPolicy::DropNewest) => SirOverflow::DropNewest,
+            Some(OverflowPolicy::Fault) => SirOverflow::Fault,
+            _ => SirOverflow::Coalesce, // default (§5.1/D02)
+        };
+        Some(SirReaction { id, trigger, body, priority, disposition, yields, deadline_ns, overflow })
     }
 
     /// §4.1/D07 — validate a device's typestate declarations: every op `when S`

@@ -455,7 +455,26 @@ impl CBackend {
         // while a prior activation is still in flight (§5.1), as the sim does.
         self.line(&format!("void {}(void) {{", fn_name));
         self.indent += 1;
-        self.line(&format!("if ({}.__state != 0U) return; /* coalesce: still in flight (§5.1) */", frame));
+        // §5.1/D02 overflow policy when a re-fire arrives still-in-flight.  With a
+        // single pending slot and no event payload, coalesce and drop-newest both
+        // drop the re-fire; `fault` drives the system to its safe state.
+        match reaction.overflow {
+            SirOverflow::Coalesce => {
+                self.line(&format!("if ({}.__state != 0U) return; /* coalesce: still in flight (§5.1) */", frame));
+            }
+            SirOverflow::DropNewest => {
+                self.line(&format!("if ({}.__state != 0U) return; /* drop-newest: still in flight (§5.1/D02) */", frame));
+            }
+            SirOverflow::Fault => {
+                self.line(&format!("if ({}.__state != 0U) {{ /* fault: event overflow (§5.1/D02) */", frame));
+                self.indent += 1;
+                self.line("__asm__ volatile(\"cpsid i\" ::: \"memory\");");
+                self.line("__drive_safe();");
+                self.line("for (;;) { __asm__ volatile(\"wfi\"); }");
+                self.indent -= 1;
+                self.line("}");
+            }
+        }
         self.line(&format!("__react_{}_run();", n));
         self.indent -= 1;
         self.line("}");
@@ -638,7 +657,13 @@ impl CBackend {
             .arith_combos
             .iter()
             .any(|(_, m, _, _)| *m == OverflowMode::Trap);
-        if module.safe_seqs.is_empty() && !has_safe_disp && !has_arith_trap {
+        // A `fault` overflow policy (§5.1/D02) also drives the safe state on a
+        // re-fire-while-in-flight, so the function must exist for it too.
+        let has_overflow_fault = module
+            .reactions
+            .iter()
+            .any(|r| r.overflow == SirOverflow::Fault);
+        if module.safe_seqs.is_empty() && !has_safe_disp && !has_arith_trap && !has_overflow_fault {
             return;
         }
         self.line("/* Safe-state drive (§5.6): bounded, non-yielding register writes. */");
@@ -1950,6 +1975,7 @@ mod tests {
                 disposition: SirDisposition::Escalate,
                 yields: false,
                 deadline_ns: None,
+                overflow: SirOverflow::Coalesce,
             }],
             ..Default::default()
         };
@@ -1971,6 +1997,7 @@ mod tests {
                 disposition: SirDisposition::Escalate,
                 yields: false,
                 deadline_ns: None,
+                overflow: SirOverflow::Coalesce,
             }],
             ..Default::default()
         };

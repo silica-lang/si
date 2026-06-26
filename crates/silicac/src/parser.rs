@@ -247,23 +247,46 @@ impl Parser {
             None
         };
 
-        // Optional `on fault <disp>` clause.
-        let fault_disp = if self.peek() == Some(&Token::KwOn) {
-            // peek ahead for `fault`
-            if self.peek2() == Some(&Token::KwFault) {
-                self.advance(); // eat `on`
-                self.advance(); // eat `fault`
-                Some(self.parse_fault_disp()?)
-            } else {
-                None
+        // Optional `on overflow <policy>` (§5.1) and `on fault <disp>` clauses,
+        // in any order (both begin with `on`).
+        let mut overflow = None;
+        let mut fault_disp = None;
+        while self.peek() == Some(&Token::KwOn) {
+            match self.peek2() {
+                Some(Token::KwFault) => {
+                    self.advance(); // `on`
+                    self.advance(); // `fault`
+                    fault_disp = Some(self.parse_fault_disp()?);
+                }
+                Some(Token::Ident(s)) if s == "overflow" => {
+                    self.advance(); // `on`
+                    self.advance(); // `overflow`
+                    overflow = Some(self.parse_overflow_policy()?);
+                }
+                _ => break,
             }
-        } else {
-            None
-        };
+        }
 
         let body = self.parse_block()?;
         let end = self.prev_span().end;
-        Ok(Reaction { trigger, within, fault_disp, body, span: Span::new(start, end) })
+        Ok(Reaction { trigger, within, overflow, fault_disp, body, span: Span::new(start, end) })
+    }
+
+    /// `coalesce` | `drop_newest` | `fault` (§5.1/D02).
+    fn parse_overflow_policy(&mut self) -> Result<OverflowPolicy, ParseError> {
+        let policy = match self.peek() {
+            Some(Token::Ident(s)) if s == "coalesce" => OverflowPolicy::Coalesce,
+            Some(Token::Ident(s)) if s == "drop_newest" => OverflowPolicy::DropNewest,
+            Some(Token::KwFault) => OverflowPolicy::Fault,
+            other => {
+                return Err(ParseError {
+                    span: self.current_span(),
+                    msg: format!("expected overflow policy (coalesce/drop_newest/fault), got {:?}", other),
+                })
+            }
+        };
+        self.advance();
+        Ok(policy)
     }
 
     /// Parse `<ident>.<ident>` (or deeper) as an event reference.

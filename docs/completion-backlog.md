@@ -151,7 +151,16 @@ pick the spec-consistent default and note it in the PR.
       ELF compiles, metal_vs_sim gate still PASS. NOTE: runtime-precondition lowering (unprovable
       cases → Layer-3 fault) + the Layer-3 site-map debug info are follow-ups; op transitions read
       from the op's own top-level `become` (not nested sub-op inlining).
-- [ ] E3 Bus arbitration / queues / scheduler overflow policy (§3.5/D06, §5.1/D02) `[metal]`
+- [x] E3 Scheduler overflow policy (§5.1/D02) `[metal]` — PR #29. `every/on … on overflow
+      <coalesce|drop_newest|fault>` clause (Reaction.overflow → SirReaction.overflow, default
+      Coalesce). On a re-fire-while-in-flight the sim's fire() applies it: coalesce collapses,
+      drop_newest discards (distinct EventOverflow trace), fault → drive_safe + stop. Metal
+      yielding-reaction trigger entry branches the same (coalesce/drop → return; fault →
+      __drive_safe()+halt; __drive_safe emission extended for fault policy). examples/overflow_policy.si
+      (1µs every vs 2µs bus → overflow) + tests/overflow_policy.rs (5). bus_parity gate PASS;
+      ms-scale fault-policy program compiles+links to metal ELF (sub-µs every is sim-only — metal
+      SysTick base is 1ms). NOTE: pending capacity >1 and per-event-source (vs per-reaction)
+      declaration deferred; multi-consumer bus arbitration / bounded per-bus wait queue not built.
 - [x] E4 `reaction … within <d>` deadline → watchdog starve (§4.5/§5.6) — PR #18. Parse
       `every/on … within <d>`, lower to SirReaction.deadline_ns. Sim: arm a per-activation
       deadline event on fire (generation-guarded); overrun while still in-flight →

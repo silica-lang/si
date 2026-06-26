@@ -107,6 +107,17 @@ pub struct SirReaction {
     /// to idle within this of firing, else it overruns and the watchdog resets.
     /// `None` = no declared deadline.
     pub deadline_ns: Option<u64>,
+    /// Event-source overflow policy (§5.1/D02): what a re-fire does while an
+    /// activation is in flight.  Default `Coalesce`.
+    pub overflow: SirOverflow,
+}
+
+/// Event-source overflow policy (§5.1/D02).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SirOverflow {
+    Coalesce,
+    DropNewest,
+    Fault,
 }
 
 /// Reaction-boundary fault disposition (§4.4): what happens when a fault
