@@ -1,0 +1,6 @@
+User-agent: *
+Allow: /
+
+# LLM-friendly indexes (https://llmstxt.org/)
+# Curated index:   https://silica-lang.github.io/si/llms.txt
+# Full docs (one file): https://silica-lang.github.io/si/llms-full.txt

@@ -1,0 +1,46 @@
+# Silica
+
+> An experimental, embedded-native and agentic-native programming language (`.si`). Silica builds its semantics from hardware concepts — devices, registers, interrupts, time, capabilities — rather than C/UNIX vocabulary, on the wager that the language an AI agent most wants to author is the same one a compiler most wants to analyze and a hardware engineer most wants to read.
+
+This file is the LLM-oriented index of the Silica documentation, in the [llms.txt](https://llmstxt.org/) format. Every link points to a self-contained Markdown-rendered page. For the entire documentation as a single file, fetch [llms-full.txt](https://silica-lang.github.io/si/llms-full.txt).
+
+## Getting Started
+- [Introduction](https://silica-lang.github.io/si/intro.html): vision, the two-goals-converge thesis, and what works today
+- [Installation & Build](https://silica-lang.github.io/si/getting-started/install.html): Rust toolchain, build/run/test commands, and the `silicac` CLI
+- [Your First Program](https://silica-lang.github.io/si/getting-started/first-program.html): the canonical blink + button program, explained
+
+## Language Guide
+- [Syntax & Grammar](https://silica-lang.github.io/si/language/syntax.html): the machine-friendly grammar and its design constraints
+- [Programs, Boards, SoCs & Devices](https://silica-lang.github.io/si/language/structure.html): the top-level declarations and how they wire together
+- [The Reactive Model](https://silica-lang.github.io/si/language/reactive.html): `every <duration>` and `on <event>` reactions
+- [Composed Devices on a Bus](https://silica-lang.github.io/si/language/composition.html): building higher-level devices over i2c/spi
+- [Typed Overlays](https://silica-lang.github.io/si/language/overlays.html): typed configuration patches
+
+## Type System
+- [Devices, Interfaces & Capabilities](https://silica-lang.github.io/si/types/devices.html): devices as types, interface contracts, unforgeable capabilities
+- [Registers & Bit-fields](https://silica-lang.github.io/si/types/registers.html): typed register access ({offset, mask, shift, access}), not raw pointers
+- [The Number / Data Model](https://silica-lang.github.io/si/types/numbers.html): fixed-width integers, casts, overflow policy, floats
+- [Faults & Fallibility](https://silica-lang.github.io/si/types/faults.html): typed fallibility and fault propagation
+- [Time as a Type](https://silica-lang.github.io/si/types/time.html): instants vs durations, `now()`, duration literals
+- [Literals & Compile-time Evaluation](https://silica-lang.github.io/si/types/literals.html): typed literals and const evaluation
+
+## Execution Model
+- [Reactive Scheduling](https://silica-lang.github.io/si/execution/scheduling.html): how reactions are scheduled and prioritized
+- [Run-to-completion & Suspension](https://silica-lang.github.io/si/execution/suspension.html): run-to-completion between yields, `await`/`poll … within … else fault`
+- [Memory & Allocation](https://silica-lang.github.io/si/execution/memory.html): static RAM budget, bounded types, recursion ban, worst-case stack
+- [The Three-Layer Fault Model](https://silica-lang.github.io/si/execution/faults.html): address-ownership decoding from sim to metal HardFault
+- [Atomicity & Interrupt-safety](https://silica-lang.github.io/si/execution/atomicity.html): compiler-computed priority-ceiling critical sections, `atomic { }`
+- [Safe State](https://silica-lang.github.io/si/execution/safe-state.html): declared safe states and watchdog interplay
+
+## Tooling
+- [The Deterministic Simulator](https://silica-lang.github.io/si/tooling/simulator.html): a reproducible host simulator with event/fault injection
+- [Targets & Codegen](https://silica-lang.github.io/si/tooling/targets.html): the SIR boundary, the C backend, and the nRF52840 metal target
+
+## Reference
+- [Examples Tour](https://silica-lang.github.io/si/examples.html): the 30 example `.si` programs, grouped by topic
+- [Status & Roadmap](https://silica-lang.github.io/si/roadmap.html): phases 0–4 and project scope
+
+## Source
+- [DESIGN.md](https://github.com/silica-lang/si/blob/main/docs/DESIGN.md): the authoritative design document / spec
+- [Examples directory](https://github.com/silica-lang/si/tree/main/examples): the 30 example `.si` programs in the repo
+- [Repository](https://github.com/silica-lang/si): the silicac compiler source
