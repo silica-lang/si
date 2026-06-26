@@ -989,6 +989,7 @@ impl Parser {
         let mut memory = Vec::new();
         let mut clocks = Vec::new();
         let mut irqs = Vec::new();
+        let mut fpu = false;
         while self.peek() != Some(&Token::RBrace) {
             if self.at_end() {
                 return Err(self.error("unexpected EOF in soc body"));
@@ -1018,6 +1019,12 @@ impl Parser {
                     }
                     self.eat(&Token::RBrace)?;
                 }
+                // `fpu` — the SoC declares a hardware FPU (§4.1/§4.3).
+                Some(Token::Ident(s)) if s == "fpu" => {
+                    self.advance();
+                    self.eat_optional_semi();
+                    fpu = true;
+                }
                 other => {
                     return Err(ParseError {
                         span: self.current_span(),
@@ -1028,7 +1035,7 @@ impl Parser {
         }
         let end = self.current_span().end;
         self.eat(&Token::RBrace)?;
-        Ok(SocDef { name, memory, clocks, irqs, span: Span::new(start, end) })
+        Ok(SocDef { name, memory, clocks, irqs, fpu, span: Span::new(start, end) })
     }
 
     /// `<name> : region at <addr> size <size>`

@@ -402,6 +402,9 @@ pub struct SocDef {
     pub memory: Vec<RegionDecl>,
     pub clocks: Vec<ClockDecl>,
     pub irqs: Vec<IrqDecl>,
+    /// Whether the SoC declares a hardware FPU (§4.1/§4.3).  `float` is allowed
+    /// only on a board whose SoC sets this; otherwise it is a compile error.
+    pub fpu: bool,
     pub span: Span,
 }
 

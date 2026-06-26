@@ -440,6 +440,11 @@ pub enum SirType {
     /// `ring<T, N>` — a bounded ring buffer (§5.3): `cap` elements each of
     /// `elem_bytes` bytes, plus head/tail/count indices.  Statically counted.
     Ring { elem_bytes: u8, cap: u32 },
+    /// IEEE-754 single / double (§4.3).  Allowed only on an FPU-bearing SoC
+    /// (§4.1); the resolver rejects them elsewhere.  Runtime float arithmetic is
+    /// a follow-up — these carry the type so the gate is enforceable.
+    F32,
+    F64,
 }
 
 impl SirType {
@@ -459,6 +464,8 @@ impl SirType {
             // Rings are not scalar values; they are emitted as a named struct,
             // never via `c_type` in expression position.
             SirType::Ring { .. } => "struct __ring",
+            SirType::F32 => "float",
+            SirType::F64 => "double",
         }
     }
 
@@ -477,8 +484,8 @@ impl SirType {
         match self {
             SirType::Bool | SirType::U8 | SirType::S8 => 1,
             SirType::U16 | SirType::S16 => 2,
-            SirType::U32 | SirType::S32 | SirType::Bytes => 4,
-            SirType::U64 | SirType::S64 | SirType::Instant | SirType::Duration => 8,
+            SirType::U32 | SirType::S32 | SirType::Bytes | SirType::F32 => 4,
+            SirType::U64 | SirType::S64 | SirType::Instant | SirType::Duration | SirType::F64 => 8,
             // cap elements + head/tail/count (3 × u32).
             SirType::Ring { elem_bytes, cap } => (*cap as u64) * (*elem_bytes as u64) + 12,
         }
