@@ -1458,6 +1458,18 @@ impl Parser {
                 Ok(Stmt::Poll { cond, within, fault_code, span: Span::new(start, self.prev_span().end) })
             }
             Some(Token::KwMatch) => self.parse_match(start),
+            Some(Token::KwAwait) => {
+                self.advance();
+                // Same `<cond> within <d> else fault <code>` shape as `poll`.
+                let cond = self.parse_or()?;
+                self.eat(&Token::KwWithin)?;
+                let within = self.parse_duration()?;
+                self.eat(&Token::KwElse)?;
+                self.eat(&Token::KwFault)?;
+                let fault_code = self.eat_ident()?;
+                self.eat_optional_semi();
+                Ok(Stmt::Await { cond, within, fault_code, span: Span::new(start, self.prev_span().end) })
+            }
             Some(Token::KwBecome) => {
                 self.advance();
                 let state = self.eat_ident()?;

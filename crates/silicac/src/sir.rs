@@ -263,6 +263,13 @@ pub enum SirStmt {
     /// failed transaction.  On the host the check is deterministic (nothing
     /// changes during a non-yielding wait); on metal it is a bounded spin loop.
     Poll { cond: SirExpr, fault_code: String, within_ns: u64 },
+    /// `await <cond> within <d> else fault <code>` (§3.2/§5.2): a bounded
+    /// **suspending** wait.  The handler yields; `cond` is re-checked every
+    /// `recheck_ns` until it holds (resume) or `within_ns` elapses (raise
+    /// `fault_code` → the reaction's Layer-2 disposition).  The sim suspends via
+    /// the event queue (a re-check is a peer of the bus `Resume`); metal lowers it
+    /// to a bounded re-check loop respecting the budget (full suspend is D2-style).
+    Await { cond: SirExpr, fault_code: String, within_ns: u64, recheck_ns: u64 },
     /// A device op call over a substrate (§3.5).  Defined now as the Phase-1
     /// hook for composed devices; the slice lowers GPIO set/get directly to a
     /// register access instead (leaf MMIO, §6.5).

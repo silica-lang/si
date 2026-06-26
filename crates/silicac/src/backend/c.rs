@@ -749,6 +749,35 @@ impl CBackend {
                 }
                 Target::Host => self.line(&format!("/* host: sim services poll `{}` */", fault_code)),
             },
+            SirStmt::Await { cond, fault_code, within_ns, recheck_ns } => match self.target {
+                Target::MetalNrf52840 => {
+                    // §5.2 — a suspending wait.  On metal this is currently lowered
+                    // as a bounded re-check loop respecting `within` (the condition
+                    // can be set by an ISR between checks); a full D2-style
+                    // suspend/resume of the handler frame is a follow-up.
+                    let c = self.emit_expr(cond);
+                    let bound = (*within_ns / (*recheck_ns).max(1)).max(1);
+                    self.line(&format!("{{ /* await `{}` within {}ns: bounded re-check (§5.2) */", fault_code, within_ns));
+                    self.indent += 1;
+                    self.line("uint32_t __waits = 0U;");
+                    self.line(&format!("while (!({})) {{", c));
+                    self.indent += 1;
+                    self.line(&format!("if (++__waits > {}UL) {{ __faulted = 1U; break; }}", bound));
+                    self.line("__asm__ volatile(\"wfi\"); /* yield to ISRs between re-checks */");
+                    self.indent -= 1;
+                    self.line("}");
+                    self.indent -= 1;
+                    self.line("}");
+                    if let Some(disp) = self.current_disposition {
+                        self.line("if (__faulted) {");
+                        self.indent += 1;
+                        self.emit_disposition_terminal(disp);
+                        self.indent -= 1;
+                        self.line("}");
+                    }
+                }
+                Target::Host => self.line(&format!("/* host: sim services await `{}` */", fault_code)),
+            },
             SirStmt::Assign { target, value } => match target {
                 SirPlace::Var(name) => {
                     let val = self.emit_expr(value);
@@ -1713,6 +1742,7 @@ fn collect_arith_stmts(stmts: &[SirStmt], set: &mut HashSet<(SirArithOp, Overflo
             SirStmt::Exit(e) => collect_arith_expr(e, set),
             SirStmt::Critical { body, .. } => collect_arith_stmts(body, set),
             SirStmt::Poll { cond, .. } => collect_arith_expr(cond, set),
+            SirStmt::Await { cond, .. } => collect_arith_expr(cond, set),
             SirStmt::DeviceOp { args, .. } | SirStmt::BusXfer { args, .. } => {
                 args.iter().for_each(|a| collect_arith_expr(a, set));
             }
@@ -1781,6 +1811,7 @@ fn stmts_have_now(stmts: &[SirStmt]) -> bool {
         SirStmt::Exit(e) => expr_has_now(e),
         SirStmt::Critical { body, .. } => stmts_have_now(body),
         SirStmt::Poll { cond, .. } => expr_has_now(cond),
+        SirStmt::Await { cond, .. } => expr_has_now(cond),
         SirStmt::DeviceOp { args, .. } | SirStmt::BusXfer { args, .. } => args.iter().any(expr_has_now),
         SirStmt::RingPush { value, .. } => expr_has_now(value),
         SirStmt::RingPop { .. } => false,
@@ -1809,8 +1840,9 @@ fn module_has_bus_xfer(module: &SirModule) -> bool {
 /// True if any statement in `stmts` (recursively, through `if`/critical bodies)
 /// is a `poll` — i.e. the reaction can fault via a poll timeout (§3.2).
 fn body_has_poll(stmts: &[SirStmt]) -> bool {
+    // `await` shares the bounded-fault wrapper (`__faulted` → disposition).
     stmts.iter().any(|s| match s {
-        SirStmt::Poll { .. } => true,
+        SirStmt::Poll { .. } | SirStmt::Await { .. } => true,
         SirStmt::If { then, .. } => body_has_poll(then),
         SirStmt::Critical { body, .. } => body_has_poll(body),
         _ => false,

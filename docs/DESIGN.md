@@ -218,6 +218,18 @@ Notes that matter:
   sub-microseconds). Its sibling `await <cond> within <d>` *suspends*, and **any op that can reach an
   `await` must be marked `yields`** (§5.2). That is why `write` is not `yields` but `read_temp` (§3.5)
   is — busy-wait vs. suspend is a type-level choice, never hidden.
+
+  > **Status (implemented).** `await <cond> within <d> else fault <code>` parses with the same shape
+  > as `poll` and lowers to `SirStmt::Await`. **Resume model (the chosen default):** on reaching the
+  > `await` the handler *yields* to the scheduler; the condition is re-checked on a cadence (a
+  > fraction of the budget) until it holds — resume the handler — or the `within` budget elapses —
+  > raise `fault` to the reaction's Layer-2 disposition. In the sim this is a true suspension via the
+  > event queue (an `AwaitRecheck` is a peer of the bus `Resume`), so other reactions run meanwhile
+  > and a *different* reaction can make the condition true (modelled + tested). An `await` is a *poll*
+  > of its condition, so it is exempt from the §5.5 auto-critical and is rejected inside an `atomic`
+  > (a critical cannot span a suspension). **Metal:** currently lowered as a bounded re-check loop
+  > (`wfi` between checks) that respects `within` — the condition can be set by an ISR between checks;
+  > a full D2-style suspend/resume of the handler *frame* across the await is the noted follow-up.
 - `op write(...) -> () or fault` is **fallible**: the caller must discharge the fault path or it is
   a compile error (§4.4).
 - `become ready` is the only way to change `when`-state; states are explicit and finite, which is

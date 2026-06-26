@@ -1235,10 +1235,10 @@ impl Resolver {
                 for s in &block.stmts {
                     self.lower_stmt(s, scope, vars, &mut body);
                 }
-                if body_yields(&body) {
+                if body_yields(&body) || body.iter().any(|s| matches!(s, SirStmt::Await { .. })) {
                     self.err(
                         *span,
-                        "an `atomic` block may not contain a yielding op (§5.5: a critical section cannot span a suspension)",
+                        "an `atomic` block may not contain a yielding op or `await` (§5.5: a critical section cannot span a suspension)",
                     );
                 }
                 out.push(SirStmt::Critical { ceiling: 0, body });
@@ -1254,6 +1254,19 @@ impl Resolver {
                     cond,
                     fault_code: fault_code.name.clone(),
                     within_ns: within.to_ns(),
+                });
+            }
+            Stmt::Await { cond, within, fault_code, .. } => {
+                // Suspending bounded wait (§5.2): re-check on a cadence — a small
+                // fraction of the budget — until `cond` holds or it elapses.
+                let cond = self.lower_expr_emit(cond, scope, vars, out);
+                let within_ns = within.to_ns();
+                let recheck_ns = (within_ns / 8).max(1_000); // ≥ 1µs cadence
+                out.push(SirStmt::Await {
+                    cond,
+                    fault_code: fault_code.name.clone(),
+                    within_ns,
+                    recheck_ns,
                 });
             }
             Stmt::Become(_, _) => {} // typestate transition — later
@@ -2401,6 +2414,10 @@ fn stmt_touches_cell(stmt: &SirStmt, cell: &str) -> bool {
         }
         SirStmt::If { cond, then } => expr_touches_cell(cond, cell) || stmts_touch_cell(then, cell),
         SirStmt::Poll { cond, .. } => expr_touches_cell(cond, cell),
+        // An `await` *polls* its condition (it must observe a cell another reaction
+        // changes during the suspension), so it is deliberately NOT a synchronized
+        // cell access — it is never wrapped in the §5.5 auto-critical.
+        SirStmt::Await { .. } => false,
         SirStmt::Critical { body, .. } => stmts_touch_cell(body, cell),
         SirStmt::Exit(e) => expr_touches_cell(e, cell),
         SirStmt::Intrinsic(intr) => match intr {
