@@ -303,6 +303,28 @@ pub fn run(module: &SirModule) -> SimResult {
     SimResult { trace: sim.trace, stdout: sim.stdout }
 }
 
+/// Collect `(device, reg_offset)` for every read-to-clear (`rc`) register read
+/// in `expr` (§4.2/D04, P0-2b).
+fn collect_rc_reads(expr: &SirExpr, out: &mut Vec<(usize, u64)>) {
+    match expr {
+        SirExpr::RegLoad { device, reg_offset, access, .. } => {
+            if matches!(access, SirRegAccess::Rc) {
+                out.push((*device, *reg_offset));
+            }
+        }
+        SirExpr::Not(inner) | SirExpr::Cast { inner, .. } => collect_rc_reads(inner, out),
+        SirExpr::BinOp(_, l, r) => {
+            collect_rc_reads(l, out);
+            collect_rc_reads(r, out);
+        }
+        SirExpr::Arith { lhs, rhs, .. } => {
+            collect_rc_reads(lhs, out);
+            collect_rc_reads(rhs, out);
+        }
+        _ => {}
+    }
+}
+
 impl<'m> Sim<'m> {
     fn run(&mut self) {
         // Initialise register arrays from declared reset values (§4.2).
@@ -745,6 +767,9 @@ impl<'m> Sim<'m> {
             SirStmt::Intrinsic(intr) => self.eval_intrinsic(intr),
             SirStmt::Assign { target, value } => {
                 let v = self.eval_expr(value, frame);
+                // Read-to-clear (§4.2/D04, P0-2b): a read of an `rc` register has
+                // a side effect — zero it after the value is captured.
+                self.apply_read_clears(value);
                 match target {
                     SirPlace::Var(name) => {
                         // Module-level vars (cells) are shared/global and traced;
@@ -889,6 +914,20 @@ impl<'m> Sim<'m> {
             at_ns: self.now,
             kind: TraceKind::RegWrite { device, offset, bit, value: bitval },
         });
+    }
+
+    /// Model read-to-clear (`rc`) reads (§4.2/D04, P0-2b): after an expression
+    /// is evaluated, zero any register read with `rc` access.  Only reads in
+    /// assignment-RHS position are modelled today; reads buried in conditions
+    /// are a documented follow-up.
+    fn apply_read_clears(&mut self, expr: &SirExpr) {
+        let mut hits = Vec::new();
+        collect_rc_reads(expr, &mut hits);
+        for (device, offset) in hits {
+            if let Some(m) = self.regs.get_mut(&device) {
+                m.insert(offset, 0);
+            }
+        }
     }
 
     fn eval_expr(&self, expr: &SirExpr, frame: &HashMap<String, u64>) -> u64 {

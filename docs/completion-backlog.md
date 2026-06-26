@@ -230,10 +230,18 @@ Each item is its own branch (`feat/p0-<id>`) + PR behind the hard gate.
       examples/stack_over_budget_nrf52840.si + harness/stack_budget.sh (healthy reports measured;
       oversized rejected, no ELF) + enforce unit/integration tests. metal_vs_sim Renode gate PASS.
       Completes Finding 1. NOTE: frame-union optimisation not yet applied (only shrinks the budget).
-- [ ] P0-2a Thread per-field access resolver→SIR→backend (`RegInfo.fields` carries access; field
-      access falls back to register access); reject `Ro` writes / `Wo` reads.
-- [ ] P0-2b `rc`/`pop_on_read` as tracked read-effects — capture the swallowed modifiers; forbid
-      implicit RMW of a read-side-effect register; model `rc` read-clear in the sim. `[metal]`
+- [x] P0-2a Thread per-field access resolver→SIR→backend — PR #39. `RegInfo.fields` now carries
+      `(mask, shift, access)` (field qualifier, else register's); `reg_place`/`reg_load` take an
+      explicit access; reads/writes reject `ro` writes and `wo` reads (compile errors). Effect: a
+      `w1c` field in an `rw` register lowers to a single masked write (not a sibling-clobbering RMW).
+      tests/reg_access.rs (4 negative + a w1c-vs-rw codegen contrast). metal_vs_sim Renode sanity PASS.
+- [x] P0-2b `rc`/`pop_on_read` as tracked read-effects — PR #40. Parser captures the previously-
+      swallowed `pop_on_read`/`side_effect` → `RegDecl.read_side_effect`; `RegInfo.read_side_effect`
+      (rc / modifier / any rc field). A field write that RMWs such a register is a compile error
+      (write the whole register, use w1c, or `.raw`); w1c/wo field writes still allowed. Sim models
+      `rc` read-to-clear at assignment sites. tests/reg_access.rs (rc/pop_on_read rejected; w1c-on-
+      pop_on_read allowed; sim read-clear 5→0). metal_vs_sim Renode gate PASS. NOTE: rc read-clear in
+      conditions (not assignment RHS) and `reserved`/`width=` enforcement deferred.
 - [ ] P0-2c Multi-field single write `REG{a=1, b=1}` — lexer/parser/AST + `SirStmt::RegWrite` with
       multiple `(mask,shift,value)`; backend emits one combined masked write (not N RMWs). `[metal]`
 - [ ] P0-3a `fixed<I,F>` type + casts + add/sub — `SirType::Fixed`, map `TypeKind::Fixed`, number
