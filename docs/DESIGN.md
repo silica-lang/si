@@ -608,9 +608,13 @@ fixed-width volatile pointers (§6.2, D09).
 > are now load-bearing: a register read with a side effect (`rc` access, the `pop_on_read`/`side_effect`
 > modifier — now captured rather than swallowed — or any `rc` field) makes a partial *field* write a
 > **compile error** (the implicit read-modify-write would disturb it) — write the whole register, use a
-> `w1c` field, or `.raw`. The sim models `rc` read-to-clear at assignment sites. **Remaining:** P0-2c
-> adds the multi-field single write `CR1{a=1, b=1}`; `rc` read-clear for reads buried in conditions
-> (not assignment RHS), and `reserved`/`width=` enforcement, are still deferred.
+> `w1c` field, or `.raw`. The sim models `rc` read-to-clear at assignment sites. **Multi-field single
+> write (audit #35 P0-2c).** `REG{ a = .., b = .. }` updates several fields of one register in **one**
+> store (`Stmt::RegWrite` → `SirStmt::RegWrite`): a single masked write when every field is w1c/wo,
+> else one read-modify-write over the *union* mask — never one RMW per field. Direction (`ro`),
+> duplicate-field, unknown-field, and read-side-effect-RMW errors all apply. **Finding 2 complete.**
+> **Remaining (deferred):** `rc` read-clear for reads buried in conditions (not assignment RHS), and
+> `reserved`/`width=` enforcement.
 
 ### 4.3 The number / data model
 

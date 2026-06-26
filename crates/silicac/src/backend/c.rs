@@ -802,6 +802,19 @@ impl CBackend {
                     }
                 }
             },
+            SirStmt::RegWrite { device, reg_offset, width, writes } => match self.target {
+                Target::MetalNrf52840 => {
+                    for l in self.emit_mmio_store_multi(*device, *reg_offset, *width, writes) {
+                        self.line(&l);
+                    }
+                }
+                Target::Host => {
+                    self.line(&format!(
+                        "/* host: no MMIO; sim services device {} reg 0x{:x} (multi-field) */",
+                        device, reg_offset
+                    ));
+                }
+            },
             SirStmt::RingPush { ring, value } => {
                 let v = self.emit_expr(value);
                 let cap = self.ring_info.get(ring).map(|(_, c)| *c).unwrap_or(1).max(1);
@@ -1062,6 +1075,67 @@ impl CBackend {
                 out.push("    *__p = __v;".into());
                 out.push("    __DMB();".into());
             }
+        }
+        out.push("}".into());
+        out
+    }
+
+    /// Lower a `SirStmt::RegWrite` (multi-field) to ONE ordered volatile store
+    /// (§4.2/§6.2, audit #35 P0-2c).  All fields are OR-combined; if none needs a
+    /// read (every field is w1c/wo) it is a single masked write, else a single
+    /// read-modify-write over the union mask — never one RMW per field.
+    fn emit_mmio_store_multi(
+        &self,
+        device: usize,
+        offset: u64,
+        width: u8,
+        writes: &[(u64, u8, SirRegAccess, SirExpr)],
+    ) -> Vec<String> {
+        let Some(&base) = self.device_bases.get(&device) else {
+            return vec![format!(
+                "#error \"device {} has no MMIO base address (instance needs `at <addr>`)\"",
+                device
+            )];
+        };
+        let cty = match width {
+            8 => "uint8_t",
+            16 => "uint16_t",
+            32 => "uint32_t",
+            _ => return vec![format!("#error \"unsupported register width {} (expected 8/16/32)\"", width)],
+        };
+        let addr = base + offset;
+        // OR the fields into one value; union of the touched masks.
+        let mut union_mask = 0u64;
+        let mut terms = Vec::new();
+        for (mask, shift, _access, value) in writes {
+            union_mask |= *mask;
+            let v = self.emit_expr(value);
+            terms.push(format!("(((uint32_t)({}) << {}) & 0x{:x}UL)", v, shift, mask));
+        }
+        let combined = terms.join(" | ");
+        // No read needed only when every field is a single-write kind (w1c/wo).
+        let single_write = writes
+            .iter()
+            .all(|(_, _, a, _)| matches!(a, SirRegAccess::W1c | SirRegAccess::Wo));
+
+        let mut out = vec![format!(
+            "{{ /* MMIO multi-field store: device {} reg 0x{:x} ({}-bit, {} fields, §4.2 ordered) */",
+            device, offset, width, writes.len()
+        )];
+        out.push(format!("    volatile {ct} *__p = (volatile {ct} *)0x{:08x}UL;", addr, ct = cty));
+        if single_write {
+            out.push("    __DMB();".into());
+            out.push(format!("    *__p = ({ct})({combined});", ct = cty, combined = combined));
+            out.push("    __DMB();".into());
+        } else {
+            out.push(format!("    {ct} __v = *__p;", ct = cty));
+            out.push(format!(
+                "    __v = ({ct})(((uint32_t)__v & ~0x{:x}UL) | ({combined}));",
+                union_mask, ct = cty, combined = combined
+            ));
+            out.push("    __DMB();".into());
+            out.push("    *__p = __v;".into());
+            out.push("    __DMB();".into());
         }
         out.push("}".into());
         out
@@ -1735,6 +1809,9 @@ fn collect_arith_stmts(stmts: &[SirStmt], set: &mut HashSet<(SirArithOp, Overflo
     for s in stmts {
         match s {
             SirStmt::Assign { value, .. } => collect_arith_expr(value, set),
+            SirStmt::RegWrite { writes, .. } => {
+                writes.iter().for_each(|(_, _, _, v)| collect_arith_expr(v, set));
+            }
             SirStmt::If { cond, then } => {
                 collect_arith_expr(cond, set);
                 collect_arith_stmts(then, set);
@@ -1807,6 +1884,7 @@ fn module_uses_now(module: &SirModule) -> bool {
 fn stmts_have_now(stmts: &[SirStmt]) -> bool {
     stmts.iter().any(|s| match s {
         SirStmt::Assign { value, .. } => expr_has_now(value),
+        SirStmt::RegWrite { writes, .. } => writes.iter().any(|(_, _, _, v)| expr_has_now(v)),
         SirStmt::If { cond, then } => expr_has_now(cond) || stmts_have_now(then),
         SirStmt::Exit(e) => expr_has_now(e),
         SirStmt::Critical { body, .. } => stmts_have_now(body),

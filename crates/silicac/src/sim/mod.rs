@@ -789,6 +789,14 @@ impl<'m> Sim<'m> {
                     }
                 }
             }
+            SirStmt::RegWrite { device, reg_offset, writes, .. } => {
+                // Multi-field single write (§4.2 P0-2c): apply each field to the
+                // mock register; the net state matches the backend's one store.
+                for (mask, shift, access, value) in writes {
+                    let v = self.eval_expr(value, frame);
+                    self.write_reg(*device, *reg_offset, *mask, *shift, *access, v);
+                }
+            }
             SirStmt::RingPush { ring, value } => {
                 let v = self.eval_expr(value, frame);
                 if let Some((q, cap)) = self.rings.get_mut(ring) {

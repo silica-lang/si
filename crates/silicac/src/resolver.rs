@@ -1306,7 +1306,74 @@ impl Resolver {
             Stmt::Match { scrutinee, arms, span } => {
                 self.lower_match(scrutinee, arms, *span, scope, vars, out);
             }
+            Stmt::RegWrite { reg, writes, span } => {
+                self.lower_reg_write(reg, writes, *span, scope, vars, out);
+            }
         }
+    }
+
+    /// Lower `REG{ a = .., b = .. }` to a single `SirStmt::RegWrite` (§4.2 P0-2c).
+    fn lower_reg_write(
+        &mut self,
+        reg: &Ident,
+        writes: &[(Ident, Expr)],
+        span: Span,
+        scope: &mut Scope,
+        vars: &[SirVar],
+        out: &mut Vec<SirStmt>,
+    ) {
+        let Some(Binding::Reg(ri)) = scope.lookup(&reg.name) else {
+            self.err(reg.span, format!("'{}' is not a register", reg.name));
+            return;
+        };
+        let (device, reg_offset, width, read_side_effect) =
+            (ri.device, ri.offset, ri.width, ri.read_side_effect);
+        // Resolve each field to (mask, shift, access) up front (immutable borrow
+        // of scope) so we can then lower the value exprs (which need &mut self).
+        let mut resolved = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut needs_rmw = false;
+        for (field, _) in writes {
+            match ri.fields.get(&field.name) {
+                Some(&(mask, shift, access)) => {
+                    if !seen.insert(field.name.clone()) {
+                        self.err(field.span, format!("field '{}' written more than once in one `{}{{…}}`", field.name, reg.name));
+                    }
+                    if matches!(access, SirRegAccess::Ro) {
+                        self.err(field.span, format!("cannot write read-only field '{}.{}' (§4.2)", reg.name, field.name));
+                    }
+                    if !matches!(access, SirRegAccess::W1c | SirRegAccess::Wo) {
+                        needs_rmw = true;
+                    }
+                    resolved.push((mask, shift, access));
+                }
+                None => {
+                    self.err(field.span, format!("register '{}' has no field '{}'", reg.name, field.name));
+                    resolved.push((0, 0, SirRegAccess::Rw));
+                }
+            }
+        }
+        // A combined write that still needs a read (any non-w1c/wo field) must
+        // not RMW a register whose read has a side effect (§4.2/D04, P0-2b).
+        if needs_rmw && read_side_effect {
+            self.err(span, format!(
+                "register '{}' has a read-side-effect (rc/pop_on_read); a multi-field write that needs a read-modify-write would disturb it — write only w1c/wo fields, or the whole register, or `.raw` (§4.2)",
+                reg.name
+            ));
+        }
+        // Lower the value exprs at the register width.
+        let saved = (self.arith_width, self.arith_signed);
+        (self.arith_width, self.arith_signed) = (width, false);
+        let sir_writes = writes
+            .iter()
+            .zip(resolved)
+            .map(|((_, value), (mask, shift, access))| {
+                let v = self.lower_expr_emit(value, scope, vars, out);
+                (mask, shift, access, v)
+            })
+            .collect();
+        (self.arith_width, self.arith_signed) = saved;
+        out.push(SirStmt::RegWrite { device, reg_offset, width, writes: sir_writes });
     }
 
     /// Lower `match <scrut> { <pat> => <body>, … }` (§4.4/D14) to a guarded
@@ -2457,6 +2524,9 @@ fn stmt_touches_cell(stmt: &SirStmt, cell: &str) -> bool {
         SirStmt::Assign { target, value } => {
             place_touches_cell(target, cell) || expr_touches_cell(value, cell)
         }
+        // A register multi-field write touches a cell only via its value exprs
+        // (the target is MMIO, not a cell).
+        SirStmt::RegWrite { writes, .. } => writes.iter().any(|(_, _, _, v)| expr_touches_cell(v, cell)),
         SirStmt::If { cond, then } => expr_touches_cell(cond, cell) || stmts_touch_cell(then, cell),
         SirStmt::Poll { cond, .. } => expr_touches_cell(cond, cell),
         // An `await` *polls* its condition (it must observe a cell another reaction

@@ -243,6 +243,17 @@ pub enum SirStmt {
     Intrinsic(SirIntrinsic),
     /// Assign `target = value`.
     Assign { target: SirPlace, value: SirExpr },
+    /// `REG{ a = .., b = .. }` — a multi-field single write to one register
+    /// (§4.2, audit #35 P0-2c): the backend combines all fields into ONE store
+    /// (a single masked write when no field needs a read, else one RMW over the
+    /// union mask) instead of a separate read-modify-write per field.
+    RegWrite {
+        device: usize,
+        reg_offset: u64,
+        width: u8,
+        /// (field_mask, field_shift, access, value) per field, in source order.
+        writes: Vec<(u64, u8, SirRegAccess, SirExpr)>,
+    },
     /// `ring.push(v)` (§5.3): enqueue `value`; on a full ring the oldest element
     /// is overwritten (a defined, bounded overflow policy).
     RingPush { ring: String, value: SirExpr },

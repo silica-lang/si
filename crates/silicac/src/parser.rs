@@ -1497,11 +1497,40 @@ impl Parser {
                 self.eat_optional_semi();
                 Ok(Stmt::Exit(code, Span::new(start, self.prev_span().end)))
             }
+            // `REG{ field = expr, … }` — a multi-field single write (§4.2 P0-2c).
+            // Distinguished from `REG.field = …` / `dev.op()` by the `{` directly
+            // after a bare identifier.
+            Some(Token::Ident(_)) if self.peek2() == Some(&Token::LBrace) => self.parse_reg_write(start),
             _ => {
                 let expr = self.parse_expr_stmt()?;
                 Ok(Stmt::Expr(expr))
             }
         }
+    }
+
+    /// `REG{ field = expr, field = expr, … }` (§4.2 P0-2c).
+    fn parse_reg_write(&mut self, start: usize) -> Result<Stmt, ParseError> {
+        let reg = self.eat_ident()?;
+        self.eat(&Token::LBrace)?;
+        let mut writes = Vec::new();
+        while self.peek() != Some(&Token::RBrace) {
+            if self.at_end() {
+                return Err(self.error("unexpected EOF in register multi-field write"));
+            }
+            let field = self.eat_ident()?;
+            self.eat(&Token::Eq)?;
+            let value = self.parse_expr()?;
+            writes.push((field, value));
+            if self.peek() == Some(&Token::Comma) {
+                self.advance();
+            }
+        }
+        self.eat(&Token::RBrace)?;
+        self.eat_optional_semi();
+        if writes.is_empty() {
+            return Err(self.error("a register multi-field write needs at least one `field = value`"));
+        }
+        Ok(Stmt::RegWrite { reg, writes, span: Span::new(start, self.prev_span().end) })
     }
 
     /// `match <expr> { <pat> => <body>, … }`.  A `<body>` is a block or a single
