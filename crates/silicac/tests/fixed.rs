@@ -80,6 +80,45 @@ fn mixing_different_fixed_scales_is_an_error() {
 }
 
 #[test]
+fn fixed_multiply_rescales() {
+    // 2.0 * 3.0 = 6.0 in Q16.16 — the helper multiplies in a wider intermediate
+    // then shifts the binary point back by 16.
+    let src = program(
+        "  cell n : u32 = 0\n  on sys.start { let a = 2 as fixed<16,16>  let b2 = 3 as fixed<16,16>  let c = a * b2  n = c as u32 }",
+    );
+    let t = sim::run(&compile(&src)).render(&compile(&src));
+    assert!(t.contains("cell n = 6"), "2*3 = 6:\n{t}");
+}
+
+#[test]
+fn fixed_divide_keeps_fractional_precision() {
+    // (7 / 2) * 2 = 7 — the 0.5 survives because div keeps 16 fractional bits.
+    let src = program(
+        "  cell n : u32 = 0\n  on sys.start { let a = 7 as fixed<16,16>  let two = 2 as fixed<16,16>  let half = a / two  let back = half * two  n = back as u32 }",
+    );
+    let t = sim::run(&compile(&src)).render(&compile(&src));
+    assert!(t.contains("cell n = 7"), "(7/2)*2 = 7 — fractional precision kept:\n{t}");
+}
+
+#[test]
+fn fixed_multiply_overflow_traps() {
+    // 200.0 * 200.0 = 40000.0 overflows Q16.16 (int32 holds ≈ ±32767.99) → trap.
+    let src = program(
+        "  cell n : u32 = 0\n  on sys.start { let a = 200 as fixed<16,16>  let b2 = 200 as fixed<16,16>  let c = a * b2  n = c as u32 }",
+    );
+    let t = sim::run(&compile(&src)).render(&compile(&src));
+    assert!(t.contains("OVERFLOW TRAP"), "fixed mul overflow traps to safe-state:\n{t}");
+}
+
+#[test]
+fn fixed_mul_metal_emits_a_rescaling_helper() {
+    let src = program("  cell q : fixed<16,16> = 0\n  on sys.start { let a = 3 as fixed<16,16>  q = a * a }");
+    let out = c::CBackend::with_target(Target::MetalNrf52840).emit(&compile(&src));
+    assert!(out.contains("__si_fixmul_trap_s32_f16"), "fixed mul helper emitted:\n{out}");
+    assert!(out.contains(">> 16"), "helper rescales by the frac bits:\n{out}");
+}
+
+#[test]
 fn assigning_an_integer_to_a_fixed_binding_needs_a_cast() {
     let errs = resolve_err(&program(
         "  cell q : fixed<16,16> = 0\n  on sys.start { let i : u32 = 5  q = i }",

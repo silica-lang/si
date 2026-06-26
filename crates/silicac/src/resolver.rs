@@ -1185,6 +1185,37 @@ impl Resolver {
     /// Build a binary-op SIR node.  Arithmetic ops (Add/Sub/Mul + their
     /// wrapping/saturating forms) become a width-checked [`SirExpr::Arith`] using
     /// the current target-type context; everything else stays an untyped `BinOp`.
+    /// Like `make_binop`, but routes fixed-point `*` / `/` (whose operands are
+    /// `fixed<I,F>`) to a rescaling `FixedArith` node (§4.3 P0-3c).  Add/sub on
+    /// fixed stay raw integer arithmetic at the storage width.
+    fn make_binop_typed(&self, op: BinOp, l: SirExpr, r: SirExpr, lhs: &Expr, rhs: &Expr, scope: &Scope) -> SirExpr {
+        let fixed = match (self.expr_sirtype(lhs, scope), self.expr_sirtype(rhs, scope)) {
+            (SirType::Fixed { int_bits, frac_bits, signed }, _)
+            | (_, SirType::Fixed { int_bits, frac_bits, signed }) => Some((int_bits, frac_bits, signed)),
+            _ => None,
+        };
+        if let Some((int_bits, frac_bits, signed)) = fixed {
+            let width = SirType::fixed_storage_bits(int_bits, frac_bits) as u8;
+            let mul = |mode| SirExpr::FixedArith {
+                op: FixedArithOp::Mul, mode, frac_bits, width, signed,
+                lhs: Box::new(l.clone()), rhs: Box::new(r.clone()),
+            };
+            match op {
+                BinOp::Mul => return mul(OverflowMode::Trap),
+                BinOp::MulWrap => return mul(OverflowMode::Wrap),
+                BinOp::MulSat => return mul(OverflowMode::Saturate),
+                BinOp::Div => {
+                    return SirExpr::FixedArith {
+                        op: FixedArithOp::Div, mode: OverflowMode::Trap, frac_bits, width, signed,
+                        lhs: Box::new(l), rhs: Box::new(r),
+                    }
+                }
+                _ => {} // add/sub/rem/compare → raw path below
+            }
+        }
+        self.make_binop(op, l, r)
+    }
+
     fn make_binop(&self, op: BinOp, l: SirExpr, r: SirExpr) -> SirExpr {
         if let Some((aop, mode)) = arith_mode(op) {
             SirExpr::Arith {
@@ -1844,7 +1875,7 @@ impl Resolver {
             ExprKind::BinOp { op, lhs, rhs } => {
                 let l = self.lower_expr_emit(lhs, scope, vars, out);
                 let r = self.lower_expr_emit(rhs, scope, vars, out);
-                self.make_binop(*op, l, r)
+                self.make_binop_typed(*op, l, r, lhs, rhs, scope)
             }
             ExprKind::Not(inner) => SirExpr::Not(Box::new(self.lower_expr_emit(inner, scope, vars, out))),
             ExprKind::Cast(inner, ty) => {
@@ -2207,7 +2238,7 @@ impl Resolver {
             ExprKind::BinOp { op, lhs, rhs } => {
                 let l = self.lower_expr(lhs, scope);
                 let r = self.lower_expr(rhs, scope);
-                self.make_binop(*op, l, r)
+                self.make_binop_typed(*op, l, r, lhs, rhs, scope)
             }
             ExprKind::Assign(_lhs, rhs) => self.lower_expr(rhs, scope),
             ExprKind::CompoundAssign(_, _, rhs) => self.lower_expr(rhs, scope),
@@ -2652,6 +2683,7 @@ fn expr_touches_cell(expr: &SirExpr, cell: &str) -> bool {
         SirExpr::Load(n) => n == cell,
         SirExpr::Not(inner) => expr_touches_cell(inner, cell),
         SirExpr::Cast { inner, .. } | SirExpr::FixedCast { inner, .. } => expr_touches_cell(inner, cell),
+        SirExpr::FixedArith { lhs, rhs, .. } => expr_touches_cell(lhs, cell) || expr_touches_cell(rhs, cell),
         SirExpr::BinOp(_, l, r) => expr_touches_cell(l, cell) || expr_touches_cell(r, cell),
         SirExpr::Arith { lhs, rhs, .. } => expr_touches_cell(lhs, cell) || expr_touches_cell(rhs, cell),
         SirExpr::RingLen(r) | SirExpr::RingEmpty(r) | SirExpr::RingFull(r) => r == cell,
