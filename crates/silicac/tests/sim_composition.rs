@@ -205,3 +205,25 @@ sim app_sim for app {
         "samples reaches 1 after retry recovery:\n{:#?}", t
     );
 }
+
+#[test]
+fn bus_interleave_example_runs_button_during_the_suspension() {
+    // The hermetic oracle for harness/bus_parity.sh: compile the on-metal
+    // interleave example and confirm in the sim that the button reaction (hits)
+    // runs DURING the sensor's bus suspension — i.e. its cell write lands before
+    // the sensor's post-resume write (samples).  The Renode harness then checks
+    // the same ordering on nRF52840 hardware (§5.2/E1).
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/bus_interleave_nrf52840.si");
+    let src = std::fs::read_to_string(&path).expect("read bus_interleave example");
+    let std_items = silicac::load_std_items(&silicac::default_std_dir()).expect("std");
+    let tokens = silicac::lexer::lex(&src).expect("lex");
+    let mut ast = silicac::parser::parse(tokens).expect("parse");
+    ast.items.splice(0..0, std_items);
+    let sir = silicac::resolver::resolve(&ast)
+        .unwrap_or_else(|e| panic!("resolve: {:?}", e.iter().map(|d| &d.msg).collect::<Vec<_>>()));
+    let r = sim::run(&sir);
+    let hits = r.trace.iter().position(|x| matches!(&x.kind, TraceKind::CellWrite { name, value } if name == "hits" && *value == 1)).expect("button hit");
+    let samples = r.trace.iter().position(|x| matches!(&x.kind, TraceKind::CellWrite { name, value } if name == "samples" && *value == 1)).expect("sensor sample");
+    assert!(hits < samples, "button (hits) must run during the bus suspension, before the sensor resumes (samples):\n{:#?}", r.trace);
+}

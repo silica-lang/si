@@ -1,0 +1,51 @@
+// Trace-order interleaving (§5.2) on nRF52840 metal — the proof that a yielding
+// bus transaction really suspends the handler so the scheduler runs other work.
+//
+// A sensor reaction (`every`) reads a temperature over I²C; while that transfer
+// is in flight a higher-priority button reaction (`on falling`) fires and runs
+// to completion BEFORE the sensor resumes.  Two observable cells make the order
+// checkable from outside:
+//   - `hits`    — incremented by the button reaction
+//   - `samples` — incremented by the sensor reaction *after* the bus completes
+// During the bus suspension `hits` reaches 1 while `samples` is still 0; only an
+// IRQ-driven suspend/resume (not a busy-poll) can produce that ordering.
+//
+//   silicac --sim examples/bus_interleave_nrf52840.si           # host trace
+//   RENODE=… ./harness/bus_parity.sh                            # on-metal parity
+
+board demo {
+  soc s {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+
+  gpio0 : nrf_gpio at 0x5000_0000
+  i2c0  : i2c_controller at 0x4000_3000 { needs { clock = soc.sysclk } }
+  env   : bme280 { needs { bus = i2c0 } }
+  btn   : nrf_gpio.pin = gpio0.pin(11) as input pulling up
+}
+
+program app {
+  use board demo as b
+
+  let sensor = b.env
+  let button = b.btn
+  cell samples : u32 = 0
+  cell hits    : u32 = 0
+
+  every 1000ms {
+    let t = sensor.read_temp()?
+    samples = samples + 1
+  }
+  on button.falling {
+    hits = hits + 1
+  }
+}
+
+sim app_sim for app {
+  inject btn.falling at 1000001us   // 1µs into the sensor's bus window
+  run until 1100ms
+}
