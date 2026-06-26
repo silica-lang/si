@@ -664,6 +664,14 @@ embedded systems routinely depends on *which* failure occurred — `timeout` vs 
 vs `overflow` vs a `when`-precondition violation — so the codes are first-class to docs, tools, and
 disposition validation, while the value stays one regular shape to handle.
 
+> **Status (implemented — `match` + totality).** The `match` statement is built as the surface
+> conditional (`match <expr> { <lit> => …, _ => … }`, lowered to a guarded if-chain over existing
+> `SirStmt::If`). Matching is enforced **total**: a `_` wildcard arm is required (else a compile
+> error) and duplicate literal arms are rejected — the "completeness, no silent fall-through"
+> discipline D14 asks for, applied to value matching. **Remaining:** patterns are integer/bool
+> literals only; `ok`/`fault f` op-result patterns and exhaustiveness against an op's *declared fault
+> codes* (the `match usart2.write(b)` form above) build on this and are not yet wired.
+
 **Layer 2 — propagation through the reactive model: fault disposition.** Fallibility composes
 *within* a handler (via `?`), but a handler has **no caller to unwind to** — it was invoked by an
 event, not a function call. So each reaction declares a **fault disposition**, the reactive-model

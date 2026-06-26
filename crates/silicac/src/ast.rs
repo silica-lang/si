@@ -535,6 +535,25 @@ pub enum Stmt {
     Return(Option<Expr>, Span),
     /// `exit(<code>)` — host intrinsic
     Exit(Expr, Span),
+    /// `match <expr> { <pat> => <body>, … }` (§4.4/D14): the first surface
+    /// conditional.  Matching must be **total** — a `_` wildcard arm is required,
+    /// so no case is silently unhandled.
+    Match { scrutinee: Expr, arms: Vec<MatchArm>, span: Span },
+}
+
+#[derive(Debug, Clone)]
+pub struct MatchArm {
+    pub pattern: MatchPat,
+    pub body: Block,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum MatchPat {
+    /// A literal pattern: `3 => …` or `true => …`.
+    Lit(Expr),
+    /// The `_` wildcard (the mandatory default).
+    Wild,
 }
 
 // ─── Expressions ─────────────────────────────────────────────────────────────

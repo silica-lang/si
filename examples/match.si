@@ -1,0 +1,40 @@
+// `match` — total case analysis (§4.4/D14).
+//
+// `match` is the surface conditional, and it must be **exhaustive**: a `_`
+// wildcard arm is required, so no input is ever silently unhandled (the same
+// "completeness vs the declared set" discipline the fault model uses).  Arms
+// with literal patterns are mutually exclusive; the `_` arm runs when none
+// matched.
+//
+// Here a rolling counter is classified into a small state code each tick.
+//
+//   silicac --sim examples/match.si
+
+board demo {
+  soc s {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+}
+
+program app {
+  use board demo as b
+  cell phase : u32 = 0   // cycles 0,1,2,0,1,2,…
+  cell state : u32 = 0   // classified output
+
+  every 100ms {
+    match phase {
+      0 => { state = 10 }
+      1 => { state = 20 }
+      _ => { state = 99 }   // mandatory default — covers 2 and anything else
+    }
+    phase = (phase + 1) % 3
+  }
+}
+
+sim app_sim for app {
+  run until 450ms
+}
