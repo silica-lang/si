@@ -1268,6 +1268,11 @@ impl Parser {
         let start = self.current_span().start;
         match self.peek() {
             Some(Token::KwLet) => Ok(Stmt::Let(self.parse_let()?)),
+            Some(Token::KwAtomic) => {
+                self.advance();
+                let block = self.parse_block()?;
+                Ok(Stmt::Atomic(block, Span::new(start, self.prev_span().end)))
+            }
             Some(Token::KwBecome) => {
                 self.advance();
                 let state = self.eat_ident()?;

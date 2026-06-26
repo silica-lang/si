@@ -518,6 +518,10 @@ pub enum Stmt {
     Let(LetDecl),
     /// An expression used as a statement (typically a call or assignment).
     Expr(Expr),
+    /// `atomic { <stmts> }` — an explicit multi-statement critical section
+    /// (§5.5/D03): the whole block runs at the priority ceiling of every cell it
+    /// touches, so a group of cell updates is indivisible w.r.t. other reactions.
+    Atomic(Block, Span),
     /// `become <state>`
     Become(Ident, Span),
     /// `return <expr>`

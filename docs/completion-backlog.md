@@ -49,7 +49,10 @@ pick the spec-consistent default and note it in the PR.
 - [ ] B1 Saturating/wrapping ops + `@overflow` directive + overflow-trap-by-default (§4.3/SIL-004) `[metal]`
 
 ### Cluster C — bounded-memory & atomicity
-- [ ] C1 `atomic { … }` multi-cell construct (§5.5/D03)
+- [x] C1 `atomic { … }` multi-cell construct (§5.5/D03) — PR #16. Lex KwAtomic, parse
+      `atomic { stmts }`, lower to ONE Critical whose ceiling is fixed up in analyze_cells
+      (reuses the priority-ceiling machinery); reject a yield inside. Distinct from the
+      per-access auto-critical. examples/atomic.si + tests/atomic.rs.
 - [ ] C2 Bounded types `pool`/`arena`/`ring`/`buffer`/`bytes` (§5.3/§4.3)
 - [ ] C3 Typed overlays — language construct only (§3.6)
 
@@ -68,7 +71,13 @@ pick the spec-consistent default and note it in the PR.
       check (cells are only touched inside criticals). 3 codegen tests rewritten to assert
       the state machine; all metal examples link; baseline blink/button Renode gate still
       PASS. **Interleaving on Renode** (vs just in sim) lands with E1's mock controller.
-- [ ] D3 `await <cond> within <d>` (§3.2/§5.2) `[metal]`  (dep: D2)
+- [ ] D3 `await <cond> within <d>` (§3.2/§5.2) `[metal]`  (dep: D2) — NEEDS A DESIGN CALL,
+      not autonomous-default-able. Findings: `await`/`poll`/`within`/`else` all lex but none
+      parse; `await` suspends on a *condition* but the spec doesn't pin the wakeup trigger
+      (re-check cadence? event-driven dep-tracking?); and the sim doesn't model hardware-
+      driven register changes, so a condition-wait can't naturally succeed without injection
+      machinery. Its non-suspending sibling `poll` is also unbuilt and is the parsing
+      prerequisite. Surface the resume-model decision before implementing.
 
 ### Cluster E — Renode Phase-1 closure + fault depth
 - [x] E1 Mock I²C controller Renode peripheral + trace-order parity harness `[metal]` — PR #15.

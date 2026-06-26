@@ -935,6 +935,22 @@ impl Resolver {
                 scope.insert(&l.name.name, Binding::Local(l.name.name.clone(), ty));
                 out.push(SirStmt::Assign { target: SirPlace::Var(l.name.name.clone()), value });
             }
+            Stmt::Atomic(block, span) => {
+                // Lower the block into one critical section.  The ceiling is
+                // filled in by `analyze_cells` (which knows cross-reaction cell
+                // sharing); here we only emit the grouping + reject a yield.
+                let mut body = Vec::new();
+                for s in &block.stmts {
+                    self.lower_stmt(s, scope, vars, &mut body);
+                }
+                if body_yields(&body) {
+                    self.err(
+                        *span,
+                        "an `atomic` block may not contain a yielding op (§5.5: a critical section cannot span a suspension)",
+                    );
+                }
+                out.push(SirStmt::Critical { ceiling: 0, body });
+            }
             Stmt::Become(_, _) => {} // typestate transition — later
             Stmt::Return(expr, _) => {
                 // Inside an inlined op body, `return X` binds the op's result
@@ -1477,19 +1493,35 @@ impl Resolver {
             .collect();
 
         // Wrap each shared-cell access in a priority-ceiling critical section.
+        // An explicit `atomic { }` block is already a top-level `Critical` at this
+        // point (lowering emits it with a placeholder ceiling); set its ceiling to
+        // protect every cell it touches — the max priority among reactions that
+        // touch any of them — rather than wrapping it again.
         for r in reactions.iter_mut() {
+            let rprio = r.priority;
             let body = std::mem::take(&mut r.body);
             r.body = body
                 .into_iter()
-                .map(|stmt| {
-                    let ceil = shared
-                        .iter()
-                        .filter(|(cell, _)| stmt_touches_cell(&stmt, cell))
-                        .map(|(_, &c)| c)
-                        .max();
-                    match ceil {
-                        Some(c) => SirStmt::Critical { ceiling: c, body: vec![stmt] },
-                        None => stmt,
+                .map(|stmt| match stmt {
+                    SirStmt::Critical { body, .. } => {
+                        let c = cell_names
+                            .iter()
+                            .filter(|cell| stmts_touch_cell(&body, cell))
+                            .filter_map(|cell| ceiling.get(cell).copied())
+                            .max()
+                            .unwrap_or(rprio);
+                        SirStmt::Critical { ceiling: c, body }
+                    }
+                    stmt => {
+                        let ceil = shared
+                            .iter()
+                            .filter(|(cell, _)| stmt_touches_cell(&stmt, cell))
+                            .map(|(_, &c)| c)
+                            .max();
+                        match ceil {
+                            Some(c) => SirStmt::Critical { ceiling: c, body: vec![stmt] },
+                            None => stmt,
+                        }
                     }
                 })
                 .collect();

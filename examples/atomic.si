@@ -1,0 +1,45 @@
+// Explicit multi-statement atomicity (§5.5/D03): `atomic { … }`.
+//
+// The compiler already inserts a priority-ceiling critical section around each
+// *individual* shared-cell access (§5.5).  `atomic { }` groups several updates
+// into ONE indivisible section, so another reaction can never observe a partial
+// update — here `lo`/`hi` are always advanced together.  An `atomic` block may
+// not contain a yielding op (a held ceiling cannot survive a suspension).
+//
+//   silicac --sim examples/atomic.si
+
+board demo {
+  soc s {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+}
+
+program app {
+  use board demo as b
+
+  cell lo : u32 = 0
+  cell hi : u32 = 0
+
+  // Advance both halves as one indivisible step.
+  every 1000ms {
+    atomic {
+      lo = lo + 1
+      hi = hi + 1
+    }
+  }
+
+  // A second reaction shares the cells, so they need a ceiling — and the
+  // `atomic` block above is what keeps the pair consistent against it.
+  every 700ms {
+    lo = lo + 10
+    hi = hi + 10
+  }
+}
+
+sim app_sim for app {
+  run until 2100ms
+}
