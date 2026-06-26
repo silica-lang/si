@@ -40,7 +40,14 @@ pick the spec-consistent default and note it in the PR.
 ### Cluster A — enforcement on already-parsed syntax
 - [x] A1 `where`-constraint enforcement (§3.2/§4.1) — PR #12. Also fixed a parser
       greediness bug where `where <expr> = <default>` swallowed the default.
-- [ ] A2 Number model: casts / mixed-sign / odd-width / endianness (§4.3)
+- [x] A2 Number model: casts / mixed-sign / narrowing (§4.3) — PR #23. Explicit cast `<expr> as
+      <type>` (AST::Cast → SirExpr::Cast; sim truncates to width, C emits a fixed-width cast). A
+      resolver `value_type` pass (Int{width,signed}/Literal/Flexible) rejects implicit narrowing,
+      mixed signed/unsigned operands, and out-of-range literals; literals + device/register results
+      stay flexible to avoid false positives. examples/casts.si + tests/casts.rs (9). Sim is the gate
+      (not `[metal]`-tagged); metal C compiles with arm-gcc. NOTE: `.le`/`.be` endianness, odd-width
+      fields (u7/u24) in expressions, and a checked/fallible narrowing cast are deferred — only the
+      truncating `as` is built.
 - [ ] A3 instant/duration type rules + `now()` (§4.5)
 - [ ] A4 Disposition completeness vs declared codes (§4.4/D14)
 - [ ] A5 Interface semantic-property checks (§4.1/D18)

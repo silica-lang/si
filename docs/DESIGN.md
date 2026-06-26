@@ -573,6 +573,16 @@ an odd width like `u7` or `u24`.
 | Text | Minimal byte-strings only. **No Unicode / text machinery** on device. |
 | Endianness | **Explicit** at the byte/buffer boundary: `u32.le`, `u32.be` when (de)serializing. |
 
+> **Status (implemented — conversions).** The Widening / Narrowing / Mixed-sign rules are enforced.
+> The resolver runs a `value_type` pass over each statement: a declared-typed value assigned to a
+> narrower type, or signed/unsigned operands mixed in one operation, is a compile error; an
+> out-of-range integer literal for its target type is rejected. The single escape hatch is the
+> explicit cast `<expr> as <type>` (`AST::Cast` → `SirExpr::Cast`), which the sim truncates to the
+> target width and the C backend emits as a fixed-width C cast. Integer *literals* and device-op /
+> register results stay width-flexible so ordinary code needs no annotation. **Remaining:** `.le`/`.be`
+> endianness, odd-width fields (`u7`/`u24`) in expressions, and a *checked* (fallible) narrowing cast
+> are not yet built — only the truncating `as`. (Overflow trap-by-default is tracked separately as B1.)
+
 > **Flagged inconsistency in the source decisions.** The settled list says overflow "traps by
 > default" but parenthesizes "(fault in debug/sim)", which quietly implies *no* trap in
 > release/on-metal — re-introducing exactly the silent-wraparound footgun the design exists to

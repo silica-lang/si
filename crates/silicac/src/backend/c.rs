@@ -903,6 +903,12 @@ impl CBackend {
                 };
                 format!("({} {} {})", l, op_str, r)
             }
+            // Explicit cast (§4.3): a C cast to the target fixed-width type does
+            // the narrowing/widening/sign reinterpretation.
+            SirExpr::Cast { inner, to_width, signed } => {
+                let cty = format!("{}int{}_t", if *signed { "" } else { "u" }, to_width);
+                format!("(({}){})", cty, self.emit_expr(inner))
+            }
         }
     }
 
