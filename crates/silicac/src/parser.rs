@@ -1822,6 +1822,12 @@ impl Parser {
                 self.advance();
                 Ok(Expr { kind: ExprKind::IntLit(n), span })
             }
+            // Fixed-point decimal/voltage literal (§4.3 P0-3b).
+            Some(Token::FixedLit(mantissa, scale)) => {
+                let span = self.current_span();
+                self.advance();
+                Ok(Expr { kind: ExprKind::FixedLit(mantissa, scale), span })
+            }
             // Frequency / size literals fold to their integer value (Hz / bytes)
             // in expression position — e.g. a clock init `= 8MHz`.
             Some(Token::FreqLit(hz)) => {

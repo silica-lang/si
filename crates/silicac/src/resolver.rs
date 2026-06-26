@@ -184,6 +184,9 @@ pub struct Resolver {
     /// Defaults to 32-bit unsigned (the implicit integer type).
     arith_width: u8,
     arith_signed: bool,
+    /// Fractional bits of the enclosing fixed-point target, if any (§4.3 P0-3b):
+    /// the scale a decimal/voltage literal (`0.5`, `3v3`) adopts.
+    arith_frac: Option<u8>,
     /// The board context for the program *currently* being resolved.
     board_ctx: Option<BoardContext>,
     /// Per-program board context, so a `sim` block resolves against its own
@@ -228,6 +231,7 @@ impl Resolver {
             core_hz: 0,
             arith_width: 32,
             arith_signed: false,
+            arith_frac: None,
             dev_types: HashMap::new(),
             board_ctx: None,
             program_ctx: HashMap::new(),
@@ -346,9 +350,19 @@ impl Resolver {
                                 self.float_needs_fpu(&st, t.span);
                                 st
                             }
-                            None => infer_type_from_expr(&l.init),
+                            None => {
+                                let scoped = self.expr_sirtype(&l.init, &scope);
+                                if matches!(scoped, SirType::Fixed { .. }) {
+                                    scoped
+                                } else {
+                                    infer_type_from_expr(&l.init)
+                                }
+                            }
                         };
+                        let saved = self.save_arith();
+                        self.set_arith_ty(&ty);
                         let init = self.lower_expr(&l.init, &scope);
+                        self.restore_arith(saved);
                         scope.insert(&l.name.name, Binding::Local(l.name.name.clone(), ty.clone()));
                         vars.push(SirVar { name: l.name.name.clone(), ty, init, is_cell: false });
                     }
@@ -358,7 +372,10 @@ impl Resolver {
                     // §4.3: a cell's initialiser must fit its declared type.
                     self.check_literal_range(sirtype_valtype(&ty), &c.init, c.init.span);
                     self.float_needs_fpu(&ty, c.ty.span); // §4.3 FPU gate
+                    let saved = self.save_arith();
+                    self.set_arith_ty(&ty); // so a fixed cell's `3v3`/`0.5` init scales (P0-3b)
                     let init = self.lower_expr(&c.init, &scope);
+                    self.restore_arith(saved);
                     scope.insert(&c.name.name, Binding::Cell(c.name.name.clone(), ty.clone()));
                     vars.push(SirVar { name: c.name.name.clone(), ty, init, is_cell: true });
                 }
@@ -1185,6 +1202,67 @@ impl Resolver {
     /// Build a binary-op SIR node.  Arithmetic ops (Add/Sub/Mul + their
     /// wrapping/saturating forms) become a width-checked [`SirExpr::Arith`] using
     /// the current target-type context; everything else stays an untyped `BinOp`.
+    /// Like `make_binop`, but routes fixed-point `*` / `/` (whose operands are
+    /// `fixed<I,F>`) to a rescaling `FixedArith` node (§4.3 P0-3c).  Add/sub on
+    /// fixed stay raw integer arithmetic at the storage width.
+    fn make_binop_typed(&self, op: BinOp, l: SirExpr, r: SirExpr, lhs: &Expr, rhs: &Expr, scope: &Scope) -> SirExpr {
+        let fixed = match (self.expr_sirtype(lhs, scope), self.expr_sirtype(rhs, scope)) {
+            (SirType::Fixed { int_bits, frac_bits, signed }, _)
+            | (_, SirType::Fixed { int_bits, frac_bits, signed }) => Some((int_bits, frac_bits, signed)),
+            _ => None,
+        };
+        if let Some((int_bits, frac_bits, signed)) = fixed {
+            let width = SirType::fixed_storage_bits(int_bits, frac_bits) as u8;
+            let mul = |mode| SirExpr::FixedArith {
+                op: FixedArithOp::Mul, mode, frac_bits, width, signed,
+                lhs: Box::new(l.clone()), rhs: Box::new(r.clone()),
+            };
+            match op {
+                BinOp::Mul => return mul(OverflowMode::Trap),
+                BinOp::MulWrap => return mul(OverflowMode::Wrap),
+                BinOp::MulSat => return mul(OverflowMode::Saturate),
+                BinOp::Div => {
+                    return SirExpr::FixedArith {
+                        op: FixedArithOp::Div, mode: OverflowMode::Trap, frac_bits, width, signed,
+                        lhs: Box::new(l), rhs: Box::new(r),
+                    }
+                }
+                _ => {} // add/sub/rem/compare → raw path below
+            }
+        }
+        self.make_binop(op, l, r)
+    }
+
+    /// Save the current arithmetic context (width, signed, fixed-frac).
+    fn save_arith(&self) -> (u8, bool, Option<u8>) {
+        (self.arith_width, self.arith_signed, self.arith_frac)
+    }
+    /// Raw fixed-point value of a decimal/voltage literal at the enclosing scale
+    /// (default Q16.16): `round(mantissa * 2^F / 10^scale)` (§4.3 P0-3b).
+    fn fixed_lit_raw(&self, mantissa: u64, scale: u32) -> u64 {
+        let f = self.arith_frac.unwrap_or(16) as u32;
+        let pow10 = 10u128.pow(scale);
+        (((mantissa as u128) * (1u128 << f) + pow10 / 2) / pow10) as u64
+    }
+    /// Set the arithmetic context from a target type (so a fixed target's frac
+    /// bits flow to any decimal/voltage literal in the initialiser, §4.3 P0-3b).
+    fn set_arith_ty(&mut self, ty: &SirType) {
+        let (w, s) = sirtype_ctx(ty);
+        self.arith_width = w;
+        self.arith_signed = s;
+        self.arith_frac = sirtype_frac(ty);
+    }
+    fn set_arith(&mut self, w: u8, s: bool, frac: Option<u8>) {
+        self.arith_width = w;
+        self.arith_signed = s;
+        self.arith_frac = frac;
+    }
+    fn restore_arith(&mut self, saved: (u8, bool, Option<u8>)) {
+        self.arith_width = saved.0;
+        self.arith_signed = saved.1;
+        self.arith_frac = saved.2;
+    }
+
     fn make_binop(&self, op: BinOp, l: SirExpr, r: SirExpr) -> SirExpr {
         if let Some((aop, mode)) = arith_mode(op) {
             SirExpr::Arith {
@@ -1202,16 +1280,24 @@ impl Resolver {
 
     /// The `(width_bits, signed)` overflow context implied by an assignment
     /// target — a register field's width, or a cell/local's declared type.
-    fn place_ctx(&self, place: &SirPlace, scope: &Scope, vars: &[SirVar]) -> (u8, bool) {
+    fn place_ctx(&self, place: &SirPlace, scope: &Scope, vars: &[SirVar]) -> (u8, bool, Option<u8>) {
         match place {
-            SirPlace::Reg { width, .. } => (*width, false),
+            SirPlace::Reg { width, .. } => (*width, false, None),
             SirPlace::Var(name) => {
-                if let Some(v) = vars.iter().find(|v| &v.name == name) {
-                    sirtype_ctx(&v.ty)
-                } else if let Some(Binding::Local(_, ty)) = scope.lookup(name) {
-                    sirtype_ctx(ty)
-                } else {
-                    (32, false)
+                let ty = vars
+                    .iter()
+                    .find(|v| &v.name == name)
+                    .map(|v| &v.ty)
+                    .or_else(|| match scope.lookup(name) {
+                        Some(Binding::Local(_, ty)) | Some(Binding::Cell(_, ty)) => Some(ty),
+                        _ => None,
+                    });
+                match ty {
+                    Some(ty) => {
+                        let (w, s) = sirtype_ctx(ty);
+                        (w, s, sirtype_frac(ty))
+                    }
+                    None => (32, false, None),
                 }
             }
         }
@@ -1247,10 +1333,10 @@ impl Resolver {
                     }),
                 };
                 // §4.3: arithmetic in the initialiser is checked at the binding width.
-                let saved = (self.arith_width, self.arith_signed);
-                (self.arith_width, self.arith_signed) = sirtype_ctx(&ty);
+                let saved = self.save_arith();
+                self.set_arith_ty(&ty);
                 let value = self.lower_expr_emit(&l.init, scope, vars, out);
-                (self.arith_width, self.arith_signed) = saved;
+                self.restore_arith(saved);
                 scope.insert(&l.name.name, Binding::Local(l.name.name.clone(), ty));
                 out.push(SirStmt::Assign { target: SirPlace::Var(l.name.name.clone()), value });
             }
@@ -1371,8 +1457,8 @@ impl Resolver {
             ));
         }
         // Lower the value exprs at the register width.
-        let saved = (self.arith_width, self.arith_signed);
-        (self.arith_width, self.arith_signed) = (width, false);
+        let saved = self.save_arith();
+        self.set_arith(width, false, None);
         let sir_writes = writes
             .iter()
             .zip(resolved)
@@ -1381,7 +1467,7 @@ impl Resolver {
                 (mask, shift, access, v)
             })
             .collect();
-        (self.arith_width, self.arith_signed) = saved;
+        self.restore_arith(saved);
         out.push(SirStmt::RegWrite { device, reg_offset, width, writes: sir_writes });
     }
 
@@ -1590,6 +1676,7 @@ impl Resolver {
             ExprKind::Cast(_, ty) => resolve_type_expr(ty),
             ExprKind::Try(inner) => self.expr_sirtype(inner, scope),
             ExprKind::BinOp { lhs, .. } => self.expr_sirtype(lhs, scope),
+            ExprKind::FixedLit(..) => SirType::Fixed { int_bits: 16, frac_bits: 16, signed: true },
             _ => SirType::U32,
         }
     }
@@ -1597,6 +1684,8 @@ impl Resolver {
     fn value_type(&mut self, expr: &Expr, scope: &Scope) -> ValType {
         match &expr.kind {
             ExprKind::IntLit(_) => ValType::Literal,
+            // A fixed literal is a literal — it adopts the target fixed scale.
+            ExprKind::FixedLit(..) => ValType::Literal,
             ExprKind::Ident(id) => match scope.lookup(&id.name) {
                 Some(Binding::Local(_, t)) | Some(Binding::Cell(_, t)) => sirtype_valtype(t),
                 _ => ValType::Flexible,
@@ -1739,23 +1828,23 @@ impl Resolver {
         match &expr.kind {
             ExprKind::Assign(lhs, rhs) => {
                 if let Some(place) = self.expr_to_place(lhs, scope) {
-                    let (w, s) = self.place_ctx(&place, scope, vars);
-                    let saved = (self.arith_width, self.arith_signed);
-                    (self.arith_width, self.arith_signed) = (w, s);
+                    let (w, s, frac) = self.place_ctx(&place, scope, vars);
+                    let saved = self.save_arith();
+                    self.set_arith(w, s, frac);
                     let value = self.lower_expr_emit(rhs, scope, vars, out);
-                    (self.arith_width, self.arith_signed) = saved;
+                    self.restore_arith(saved);
                     out.push(SirStmt::Assign { target: place, value });
                 }
             }
             ExprKind::CompoundAssign(op, lhs, rhs) => {
                 if let Some(place) = self.expr_to_place(lhs, scope) {
-                    let (w, s) = self.place_ctx(&place, scope, vars);
-                    let saved = (self.arith_width, self.arith_signed);
-                    (self.arith_width, self.arith_signed) = (w, s);
+                    let (w, s, frac) = self.place_ctx(&place, scope, vars);
+                    let saved = self.save_arith();
+                    self.set_arith(w, s, frac);
                     let lhs_val = self.lower_expr(lhs, scope);
                     let rhs_val = self.lower_expr_emit(rhs, scope, vars, out);
                     let combined = self.make_binop(*op, lhs_val, rhs_val);
-                    (self.arith_width, self.arith_signed) = saved;
+                    self.restore_arith(saved);
                     out.push(SirStmt::Assign { target: place, value: combined });
                 }
             }
@@ -1844,7 +1933,7 @@ impl Resolver {
             ExprKind::BinOp { op, lhs, rhs } => {
                 let l = self.lower_expr_emit(lhs, scope, vars, out);
                 let r = self.lower_expr_emit(rhs, scope, vars, out);
-                self.make_binop(*op, l, r)
+                self.make_binop_typed(*op, l, r, lhs, rhs, scope)
             }
             ExprKind::Not(inner) => SirExpr::Not(Box::new(self.lower_expr_emit(inner, scope, vars, out))),
             ExprKind::Cast(inner, ty) => {
@@ -2166,6 +2255,9 @@ impl Resolver {
         match &expr.kind {
             ExprKind::BoolLit(b) => SirExpr::Bool(*b),
             ExprKind::IntLit(n) | ExprKind::DurationLit(n) => SirExpr::U64(*n),
+            // A decimal/voltage literal adopts the enclosing fixed-point scale
+            // (default Q16.16): raw = round(mantissa * 2^F / 10^scale) (§4.3 P0-3b).
+            ExprKind::FixedLit(mantissa, scale) => SirExpr::U64(self.fixed_lit_raw(*mantissa, *scale)),
             ExprKind::StringLit(s) => SirExpr::Bytes(s.as_bytes().to_vec()),
             ExprKind::Ident(ident) => match scope.lookup(&ident.name) {
                 Some(Binding::Local(name, _)) | Some(Binding::Cell(name, _)) => SirExpr::Load(name.clone()),
@@ -2207,7 +2299,7 @@ impl Resolver {
             ExprKind::BinOp { op, lhs, rhs } => {
                 let l = self.lower_expr(lhs, scope);
                 let r = self.lower_expr(rhs, scope);
-                self.make_binop(*op, l, r)
+                self.make_binop_typed(*op, l, r, lhs, rhs, scope)
             }
             ExprKind::Assign(_lhs, rhs) => self.lower_expr(rhs, scope),
             ExprKind::CompoundAssign(_, _, rhs) => self.lower_expr(rhs, scope),
@@ -2652,6 +2744,7 @@ fn expr_touches_cell(expr: &SirExpr, cell: &str) -> bool {
         SirExpr::Load(n) => n == cell,
         SirExpr::Not(inner) => expr_touches_cell(inner, cell),
         SirExpr::Cast { inner, .. } | SirExpr::FixedCast { inner, .. } => expr_touches_cell(inner, cell),
+        SirExpr::FixedArith { lhs, rhs, .. } => expr_touches_cell(lhs, cell) || expr_touches_cell(rhs, cell),
         SirExpr::BinOp(_, l, r) => expr_touches_cell(l, cell) || expr_touches_cell(r, cell),
         SirExpr::Arith { lhs, rhs, .. } => expr_touches_cell(lhs, cell) || expr_touches_cell(rhs, cell),
         SirExpr::RingLen(r) | SirExpr::RingEmpty(r) | SirExpr::RingFull(r) => r == cell,
@@ -2726,6 +2819,14 @@ fn fixed_frac_bits(t: &SirType) -> u8 {
     }
 }
 
+/// `Some(frac_bits)` for a fixed type, else `None` — the arith-context scale.
+fn sirtype_frac(t: &SirType) -> Option<u8> {
+    match t {
+        SirType::Fixed { frac_bits, .. } => Some(*frac_bits),
+        _ => None,
+    }
+}
+
 fn is_comparison(op: BinOp) -> bool {
     matches!(op, BinOp::EqEq | BinOp::NotEq | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)
 }
@@ -2777,6 +2878,8 @@ fn infer_type_from_expr(expr: &Expr) -> SirType {
     match &expr.kind {
         ExprKind::BoolLit(_) => SirType::Bool,
         ExprKind::IntLit(_) => SirType::U32,
+        // A bare decimal/voltage literal defaults to Q16.16 (§4.3 P0-3b).
+        ExprKind::FixedLit(..) => SirType::Fixed { int_bits: 16, frac_bits: 16, signed: true },
         ExprKind::DurationLit(_) => SirType::Duration,
         ExprKind::StringLit(_) => SirType::Bytes,
         // `<e> as <T>` initialises a binding at the cast's target type.

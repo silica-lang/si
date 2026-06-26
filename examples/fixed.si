@@ -18,13 +18,26 @@ board demo {
 
 program app {
   use board demo as b
-  cell sum : u32 = 0
+  cell sum    : u32 = 0
+  cell prod   : u32 = 0
+  cell half   : u32 = 0
+  cell gained : u32 = 0
 
   on sys.start {
     let a = 3 as fixed<16,16>
     let b2 = 4 as fixed<16,16>
+
     let c = a + b2        // 7.0 in Q16.16 — a raw 32-bit add at the shared scale
     sum = c as u32        // shift the binary point back out → 7
+
+    let p = a * b2        // 12.0 — mul rescales (wider intermediate, then >>16)
+    prod = p as u32       // → 12
+
+    let h = a / b2        // 0.75 — div keeps 16 fractional bits
+    half = (h * b2) as u32 // (0.75 * 4) = 3 — proves the fraction survived
+
+    let gain = 1v5         // a 1.5 fixed-point literal (P0-3b; `3v3`-style)
+    gained = (a * gain) as u32  // 3.0 * 1.5 = 4.5 → 4 as int
   }
 }
 

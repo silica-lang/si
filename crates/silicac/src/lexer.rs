@@ -58,6 +58,9 @@ pub enum Token {
     Ident(String),
     /// Integer literal, no suffix.
     IntLit(u64),
+    /// Fixed-point decimal/voltage literal (§4.3 P0-3b): `(mantissa, frac_digits)`
+    /// — `0.5` → `(5, 1)`, `3.25` → `(325, 2)`, `3v3` → `(33, 1)`.
+    FixedLit(u64, u32),
     /// Duration literal: value + unit (e.g. `500ms` → (500, "ms")).
     DurationLit(u64, DurationUnit),
     /// Size literal: `4K`, `512K`, `64M` (in bytes).
@@ -290,6 +293,33 @@ pub fn lex(src: &str) -> Result<Vec<Spanned<Token>>, LexError> {
                 offset: start,
                 msg: format!("integer overflow in literal '{}'", num_str),
             })?;
+
+            // Fixed-point decimal (`3.25`) or voltage (`3v3`) literal (§4.3
+            // P0-3b): a `.` or `v` between digits is the binary-point separator.
+            let frac_sep = i + 1 < len
+                && (bytes[i] == b'.' || bytes[i] == b'v')
+                && bytes[i + 1].is_ascii_digit();
+            if frac_sep {
+                i += 1; // consume the separator
+                let mut frac = String::new();
+                while i < len && (bytes[i].is_ascii_digit() || bytes[i] == b'_') {
+                    if bytes[i] != b'_' {
+                        frac.push(bytes[i] as char);
+                    }
+                    i += 1;
+                }
+                let scale = frac.len() as u32;
+                let frac_val: u64 = frac.parse().map_err(|_| LexError {
+                    offset: start,
+                    msg: format!("invalid fixed-point literal '{}.{}'", num_str, frac),
+                })?;
+                let mantissa = value
+                    .checked_mul(10u64.pow(scale))
+                    .and_then(|v| v.checked_add(frac_val))
+                    .ok_or_else(|| LexError { offset: start, msg: "fixed-point literal overflow".into() })?;
+                tokens.push(Spanned::new(Token::FixedLit(mantissa, scale), start, i));
+                continue;
+            }
 
             // Check for suffix.
             if i < len && bytes[i].is_ascii_alphabetic() {

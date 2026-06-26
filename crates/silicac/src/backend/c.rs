@@ -47,6 +47,7 @@ pub struct CBackend {
     /// Distinct width-checked-arithmetic shapes used in the module (§4.3); each
     /// gets a `static inline` helper emitted once in the preamble.
     arith_combos: HashSet<(SirArithOp, OverflowMode, u8, bool)>,
+    fixed_combos: HashSet<(FixedArithOp, OverflowMode, u8, bool, u8)>,
     /// Ring cell name → (element bytes, capacity), for ring op codegen (§5.3).
     ring_info: HashMap<String, (u8, u32)>,
     /// Yielding-reaction id → its `within <d>` deadline in SysTick base ticks
@@ -73,6 +74,7 @@ impl CBackend {
             frame_name: None,
             current_disposition: None,
             arith_combos: HashSet::new(),
+            fixed_combos: HashSet::new(),
             ring_info: HashMap::new(),
             deadline_ticks: HashMap::new(),
         }
@@ -117,6 +119,7 @@ impl CBackend {
         self.global_vars = module.vars.iter().map(|v| v.name.clone()).collect();
         self.max_priority = module.reactions.iter().map(|r| r.priority).max().unwrap_or(0);
         self.arith_combos = collect_arith(module);
+        self.fixed_combos = collect_fixed(module);
         match self.target {
             Target::Host => {
                 self.emit_header(module);
@@ -258,14 +261,20 @@ impl CBackend {
     // Emit the `static inline` helpers for every width-checked arithmetic shape
     // used in the module (§4.3 / SIL-004).
     fn emit_arith_helpers(&mut self) {
-        if self.arith_combos.is_empty() {
+        if self.arith_combos.is_empty() && self.fixed_combos.is_empty() {
             return;
         }
         let mut combos: Vec<_> = self.arith_combos.iter().copied().collect();
         combos.sort_by_key(|(op, mode, w, s)| (*w, *s as u8, *op as u8, *mode as u8));
         self.line("/* §4.3 width-checked integer arithmetic (SIL-004): plain +/-/* trap on */");
         self.line("/* overflow; `+%`-family wrap, `+|`-family saturate, at the target width. */");
-        if combos.iter().any(|(_, m, _, _)| *m == OverflowMode::Trap) {
+        // The trap helper is shared by integer arith and fixed mul/div (div-by-
+        // zero and out-of-range results both trap to safe-state).
+        let fixed_needs_trap = self
+            .fixed_combos
+            .iter()
+            .any(|(op, m, ..)| *op == FixedArithOp::Div || *m == OverflowMode::Trap);
+        if combos.iter().any(|(_, m, _, _)| *m == OverflowMode::Trap) || fixed_needs_trap {
             match self.target {
                 Target::MetalNrf52840 => {
                     self.line("static void __silica_overflow_trap(void) {");
@@ -281,6 +290,12 @@ impl CBackend {
         }
         for (op, mode, w, s) in combos {
             self.line(&arith_helper_def(op, mode, w, s));
+        }
+        // Fixed-point multiply/divide helpers (§4.3, P0-3c).
+        let mut fixed: Vec<_> = self.fixed_combos.iter().copied().collect();
+        fixed.sort_by_key(|(op, mode, w, s, f)| (*w, *s as u8, *op as u8, *mode as u8, *f));
+        for (op, mode, w, s, f) in fixed {
+            self.line(&fixed_helper_def(op, mode, w, s, f));
         }
         self.emit_newline();
     }
@@ -1191,6 +1206,11 @@ impl CBackend {
                 let cty = format!("{}int{}_t", if *signed { "" } else { "u" }, to_width);
                 format!("(({}){})", cty, self.emit_expr(inner))
             }
+            // Fixed-point multiply/divide with rescale (§4.3, P0-3c) → helper.
+            SirExpr::FixedArith { op, mode, frac_bits, width, signed, lhs, rhs } => {
+                let name = fixed_helper_name(*op, *mode, *width, *signed, *frac_bits);
+                format!("{}({}, {})", name, self.emit_expr(lhs), self.emit_expr(rhs))
+            }
             // Fixed-point rescale (§4.3, P0-3a): shift the binary point in a
             // 64-bit (sign-aware) intermediate, then narrow to the target type.
             SirExpr::FixedCast { inner, shift, to_width, signed } => {
@@ -1818,6 +1838,115 @@ fn collect_arith(module: &SirModule) -> HashSet<(SirArithOp, OverflowMode, u8, b
     set
 }
 
+type FixedCombo = (FixedArithOp, OverflowMode, u8, bool, u8);
+
+/// Stable name for a fixed-point mul/div helper (§4.3, P0-3c).
+fn fixed_helper_name(op: FixedArithOp, mode: OverflowMode, width: u8, signed: bool, frac: u8) -> String {
+    let o = match op {
+        FixedArithOp::Mul => "fixmul",
+        FixedArithOp::Div => "fixdiv",
+    };
+    let m = match mode {
+        OverflowMode::Trap => "trap",
+        OverflowMode::Wrap => "wrap",
+        OverflowMode::Saturate => "sat",
+    };
+    format!("__si_{}_{}_{}{}_f{}", o, m, if signed { "s" } else { "u" }, width, frac)
+}
+
+/// `static inline` definition for one fixed-point mul/div helper.  Computes in a
+/// 64-bit intermediate (so a `width ≤ 32` product/quotient cannot overflow it),
+/// rescales by `frac`, then applies the overflow mode at `width`.
+fn fixed_helper_def(op: FixedArithOp, mode: OverflowMode, width: u8, signed: bool, frac: u8) -> String {
+    let name = fixed_helper_name(op, mode, width, signed, frac);
+    let t = arith_cint(width, signed);
+    let wide = if signed { "int64_t" } else { "uint64_t" };
+    let (lo, hi): (i128, i128) = if signed {
+        (-(1i128 << (width as u32 - 1)), (1i128 << (width as u32 - 1)) - 1)
+    } else {
+        (0, (1i128 << width as u32) - 1)
+    };
+    // The rescaled raw value, in the 64-bit intermediate.
+    let raw = match op {
+        FixedArithOp::Mul => format!("(({wide})a * ({wide})b) >> {frac}"),
+        FixedArithOp::Div => format!("((({wide})a) << {frac}) / ({wide})b"),
+    };
+    let guard_div0 = if op == FixedArithOp::Div { "if (b == 0) __silica_overflow_trap(); " } else { "" };
+    match mode {
+        OverflowMode::Wrap => format!(
+            "static inline {t} {name}({t} a, {t} b) {{ {guard_div0}{wide} __r = {raw}; return ({t})__r; }}"
+        ),
+        OverflowMode::Trap => format!(
+            "static inline {t} {name}({t} a, {t} b) {{ {guard_div0}{wide} __r = {raw}; \
+             if (__r < ({wide}){lo} || __r > ({wide}){hi}) __silica_overflow_trap(); return ({t})__r; }}"
+        ),
+        OverflowMode::Saturate => format!(
+            "static inline {t} {name}({t} a, {t} b) {{ {guard_div0}{wide} __r = {raw}; \
+             if (__r > ({wide}){hi}) __r = ({wide}){hi}; else if (__r < ({wide}){lo}) __r = ({wide}){lo}; return ({t})__r; }}"
+        ),
+    }
+}
+
+fn collect_fixed(module: &SirModule) -> HashSet<FixedCombo> {
+    let mut set = HashSet::new();
+    for r in &module.reactions {
+        collect_fixed_stmts(&r.body, &mut set);
+    }
+    for v in &module.vars {
+        collect_fixed_expr(&v.init, &mut set);
+    }
+    for s in &module.safe_seqs {
+        collect_fixed_stmts(&s.body, &mut set);
+    }
+    set
+}
+
+fn collect_fixed_stmts(stmts: &[SirStmt], set: &mut HashSet<FixedCombo>) {
+    for s in stmts {
+        match s {
+            SirStmt::Assign { value, .. } => collect_fixed_expr(value, set),
+            SirStmt::RegWrite { writes, .. } => {
+                writes.iter().for_each(|(_, _, _, v)| collect_fixed_expr(v, set));
+            }
+            SirStmt::If { cond, then } => {
+                collect_fixed_expr(cond, set);
+                collect_fixed_stmts(then, set);
+            }
+            SirStmt::Exit(e) => collect_fixed_expr(e, set),
+            SirStmt::Critical { body, .. } => collect_fixed_stmts(body, set),
+            SirStmt::Poll { cond, .. } | SirStmt::Await { cond, .. } => collect_fixed_expr(cond, set),
+            SirStmt::DeviceOp { args, .. } | SirStmt::BusXfer { args, .. } => {
+                args.iter().for_each(|a| collect_fixed_expr(a, set));
+            }
+            SirStmt::RingPush { value, .. } => collect_fixed_expr(value, set),
+            SirStmt::Intrinsic(SirIntrinsic::HostIoPrint(e)) => collect_fixed_expr(e, set),
+            _ => {}
+        }
+    }
+}
+
+fn collect_fixed_expr(expr: &SirExpr, set: &mut HashSet<FixedCombo>) {
+    match expr {
+        SirExpr::FixedArith { op, mode, frac_bits, width, signed, lhs, rhs } => {
+            set.insert((*op, *mode, *width, *signed, *frac_bits));
+            collect_fixed_expr(lhs, set);
+            collect_fixed_expr(rhs, set);
+        }
+        SirExpr::Not(i) | SirExpr::Cast { inner: i, .. } | SirExpr::FixedCast { inner: i, .. } => {
+            collect_fixed_expr(i, set)
+        }
+        SirExpr::BinOp(_, l, r) => {
+            collect_fixed_expr(l, set);
+            collect_fixed_expr(r, set);
+        }
+        SirExpr::Arith { lhs, rhs, .. } => {
+            collect_fixed_expr(lhs, set);
+            collect_fixed_expr(rhs, set);
+        }
+        _ => {}
+    }
+}
+
 fn collect_arith_stmts(stmts: &[SirStmt], set: &mut HashSet<(SirArithOp, OverflowMode, u8, bool)>) {
     for s in stmts {
         match s {
@@ -1857,6 +1986,10 @@ fn collect_arith_expr(expr: &SirExpr, set: &mut HashSet<(SirArithOp, OverflowMod
             collect_arith_expr(rhs, set);
         }
         SirExpr::Cast { inner, .. } | SirExpr::FixedCast { inner, .. } => collect_arith_expr(inner, set),
+        SirExpr::FixedArith { lhs, rhs, .. } => {
+            collect_arith_expr(lhs, set);
+            collect_arith_expr(rhs, set);
+        }
         _ => {}
     }
 }

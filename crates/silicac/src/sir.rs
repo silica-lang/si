@@ -388,6 +388,19 @@ pub enum SirExpr {
     /// `shift > 0` shifts left (more fractional bits), `shift < 0` shifts right
     /// (arithmetic when `signed`); the result is truncated to `to_width` bits.
     FixedCast { inner: Box<SirExpr>, shift: i8, to_width: u8, signed: bool },
+    /// Fixed-point multiply/divide with rescale (§4.3, audit #35 P0-3c).  Mul
+    /// computes in a wider intermediate then `>> frac_bits`; div `<< frac_bits`
+    /// then divides — so the result keeps `frac_bits` fractional bits.  The
+    /// rescaled result obeys `mode` (trap/wrap/saturate) at `width`.
+    FixedArith {
+        op: FixedArithOp,
+        mode: OverflowMode,
+        frac_bits: u8,
+        width: u8,
+        signed: bool,
+        lhs: Box<SirExpr>,
+        rhs: Box<SirExpr>,
+    },
     /// `ring.len()` — current element count (§5.3).
     RingLen(String),
     /// `ring.is_empty()` — count == 0.
@@ -401,6 +414,14 @@ pub enum SirArithOp {
     Add,
     Sub,
     Mul,
+}
+
+/// Fixed-point operations that need a rescale (§4.3 P0-3c).  Add/sub do not —
+/// they reuse `SirArithOp` at the storage width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FixedArithOp {
+    Mul,
+    Div,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

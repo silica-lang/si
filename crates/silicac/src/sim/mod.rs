@@ -313,6 +313,10 @@ fn collect_rc_reads(expr: &SirExpr, out: &mut Vec<(usize, u64)>) {
             }
         }
         SirExpr::Not(inner) | SirExpr::Cast { inner, .. } | SirExpr::FixedCast { inner, .. } => collect_rc_reads(inner, out),
+        SirExpr::FixedArith { lhs, rhs, .. } => {
+            collect_rc_reads(lhs, out);
+            collect_rc_reads(rhs, out);
+        }
         SirExpr::BinOp(_, l, r) => {
             collect_rc_reads(l, out);
             collect_rc_reads(r, out);
@@ -998,6 +1002,12 @@ impl<'m> Sim<'m> {
                     v & ((1u64 << to_width) - 1)
                 }
             }
+            // Fixed-point multiply/divide with rescale (§4.3, P0-3c).
+            SirExpr::FixedArith { op, mode, frac_bits, width, signed, lhs, rhs } => {
+                let a = self.eval_expr(lhs, frame);
+                let b = self.eval_expr(rhs, frame);
+                self.eval_fixed(*op, *mode, *frac_bits, *width, *signed, a, b)
+            }
             // Fixed-point rescale (§4.3, P0-3a): shift the binary point, sign-
             // aware on a right shift, then truncate to the target width.
             SirExpr::FixedCast { inner, shift, to_width, signed } => {
@@ -1083,6 +1093,65 @@ impl<'m> Sim<'m> {
             (result as u64) & ((1u64 << bits) - 1)
         };
         masked
+    }
+
+    /// Fixed-point multiply/divide with rescale (§4.3, P0-3c), mirroring
+    /// `eval_arith`'s overflow handling.  Mul computes the product then `>> frac`;
+    /// div `<< frac` then divides (div-by-zero traps to safe-state).
+    fn eval_fixed(&self, op: FixedArithOp, mode: OverflowMode, frac: u8, width: u8, signed: bool, a: u64, b: u64) -> u64 {
+        let bits = width as u32;
+        let (lo, hi): (i128, i128) = if signed {
+            (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+        } else {
+            (0, (1i128 << bits) - 1)
+        };
+        let interp = |v: u64| -> i128 {
+            if signed && bits < 64 && (v >> (bits - 1)) & 1 == 1 {
+                (v as i128) - (1i128 << bits)
+            } else {
+                v as i128
+            }
+        };
+        let (x, y) = (interp(a), interp(b));
+        let full: i128 = match op {
+            FixedArithOp::Mul => (x * y) >> frac,
+            FixedArithOp::Div => {
+                if y == 0 {
+                    self.overflow_trap.set(Some(width)); // div-by-zero → safe-state
+                    return 0;
+                }
+                (x << frac) / y
+            }
+        };
+        let fits = full >= lo && full <= hi;
+        let result: i128 = match mode {
+            OverflowMode::Trap => {
+                if !fits {
+                    self.overflow_trap.set(Some(width));
+                }
+                full
+            }
+            OverflowMode::Saturate => full.clamp(lo, hi),
+            OverflowMode::Wrap => {
+                let m = 1i128 << bits;
+                let mut w = full % m;
+                if w < 0 {
+                    w += m;
+                }
+                if signed && w > hi {
+                    w - m
+                } else {
+                    w
+                }
+            }
+        };
+        if bits >= 64 {
+            result as u64
+        } else if result < 0 {
+            ((result + (1i128 << bits)) as u64) & ((1u64 << bits) - 1)
+        } else {
+            (result as u64) & ((1u64 << bits) - 1)
+        }
     }
 }
 
