@@ -1470,7 +1470,17 @@ impl Parser {
                 span: Span::new(start, end),
             });
         }
-        self.parse_postfix()
+        // Postfix `expr as <type>` casts (§4.3) — bind tighter than binary ops,
+        // so `a + b as u8` is `a + (b as u8)`.  (Pin attributes' `as` is a
+        // separate board-section production, not reached here.)
+        let mut expr = self.parse_postfix()?;
+        while self.peek() == Some(&Token::KwAs) {
+            self.advance();
+            let ty = self.parse_type()?;
+            let end = self.prev_span().end;
+            expr = Expr { kind: ExprKind::Cast(Box::new(expr), ty), span: Span::new(start, end) };
+        }
+        Ok(expr)
     }
 
     fn parse_postfix(&mut self) -> Result<Expr, ParseError> {

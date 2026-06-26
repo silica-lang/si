@@ -978,6 +978,12 @@ impl CBackend {
             }
             // `now()` — current time in ns (§4.5), from the monotonic source.
             SirExpr::Now => "__now_ns()".to_string(),
+            // Explicit cast (§4.3): a C cast to the target fixed-width type does
+            // the narrowing/widening/sign reinterpretation.
+            SirExpr::Cast { inner, to_width, signed } => {
+                let cty = format!("{}int{}_t", if *signed { "" } else { "u" }, to_width);
+                format!("(({}){})", cty, self.emit_expr(inner))
+            }
         }
     }
 

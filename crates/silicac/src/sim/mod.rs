@@ -816,6 +816,17 @@ impl<'m> Sim<'m> {
             }
             // `now()` — current virtual time in ns since boot (§4.5).
             SirExpr::Now => self.now,
+            // Explicit cast (§4.3): a narrowing cast truncates to `to_width`
+            // bits; widening is identity.  (Signed reinterpretation is not
+            // separately modelled — the sim's value domain is unsigned u64.)
+            SirExpr::Cast { inner, to_width, .. } => {
+                let v = self.eval_expr(inner, frame);
+                if *to_width >= 64 {
+                    v
+                } else {
+                    v & ((1u64 << to_width) - 1)
+                }
+            }
         }
     }
 

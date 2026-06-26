@@ -345,6 +345,10 @@ pub enum SirExpr {
     /// `now()` — the current time as an `instant`, nanoseconds since boot (§4.5).
     /// The sim reads its virtual clock; metal/host read a monotonic counter.
     Now,
+    /// `<inner> as <type>` — an explicit numeric cast (§4.3): truncate to
+    /// `to_width` bits (narrowing) or zero/sign-extend (widening); `signed`
+    /// records the target signedness for the C emission.
+    Cast { inner: Box<SirExpr>, to_width: u8, signed: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -575,6 +575,9 @@ pub enum ExprKind {
     },
     /// Unary `not <expr>`.
     Not(Box<Expr>),
+    /// `<expr> as <type>` — an explicit numeric cast (§4.3): the only way to
+    /// narrow or change signedness, since neither is ever implicit.
+    Cast(Box<Expr>, TypeExpr),
     /// `<expr>?` — fault propagation.
     Try(Box<Expr>),
     /// `<expr> = <expr>` — assignment.

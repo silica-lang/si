@@ -319,6 +319,8 @@ impl Resolver {
                 }
                 ProgramItem::CellDecl(c) => {
                     let ty = resolve_type_expr(&c.ty);
+                    // §4.3: a cell's initialiser must fit its declared type.
+                    self.check_literal_range(sirtype_valtype(&ty), &c.init, c.init.span);
                     let init = self.lower_expr(&c.init, &scope);
                     scope.insert(&c.name.name, Binding::Cell(c.name.name.clone(), ty.clone()));
                     vars.push(SirVar { name: c.name.name.clone(), ty, init, is_cell: true });
@@ -977,14 +979,17 @@ impl Resolver {
         match stmt {
             Stmt::Expr(expr) => self.lower_expr_stmt(expr, scope, vars, out),
             Stmt::Let(l) => {
-                // §4.5: infer the binding's time-kind so `let t = now()` is an
-                // `instant` and `let dt = now() - t0` is a `duration`.  An explicit
-                // annotation wins but is checked against the initialiser's kind.
+                // §4.5 time-kind (so `let t = now()` is an instant) + §4.3
+                // width/sign checks; an explicit annotation wins but is checked.
                 let tk = self.time_kind(&l.init, scope);
+                let init_vt = self.value_type(&l.init, scope);
                 let ty = match &l.ty {
                     Some(t) => {
                         let ann = resolve_type_expr(t);
                         self.check_assign_time(sirtype_time_kind(&ann), tk, l.init.span);
+                        let annvt = sirtype_valtype(&ann);
+                        self.check_assign_type(annvt, init_vt, l.init.span);
+                        self.check_literal_range(annvt, &l.init, l.init.span);
                         ann
                     }
                     None => time_kind_sirtype(tk).unwrap_or_else(|| infer_type_from_expr(&l.init)),
@@ -1018,6 +1023,7 @@ impl Resolver {
                 // metal backend turns `within` into a spin bound, the sim checks
                 // it deterministically.
                 let _ = self.time_kind(cond, scope); // §4.5 time-type the condition
+                let _ = self.value_type(cond, scope); // §4.3 width/sign check
                 let cond = self.lower_expr_emit(cond, scope, vars, out);
                 out.push(SirStmt::Poll {
                     cond,
@@ -1169,9 +1175,119 @@ impl Resolver {
         }
     }
 
+    /// Recursively compute an expression's width/sign category (§4.3), emitting
+    /// errors on implicit narrowing and mixed signed/unsigned operands.  Called
+    /// once per statement-root expression so each node is visited once.
+    fn value_type(&mut self, expr: &Expr, scope: &Scope) -> ValType {
+        match &expr.kind {
+            ExprKind::IntLit(_) => ValType::Literal,
+            ExprKind::Ident(id) => match scope.lookup(&id.name) {
+                Some(Binding::Local(_, t)) | Some(Binding::Cell(_, t)) => sirtype_valtype(t),
+                _ => ValType::Flexible,
+            },
+            ExprKind::Cast(inner, ty) => {
+                let _ = self.value_type(inner, scope); // check inside the cast
+                sirtype_valtype(&resolve_type_expr(ty))
+            }
+            ExprKind::Not(inner) => {
+                let _ = self.value_type(inner, scope);
+                ValType::Flexible
+            }
+            ExprKind::BinOp { op, lhs, rhs } => {
+                let l = self.value_type(lhs, scope);
+                let r = self.value_type(rhs, scope);
+                self.check_mixed_sign(l, r, expr.span);
+                if is_comparison(*op) || matches!(op, BinOp::And | BinOp::Or) {
+                    ValType::Flexible // boolean result
+                } else {
+                    arith_result(l, r)
+                }
+            }
+            ExprKind::Assign(lhs, rhs) => {
+                let target = self.place_valtype(lhs, scope);
+                let v = self.value_type(rhs, scope);
+                self.check_assign_type(target, v, expr.span);
+                self.check_literal_range(target, rhs, expr.span);
+                v
+            }
+            ExprKind::CompoundAssign(op, lhs, rhs) => {
+                let target = self.place_valtype(lhs, scope);
+                let r = self.value_type(rhs, scope);
+                self.check_mixed_sign(target, r, expr.span);
+                let combined = arith_result(target, r);
+                self.check_assign_type(target, combined, expr.span);
+                let _ = op;
+                combined
+            }
+            ExprKind::Try(inner) => self.value_type(inner, scope),
+            ExprKind::Call { callee, args, .. } => {
+                let _ = self.value_type(callee, scope);
+                for a in args {
+                    let _ = self.value_type(a, scope);
+                }
+                ValType::Flexible
+            }
+            ExprKind::Field(base, _) => {
+                let _ = self.value_type(base, scope);
+                ValType::Flexible
+            }
+            _ => ValType::Flexible, // bool / string / etc.
+        }
+    }
+
+    fn place_valtype(&self, lhs: &Expr, scope: &Scope) -> ValType {
+        match &lhs.kind {
+            ExprKind::Ident(id) => match scope.lookup(&id.name) {
+                Some(Binding::Local(_, t)) | Some(Binding::Cell(_, t)) => sirtype_valtype(t),
+                _ => ValType::Flexible,
+            },
+            _ => ValType::Flexible,
+        }
+    }
+
+    /// Reject `signed <op> unsigned` between two declared-typed operands (§4.3).
+    fn check_mixed_sign(&mut self, l: ValType, r: ValType, span: Span) {
+        if let (ValType::Int { signed: sl, .. }, ValType::Int { signed: sr, .. }) = (l, r) {
+            if sl != sr {
+                self.err(span, "mixed signed/unsigned operands (§4.3) — add an explicit cast");
+            }
+        }
+    }
+
+    /// Reject an implicit narrowing or sign change on assignment (§4.3).
+    fn check_assign_type(&mut self, target: ValType, v: ValType, span: Span) {
+        if let (ValType::Int { width: tw, signed: ts }, ValType::Int { width: vw, signed: vs }) = (target, v) {
+            if ts != vs {
+                self.err(span, "assigning across signedness (§4.3) — add an explicit cast");
+            } else if vw > tw {
+                self.err(
+                    span,
+                    format!("implicit narrowing from {vw}-bit to {tw}-bit (§4.3) — add an explicit cast"),
+                );
+            }
+        }
+    }
+
+    /// Reject an integer literal that does not fit its target type (§4.3).
+    fn check_literal_range(&mut self, target: ValType, rhs: &Expr, span: Span) {
+        if let (ValType::Int { width, signed }, ExprKind::IntLit(n)) = (target, &rhs.kind) {
+            let max: u128 = if signed { (1u128 << (width - 1)) - 1 } else { (1u128 << width) - 1 };
+            if (*n as u128) > max {
+                self.err(
+                    span,
+                    format!(
+                        "literal {n} does not fit in a {width}-bit {} integer (§4.3)",
+                        if signed { "signed" } else { "unsigned" }
+                    ),
+                );
+            }
+        }
+    }
+
     fn lower_expr_stmt(&mut self, expr: &Expr, scope: &mut Scope, vars: &[SirVar], out: &mut Vec<SirStmt>) {
-        // §4.5 time-type check over the whole statement expression (single pass).
+        // §4.5 time-type + §4.3 width/sign checks over the whole statement (one pass each).
         let _ = self.time_kind(expr, scope);
+        let _ = self.value_type(expr, scope);
         match &expr.kind {
             ExprKind::Assign(lhs, rhs) => {
                 if let Some(place) = self.expr_to_place(lhs, scope) {
@@ -1273,6 +1389,10 @@ impl Resolver {
                 self.make_binop(*op, l, r)
             }
             ExprKind::Not(inner) => SirExpr::Not(Box::new(self.lower_expr_emit(inner, scope, vars, out))),
+            ExprKind::Cast(inner, ty) => {
+                let v = self.lower_expr_emit(inner, scope, vars, out);
+                lower_cast(v, ty)
+            }
             _ => self.lower_expr(expr, scope),
         }
     }
@@ -1533,6 +1653,10 @@ impl Resolver {
                 SirExpr::U64(0)
             }
             ExprKind::Not(inner) => SirExpr::Not(Box::new(self.lower_expr(inner, scope))),
+            ExprKind::Cast(inner, ty) => {
+                let v = self.lower_expr(inner, scope);
+                lower_cast(v, ty)
+            }
             ExprKind::BinOp { op, lhs, rhs } => {
                 let l = self.lower_expr(lhs, scope);
                 let r = self.lower_expr(rhs, scope);
@@ -1952,6 +2076,7 @@ fn expr_touches_cell(expr: &SirExpr, cell: &str) -> bool {
     match expr {
         SirExpr::Load(n) => n == cell,
         SirExpr::Not(inner) => expr_touches_cell(inner, cell),
+        SirExpr::Cast { inner, .. } => expr_touches_cell(inner, cell),
         SirExpr::BinOp(_, l, r) => expr_touches_cell(l, cell) || expr_touches_cell(r, cell),
         SirExpr::Arith { lhs, rhs, .. } => expr_touches_cell(lhs, cell) || expr_touches_cell(rhs, cell),
         _ => false,
@@ -1967,6 +2092,64 @@ fn expr_root_ident(expr: &Expr) -> Option<&str> {
     }
 }
 
+/// `(width_bits, signed)` for an integer SIR type; `None` for non-integers.
+fn sirtype_width_sign(t: &SirType) -> Option<(u8, bool)> {
+    match t {
+        SirType::U8 => Some((8, false)),
+        SirType::U16 => Some((16, false)),
+        SirType::U32 => Some((32, false)),
+        SirType::U64 => Some((64, false)),
+        SirType::S8 => Some((8, true)),
+        SirType::S16 => Some((16, true)),
+        SirType::S32 => Some((32, true)),
+        SirType::S64 => Some((64, true)),
+        _ => None, // bool / bytes — not width-checked
+    }
+}
+
+/// The width/sign category of a value (§4.3).  `Int` is a declared-typed value;
+/// `Literal` is an integer literal (adopts any width/sign that fits, so it never
+/// triggers narrowing/sign errors); `Flexible` is an unknown (a device-op
+/// result, register read, bool, …) — also exempt, to avoid false positives.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ValType {
+    Int { width: u8, signed: bool },
+    Literal,
+    Flexible,
+}
+
+fn sirtype_valtype(t: &SirType) -> ValType {
+    match sirtype_width_sign(t) {
+        Some((width, signed)) => ValType::Int { width, signed },
+        None => ValType::Flexible,
+    }
+}
+
+fn is_comparison(op: BinOp) -> bool {
+    matches!(op, BinOp::EqEq | BinOp::NotEq | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)
+}
+
+/// The width/sign of an arithmetic result (sign already mixed-checked): the
+/// wider of two declared types, or the typed operand when the other is a literal.
+fn arith_result(l: ValType, r: ValType) -> ValType {
+    use ValType::{Flexible, Int, Literal};
+    match (l, r) {
+        (Int { width: wl, signed }, Int { width: wr, .. }) => Int { width: wl.max(wr), signed },
+        (Int { width, signed }, Literal) | (Literal, Int { width, signed }) => Int { width, signed },
+        (Literal, Literal) => Literal,
+        _ => Flexible,
+    }
+}
+
+/// Lower a `<value> as <ty>` cast to a SIR `Cast` (numeric target) or a
+/// pass-through (non-numeric target — the type checker already flagged it).
+fn lower_cast(value: SirExpr, ty: &TypeExpr) -> SirExpr {
+    match sirtype_width_sign(&resolve_type_expr(ty)) {
+        Some((to_width, signed)) => SirExpr::Cast { inner: Box::new(value), to_width, signed },
+        None => value,
+    }
+}
+
 /// Minimal type inference for initialiser expressions.
 fn infer_type_from_expr(expr: &Expr) -> SirType {
     match &expr.kind {
@@ -1974,6 +2157,8 @@ fn infer_type_from_expr(expr: &Expr) -> SirType {
         ExprKind::IntLit(_) => SirType::U32,
         ExprKind::DurationLit(_) => SirType::Duration,
         ExprKind::StringLit(_) => SirType::Bytes,
+        // `<e> as <T>` initialises a binding at the cast's target type.
+        ExprKind::Cast(_, ty) => resolve_type_expr(ty),
         _ => SirType::U32,
     }
 }

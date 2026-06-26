@@ -1,0 +1,38 @@
+// The number model (§4.3): explicit casts, no implicit narrowing or sign mixing.
+//
+// Width is always explicit and conversions are never silent:
+//   - widening (u8 → u32) is implicit and lossless;
+//   - narrowing (u32 → u8) needs an explicit `as` cast (it truncates);
+//   - mixing signed and unsigned in one operation is a type error;
+//   - an out-of-range literal for its target type is a compile error.
+// The `as` cast is the single, visible escape hatch for all of the above.
+//
+// Here a wide accumulator is deliberately narrowed to a byte before it is stored
+// in a u8 cell — the truncation is spelled out, not implied.
+//
+//   silicac --sim examples/casts.si
+
+board demo {
+  soc s {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+}
+
+program app {
+  use board demo as b
+  cell total : u32 = 0   // wide running sum
+  cell low8  : u8  = 0   // its low byte, via an explicit narrowing cast
+
+  every 100ms {
+    total = total + 100
+    low8  = total as u8   // narrowing u32 → u8: explicit, truncates at 256
+  }
+}
+
+sim app_sim for app {
+  run until 350ms
+}
