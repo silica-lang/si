@@ -208,5 +208,35 @@ pick the spec-consistent default and note it in the PR.
       metal_vs_sim + bus_parity gates PASS. NOTE: sound over-approximation (conservative overheads;
       yielding __rf temps counted as stack) not exact -fstack-usage; frame-union opt not yet applied.
 
+### Cluster P0 — earn the headline guarantees (audit #35)
+From the deep audit (issue #35): three headline correctness guarantees are not yet earned —
+worst-case stack bound is not sound (F1 over-approximation), register access enforces ordering but
+not access *semantics* (`rc`/`pop_on_read`/per-field/multi-field), and the FPU-less numeric path
+(`fixed<I,F>`) is non-functional. Plan: `~/.claude/plans/as-an-embedded-firmware-functional-pebble.md`.
+Each item is its own branch (`feat/p0-<id>`) + PR behind the hard gate.
+
+- [ ] P0-1a Measured worst-case stack via `-fcallgraph-info=su,da` (`.ci`; `-fstack-usage`/`.su`
+      fallback) — parse per-function stack + call edges, walk the recursion-banned acyclic graph
+      from entry points (`Reset_Handler`/`SysTick_Handler`/`GPIOTE_IRQHandler`/`__BUS_IRQHandler`/
+      `HardFault_Handler` → `__reaction_<id>`(+`__react_<id>_run`)), print measured budget beside
+      the SIR estimate. `[metal]`
+- [ ] P0-1b Enforce measured budget in `ram_budget()` — hard-error on over-RAM or any `dynamic`
+      frame; keep the SIR estimate as host/unit-test fallback; `harness/stack_budget.sh`. `[metal]`
+- [ ] P0-2a Thread per-field access resolver→SIR→backend (`RegInfo.fields` carries access; field
+      access falls back to register access); reject `Ro` writes / `Wo` reads.
+- [ ] P0-2b `rc`/`pop_on_read` as tracked read-effects — capture the swallowed modifiers; forbid
+      implicit RMW of a read-side-effect register; model `rc` read-clear in the sim. `[metal]`
+- [ ] P0-2c Multi-field single write `REG{a=1, b=1}` — lexer/parser/AST + `SirStmt::RegWrite` with
+      multiple `(mask,shift,value)`; backend emits one combined masked write (not N RMWs). `[metal]`
+- [ ] P0-3a `fixed<I,F>` type + casts + add/sub — `SirType::Fixed`, map `TypeKind::Fixed`, number
+      model + scale-shift casts (mirrors the float/F1 template). examples/fixed.si + tests/fixed.rs.
+- [ ] P0-3c Fixed multiply/divide with rescale — new `SirExpr::FixedArith` (mul: wider intermediate
+      then `>>F`; div: `<<F` then divide), obeying trap/wrap/saturate; C helpers + sim.
+- [ ] P0-3b Decimal + voltage literals — lexer decimal-point path + documented `3v3`/`1v8` →
+      `Token::FixedLit` → `ExprKind::FixedLit` typed as `fixed`.
+- [ ] P0-3d BME280 datasheet compensation end-to-end (the proof point) — replace the elided math in
+      `std/bme280.si` with real `fixed<>` compensation ops; sim composition test asserts a
+      compensated value; keep existing BME280 regressions green.
+
 ## Completed log
 _(append `item — PR #NN — date` here as items land)_
