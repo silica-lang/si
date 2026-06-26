@@ -1,4 +1,5 @@
 pub mod c;
+pub mod stackinfo;
 
 /// Which target a backend lowering is for.  Both targets are *consumers* of the
 /// same SIR (§6.1); only the printer differs.
@@ -32,6 +33,12 @@ impl Target {
                 "-nostdlib",
                 "-nostartfiles",
                 "-O1",
+                // Emit the toolchain's own stack accounting so the RAM budget
+                // can be a *measured* bound, not a synthetic estimate (audit #35,
+                // §5.3): `.ci` (per-function frames + call edges) and `.su`
+                // (per-function frames) — parsed by `backend::stackinfo`.
+                "-fstack-usage",
+                "-fcallgraph-info=su,da",
             ],
         }
     }

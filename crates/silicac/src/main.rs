@@ -15,6 +15,9 @@ use std::process;
 const USAGE: &str =
     "usage: silicac <input.si> [-o <output>] [--emit-c] [--sim] [--target host|metal-nrf52840] [--cc <compiler>] [--std <dir>]";
 
+/// `-dumpbase` for the metal stack-accounting dumps (`silica_stack.{su,ci}`).
+const STACK_DUMP_BASE: &str = "silica_stack";
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cfg = match Config::parse(&args[1..]) {
@@ -143,13 +146,19 @@ fn run(cfg: &Config) -> Result<(), String> {
     }
 
     // ── 5b. RAM-budget gate (metal only, validation gate #1, §5.3) ─────────────
-    if cfg.target == Target::MetalNrf52840 {
+    // The SIR estimate is a fast pre-compile fail; the *measured* budget after
+    // compile (P0-1b, audit #35) is the authoritative bound — kept here so its
+    // `statics`/`ram_size` are in scope for that check.
+    let metal_budget = if cfg.target == Target::MetalNrf52840 {
         let budget = backend::c::ram_budget(&sir)?;
         eprintln!(
-            "silicac: RAM budget {} B used ({} statics + {} stack) of {} B",
+            "silicac: RAM budget (estimate) {} B used ({} statics + {} stack) of {} B",
             budget.used(), budget.statics, budget.stack_reserve, budget.ram_size
         );
-    }
+        Some(budget)
+    } else {
+        None
+    };
 
     // ── 5c. C backend (host or metal — both consume the same SIR, §6.1) ────────
     let c_src = backend::c::CBackend::with_target(cfg.target).emit(&sir);
@@ -180,11 +189,18 @@ fn run(cfg: &Config) -> Result<(), String> {
         // Metal needs the generated linker script (§6.4); it must persist for
         // the link, so write it next to the output.
         let ld_path = cfg.output.with_extension("ld");
+        let dump_dir = std::env::temp_dir();
         if cfg.target == Target::MetalNrf52840 {
             let ld = backend::c::emit_linker_script(&sir)?;
             std::fs::write(&ld_path, ld)
                 .map_err(|e| format!("cannot write '{}': {}", ld_path.display(), e))?;
             cmd.arg("-T").arg(&ld_path);
+            // Pin where GCC writes the `-fstack-usage`/`-fcallgraph-info` dumps
+            // (audit #35, §5.3) so we can read them deterministically below.
+            cmd.arg("-dumpdir")
+                .arg(format!("{}{}", dump_dir.display(), std::path::MAIN_SEPARATOR))
+                .arg("-dumpbase")
+                .arg(STACK_DUMP_BASE);
         }
         let status = cmd
             .arg("-o")
@@ -199,6 +215,38 @@ fn run(cfg: &Config) -> Result<(), String> {
             return Err(format!("C compiler '{}' exited with status {}", cc, status.code().unwrap_or(-1)));
         }
         eprintln!("silicac: compiled '{}' → '{}'", cfg.input.display(), cfg.output.display());
+
+        // Measured RAM-budget gate (§5.3, audit #35, P0-1b): fold the toolchain's
+        // own frame accounting over the (recursion-banned, acyclic) call graph
+        // into the *authoritative* budget — hard-error on over-RAM or any
+        // non-static (alloca/VLA) frame.  The SIR estimate above is only a
+        // fast pre-compile fail / host fallback.
+        if cfg.target == Target::MetalNrf52840 {
+            match backend::stackinfo::from_dump_dir(&dump_dir, STACK_DUMP_BASE) {
+                Some(m) => {
+                    let budget = metal_budget.expect("metal budget computed before compile");
+                    let verdict = backend::stackinfo::enforce(&m, budget.statics, budget.ram_size);
+                    backend::stackinfo::cleanup_dump_dir(&dump_dir, STACK_DUMP_BASE);
+                    match verdict {
+                        Ok(used) => eprintln!(
+                            "silicac: RAM budget (measured) {} B used ({} statics + {} stack, {} source) of {} B",
+                            used, budget.statics, m.bytes, m.source, budget.ram_size
+                        ),
+                        Err(e) => {
+                            // The over-budget artifact must not look like a valid build.
+                            let _ = std::fs::remove_file(&cfg.output);
+                            return Err(e);
+                        }
+                    }
+                }
+                None => {
+                    backend::stackinfo::cleanup_dump_dir(&dump_dir, STACK_DUMP_BASE);
+                    eprintln!(
+                        "silicac: note: no measured stack dump (non-GCC --cc?); RAM budget is the SIR estimate only"
+                    );
+                }
+            }
+        }
     }
 
     Ok(())

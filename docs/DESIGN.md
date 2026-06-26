@@ -927,11 +927,19 @@ on parts that have one — not a runtime mystery.
 > frame at each level (+ a Cortex-M exception frame per level) plus a base context — the worst-case
 > ISR nest, since a reaction cannot preempt one at its own level (non-reentrant, run-to-completion).
 > **Recursion is banned**: the resolver rejects an op that re-enters itself on the active inline path
-> (`§5.3/SIL-005`), which also keeps the inliner — and the bound — finite. **Remaining:** the estimate
-> is a sound *over-approximation* (it uses conservative fixed frame overheads and counts a yielding
-> reaction's static `__rf` temps as if on-stack) rather than the toolchain's exact `-fstack-usage`
-> numbers; and the **frame-union** optimisation (overlapping disjoint-lifetime frames) is not yet
-> applied — both can only make the summed budget *smaller*, never unknowable.
+> (`§5.3/SIL-005`), which also keeps the inliner — and the bound — finite. **Measured bound (audit
+> #35, P0-1a).** Metal builds now also compile with `-fcallgraph-info=su,da` (`.ci`) / `-fstack-usage`
+> (`.su`) and `backend::stackinfo` folds the toolchain's *own* per-function frames over the
+> recursion-banned (acyclic) call graph — `silicac` prints this `measured worst-case stack … B`
+> beside the SIR estimate (e.g. blink: estimate 992 B vs measured 704 B). The `.ci` walk is the
+> sound source; `.su` is a conservative fallback. **Enforced bound (audit #35, P0-1b).** On metal the
+> *measured* number is the authoritative budget: after compile, `backend::stackinfo::enforce` folds it
+> with the statics and **hard-errors** if `statics + worst-case stack > RAM`, or if any frame is
+> non-static (alloca/VLA — impossible since recursion/VLAs are banned, so it signals an unsound bound).
+> The SIR estimate remains a fast pre-compile fail and the host/unit-test fallback. Covered by
+> `harness/stack_budget.sh` (healthy build reports a measured budget; an oversized program is rejected
+> with no firmware emitted). **Remaining:** the **frame-union** optimisation (overlapping
+> disjoint-lifetime frames) is not yet applied — it can only make the budget smaller.
 
 **Frame *union* keeps the static cost affordable (Gemini SIL-005).** Allocating a separate frame for
 every async handler would exhaust RAM on an 8–32 KB part, so the compiler does the opposite of
