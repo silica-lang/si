@@ -616,6 +616,19 @@ fixed-width volatile pointers (§6.2, D09).
 > **Remaining (deferred):** `rc` read-clear for reads buried in conditions (not assignment RHS), and
 > `reserved`/`width=` enforcement.
 
+> **Status (implemented — ARM-conformant barriers, audit #35 P1-1).** The emitted barriers now match
+> the Cortex-M architecture rather than over-/under-barriering. **Cheaper:** Device-memory accesses
+> are kept in program order by the architecture (and `volatile` blocks compiler reordering), so a
+> register store emits a *single trailing* `__DMB()` (the ordering point) instead of the old
+> before-and-after pair. **More correct:** `__ISB()` is now defined and emitted after `MSR BASEPRI`
+> so the raised priority-ceiling is in effect before the protected access (the RTIC pattern, replacing
+> a `__DMB`); a `__DSB()` is emitted after an interrupt-source clear (GPIOTE `EVENTS_IN`) before the
+> handler returns, and `__DSB();__ISB()` after the bus NVIC-disable, so an interrupt does not
+> spuriously re-enter; a `__DSB()` precedes the bus completion-IRQ enable, and an `__ISB()` follows
+> the global `cpsie i`. Verified by `metal_codegen.rs` (single-DMB-per-store, ISB-after-BASEPRI,
+> DSB-at-event-clear) and the `metal_vs_sim` + `bus_parity` Renode gates. **Remaining (deferred):**
+> fully eliminating the trailing `__DMB()` for runs with no Normal↔Device dependency.
+
 ### 4.3 The number / data model
 
 Fixed-width integers are first-class and width is **always explicit**: `u8 u16 u32 u64` and signed
