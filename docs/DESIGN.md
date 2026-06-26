@@ -811,6 +811,18 @@ So the honest claim is: **statics + pools + handler frames + a bounded worst-cas
 at build time. Stack overflow is then a *budget* failure caught at link time, plus an MPU guard-page
 on parts that have one — not a runtime mystery.
 
+> **Status (implemented).** The RAM-budget gate's stack term is now **computed from the program**, not
+> a flat 2048-byte stub: `worst_case_stack` sizes each reaction's frame from its SIR frame-locals
+> (× a word + a fixed per-frame overhead) and sums, over distinct static priority levels, the largest
+> frame at each level (+ a Cortex-M exception frame per level) plus a base context — the worst-case
+> ISR nest, since a reaction cannot preempt one at its own level (non-reentrant, run-to-completion).
+> **Recursion is banned**: the resolver rejects an op that re-enters itself on the active inline path
+> (`§5.3/SIL-005`), which also keeps the inliner — and the bound — finite. **Remaining:** the estimate
+> is a sound *over-approximation* (it uses conservative fixed frame overheads and counts a yielding
+> reaction's static `__rf` temps as if on-stack) rather than the toolchain's exact `-fstack-usage`
+> numbers; and the **frame-union** optimisation (overlapping disjoint-lifetime frames) is not yet
+> applied — both can only make the summed budget *smaller*, never unknowable.
+
 **Frame *union* keeps the static cost affordable (Gemini SIL-005).** Allocating a separate frame for
 every async handler would exhaust RAM on an 8–32 KB part, so the compiler does the opposite of
 wasteful: from the static call-graph and priority map it computes which handler frames have
