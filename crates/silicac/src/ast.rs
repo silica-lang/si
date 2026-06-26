@@ -266,6 +266,11 @@ pub struct RegDecl {
     /// Byte offset from the device's base address.
     pub offset: u64,
     pub access: RegAccess,
+    /// `pop_on_read` / `side_effect` modifier (§4.2/D04): reading the register
+    /// has a side effect, so an implicit read-modify-write of one field would
+    /// disturb it.  Distinct from `access` so a `pop_on_read` register can still
+    /// be `rw` for whole-register writes.
+    pub read_side_effect: bool,
     pub fields: Vec<FieldDecl>,
     pub span: Span,
 }

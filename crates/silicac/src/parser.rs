@@ -629,8 +629,7 @@ impl Parser {
         let offset = self.expect_int_lit()?;
 
         // optional `access <acc>` and other register-level qualifiers
-        let mut access = RegAccess::Rw;
-        access = self.parse_opt_access(access)?;
+        let (access, read_side_effect) = self.parse_opt_access(RegAccess::Rw)?;
 
         // optional field block
         let mut fields = Vec::new();
@@ -648,25 +647,29 @@ impl Parser {
             self.eat(&Token::RBrace)?;
         }
         let end = self.prev_span().end;
-        Ok(RegDecl { name, width, offset, access, fields, span: Span::new(start, end) })
+        Ok(RegDecl { name, width, offset, access, read_side_effect, fields, span: Span::new(start, end) })
     }
 
-    /// Parse an optional `access <acc>` qualifier plus the §4.2 modifier
-    /// idents (`side_effect`, `pop_on_read`, `reserved`) which the slice
-    /// records-then-ignores beyond the access direction.
-    fn parse_opt_access(&mut self, default: RegAccess) -> Result<RegAccess, ParseError> {
+    /// Parse an optional `access <acc>` qualifier plus the §4.2 register-level
+    /// modifier idents.  Returns the access and whether a **read-side-effect**
+    /// modifier (`side_effect` / `pop_on_read`) was present (§4.2/D04, P0-2b);
+    /// `reserved` is still recorded-then-ignored.
+    fn parse_opt_access(&mut self, default: RegAccess) -> Result<(RegAccess, bool), ParseError> {
         let mut access = default;
         if matches!(self.peek(), Some(Token::Ident(s)) if s == "access") {
             self.advance();
             access = self.parse_access_kind()?;
         }
-        // Swallow trailing register-semantics modifiers we don't model yet.
-        while matches!(self.peek(), Some(Token::Ident(s))
-            if s == "side_effect" || s == "pop_on_read" || s == "reserved")
-        {
+        let mut read_side_effect = false;
+        while let Some(Token::Ident(s)) = self.peek() {
+            match s.as_str() {
+                "side_effect" | "pop_on_read" => read_side_effect = true,
+                "reserved" => {} // not a read-side-effect; still unmodelled
+                _ => break,
+            }
             self.advance();
         }
-        Ok(access)
+        Ok((access, read_side_effect))
     }
 
     fn parse_access_kind(&mut self) -> Result<RegAccess, ParseError> {

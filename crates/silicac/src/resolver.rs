@@ -73,6 +73,10 @@ struct RegInfo {
     /// so a `w1c` status bit inside an `rw` register lowers to a single masked
     /// write, not a read-modify-write that would clobber its siblings.
     fields: HashMap<String, (u64, u8, SirRegAccess)>,
+    /// Reading the register has a side effect (`rc`, `pop_on_read`/`side_effect`,
+    /// or any `rc` field), so an implicit read-modify-write of one field would
+    /// disturb it (§4.2/D04, audit #35 P0-2b).
+    read_side_effect: bool,
 }
 
 /// What a device instance's `needs` relation resolves to.
@@ -910,7 +914,7 @@ impl Resolver {
             if let Some(rs) = &def.sections.regs {
                 for r in &rs.regs {
                     let reg_access = map_access(r.access);
-                    let fields = r
+                    let fields: HashMap<String, (u64, u8, SirRegAccess)> = r
                         .fields
                         .iter()
                         .map(|f| {
@@ -920,9 +924,14 @@ impl Resolver {
                             (f.name.name.clone(), (mask, shift, access))
                         })
                         .collect();
+                    // Reading has a side effect if the register is rc, carries a
+                    // pop_on_read/side_effect modifier, or any field is rc.
+                    let read_side_effect = r.read_side_effect
+                        || matches!(reg_access, SirRegAccess::Rc)
+                        || fields.values().any(|(_, _, a)| matches!(a, SirRegAccess::Rc));
                     m.insert(
                         r.name.name.clone(),
-                        RegInfo { device, offset: r.offset, width: r.width, access: reg_access, fields },
+                        RegInfo { device, offset: r.offset, width: r.width, access: reg_access, fields, read_side_effect },
                     );
                 }
             }
@@ -2160,6 +2169,17 @@ impl Resolver {
                         if let Some(&(mask, shift, access)) = ri.fields.get(&field.name) {
                             if matches!(access, SirRegAccess::Ro) {
                                 self.err(field.span, format!("cannot write read-only field '{}.{}' (§4.2)", reg.name, field.name));
+                            }
+                            // A field write that lowers to a read-modify-write
+                            // (rw/rc fields) must not RMW a register whose READ
+                            // has a side effect — the implicit read would disturb
+                            // it (§4.2/D04, P0-2b).  w1c/wo fields are single
+                            // writes (no read), so they are fine.
+                            if ri.read_side_effect && matches!(access, SirRegAccess::Rw | SirRegAccess::Rc) {
+                                self.err(field.span, format!(
+                                    "cannot write field '{}.{}' with a read-modify-write: register '{}' has a read-side-effect (rc/pop_on_read), so the implicit read would disturb it — write the whole register, use a w1c field, or `.raw` (§4.2)",
+                                    reg.name, field.name, reg.name
+                                ));
                             }
                             return Some(reg_place(ri, mask, shift, access));
                         }

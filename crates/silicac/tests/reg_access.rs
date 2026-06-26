@@ -6,6 +6,7 @@
 //! write (no read-modify-write that would clobber its sibling status bits).
 
 use silicac::backend::{c, Target};
+use silicac::sim;
 use silicac::sir::SirModule;
 use silicac::{lexer, parser, resolver};
 
@@ -72,6 +73,52 @@ fn reading_a_write_only_field_is_an_error() {
     let dev = "device statusdev { regs { CR : reg32 at 0x0 access rw { k: bit[0] access wo } } ops { op bad() -> u32 { return CR.k } } }";
     let errs = resolve_err(&program(dev, "bad"));
     assert!(errs.iter().any(|e| e.contains("cannot read write-only field")), "{errs:?}");
+}
+
+#[test]
+fn rmw_of_a_read_to_clear_register_is_an_error() {
+    // A field write to an `rc` register would read-modify-write — and the read
+    // clears it — so it must be rejected.
+    let dev = "device statusdev { regs { ST : reg32 at 0x0 access rc { f: bit[0] } } ops { op bad() -> () { ST.f = 1 } } }";
+    let errs = resolve_err(&program(dev, "bad"));
+    assert!(errs.iter().any(|e| e.contains("read-side-effect")), "{errs:?}");
+}
+
+#[test]
+fn rmw_of_a_pop_on_read_register_is_an_error() {
+    // The `pop_on_read` modifier marks a read side effect even on an `rw`
+    // register — a partial (field) write still RMWs and must be rejected.
+    let dev = "device statusdev { regs { ST : reg32 at 0x0 access rw pop_on_read { f: bit[0] } } ops { op bad() -> () { ST.f = 1 } } }";
+    let errs = resolve_err(&program(dev, "bad"));
+    assert!(errs.iter().any(|e| e.contains("read-side-effect")), "{errs:?}");
+}
+
+#[test]
+fn w1c_field_in_a_pop_on_read_register_is_allowed() {
+    // A `w1c` field is a single write (no read), so it is fine even when the
+    // register has a read side effect — must resolve without error.
+    let dev = "device statusdev { regs { ST : reg32 at 0x0 access rw pop_on_read { ack: bit[0] access w1c } } ops { op ok() -> () { ST.ack = 1 } } }";
+    let tokens = lexer::lex(&program(dev, "ok")).expect("lex");
+    let ast = parser::parse(tokens).expect("parse");
+    assert!(resolver::resolve(&ast).is_ok(), "w1c field write should be allowed on a pop_on_read register");
+}
+
+#[test]
+fn sim_models_read_to_clear() {
+    // seed the rc register to 5; the first read returns 5 and CLEARS it, so the
+    // second read returns 0.
+    let dev = "device clr { regs { ST : reg32 at 0x0 access rc {} } ops { op seed(v: u32) -> () { ST = v }  op get() -> u32 { return ST } } }";
+    let src = format!(
+        "{dev}\n{BOARD}\nprogram p {{\n  use board b as bb\n  let d = bb.dev0\n  cell a : u32 = 0\n  cell c : u32 = 0\n  on sys.start {{ d.seed(5)  a = d.get()  c = d.get() }}\n}}\nsim s for p {{ run until 1ms }}\n"
+    )
+    .replace("dev0 : statusdev", "dev0 : clr");
+    let tokens = lexer::lex(&src).expect("lex");
+    let ast = parser::parse(tokens).expect("parse");
+    let sir: SirModule = resolver::resolve(&ast)
+        .unwrap_or_else(|e| panic!("resolve: {:?}", e.iter().map(|d| &d.msg).collect::<Vec<_>>()));
+    let out = sim::run(&sir).render(&sir);
+    assert!(out.contains("cell a = 5"), "first rc read returns the seeded value:\n{out}");
+    assert!(out.contains("cell c = 0"), "second rc read returns 0 (read cleared it):\n{out}");
 }
 
 #[test]
