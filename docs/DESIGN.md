@@ -1127,6 +1127,12 @@ driver layer underneath Silica devices.
 > memory ops, and explicit control flow — nothing that *needs* a C semantic to be meaningful. The
 > LLVM path (below) is the proof obligation that keeps the C backend honest.
 
+> **Status (implemented — optimisation level, audit #35 P1-2).** Metal builds default to **`-Os`**
+> (size — flash is the scarce embedded resource), not `-O1`. A `--opt <level>` CLI flag overrides it
+> (e.g. `--opt 2`, `--opt z`): `backend::opt_override_flag` forms the `-O…` flag and `run()` drops the
+> default `-O…` in its favour. Verified (`backend::tests`, and blink text size `-Os` 512 B vs `-O2`
+> 552 B); `metal_vs_sim` Renode gate PASS at `-Os`.
+
 The flip side of "C is just a printer" is that the printer must **dodge C's undefined behaviour**,
 or the language's guarantees (checked overflow, fixed widths, ordered MMIO) leak away in codegen
 (D09). The backend emits a strict freestanding subset:
