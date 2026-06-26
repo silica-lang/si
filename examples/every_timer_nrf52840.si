@@ -1,0 +1,36 @@
+// `every` on a hardware TIMER (§4.5, audit #35 P1-4): fine-grained, EXACT
+// periods at 1 µs resolution — no 1 ms SysTick grid, no 24-bit cap.  Each `every`
+// reaction gets its own TIMER1 compare channel.
+//
+//   silicac --sim                    examples/every_timer_nrf52840.si
+//   silicac --target metal-nrf52840  examples/every_timer_nrf52840.si -o every.elf
+//
+// `every 1500us` was a *compile error* under the old 1 ms-quantized SysTick
+// engine; it is now a plain TIMER compare (CC = 1500 ticks).
+
+board nrf52840_dk {
+  soc nrf52840 {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+
+  gpio0 : nrf_gpio at 0x5000_0000
+  led_a : nrf_gpio.pin = gpio0.pin(13) as output
+  led_b : nrf_gpio.pin = gpio0.pin(14) as output
+}
+
+program app {
+  use board nrf52840_dk as dev
+  let a = dev.led_a
+  let b = dev.led_b
+  cell lit_a : bool = false
+  cell lit_b : bool = false
+
+  every 1500us { lit_a = not lit_a  a.set(lit_a) }   // sub-millisecond — exact
+  every 2500us { lit_b = not lit_b  b.set(lit_b) }   // a second compare channel
+}
+
+sim demo for app { run until 8ms }
