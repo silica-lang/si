@@ -487,6 +487,16 @@ indivisible unit), clock-stretching support, and bus-recovery behaviour. A devic
 properties it requires; the controller declares what it provides; a mismatch (a 400 kHz-only sensor
 on a 100 kHz-capped controller) is a **compile error**, not a runtime surprise.
 
+> **Status (implemented).** An interface declares `property <name> [= default]`; a controller adds a
+> `provides <iface> { <name> = <value> }` block; a device constrains a need with
+> `needs { bus : i2c where <expr> }`. At board-bind the resolver const-evaluates the requirement
+> against the provider's values (overlaid on interface defaults, reusing the §4.1 `where` evaluator),
+> and a false result — or a reference to a property the provider doesn't declare — is a compile
+> error. `std/i2c.si` now declares `max_speed`/`addressing`; `std/i2c_controller.si` provides
+> `400_000`/`7`. **Remaining:** the richer property set (atomicity, clock-stretch, bus-recovery
+> behaviour) is expressible but not yet declared on the std interface; property values are
+> integer/bool constants only.
+
 **Capabilities** are unforgeable typed values that gate access. A handler can only touch a device
 it has been *granted* (passed a typed reference to). Floating-point requires an `fpu` capability the
 board only provides if the SoC declares an FPU (§4.3). A secure-enclave boundary is "a core with a

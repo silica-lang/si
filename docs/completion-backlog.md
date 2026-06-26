@@ -43,7 +43,14 @@ pick the spec-consistent default and note it in the PR.
 - [ ] A2 Number model: casts / mixed-sign / odd-width / endianness (§4.3)
 - [ ] A3 instant/duration type rules + `now()` (§4.5)
 - [ ] A4 Disposition completeness vs declared codes (§4.4/D14)
-- [ ] A5 Interface semantic-property checks (§4.1/D18)
+- [x] A5 Interface semantic-property checks (§4.1/D18) — PR #25. Interface `property <name> [=
+      default]`; controller `provides <iface> { name = value }`; device `needs { bus : i2c where
+      <expr> }`. Resolver const-evaluates the requirement against the provider's values (over interface
+      defaults, reusing A1's `where` evaluator) at board-bind — false, or an undeclared property, is a
+      compile error. std/i2c.si declares max_speed/addressing; std/i2c_controller.si provides 400_000/7.
+      examples/bus_speed.si + tests/interface_props.rs (4). Sim/resolve gate. NOTE: richer property set
+      (atomicity/clock-stretch/recovery) expressible but not yet on the std interface; values are
+      int/bool constants.
 
 ### Cluster B — arithmetic safety
 - [ ] B1 Saturating/wrapping ops + `@overflow` directive + overflow-trap-by-default (§4.3/SIL-004) `[metal]`

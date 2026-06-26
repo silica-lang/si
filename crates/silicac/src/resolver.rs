@@ -547,8 +547,8 @@ impl Resolver {
                     // If the need is interface-typed, check conformance (D18).
                     if let Some(ns) = &declared {
                         if let Some(nd) = ns.needs.iter().find(|n| n.name.name == need_name.name) {
-                            let iface = &nd.ty.name;
-                            if self.interfaces.contains_key(iface) && !self.implements(&target.ty, iface) {
+                            let iface = nd.ty.name.clone();
+                            if self.interfaces.contains_key(&iface) && !self.implements(&target.ty, &iface) {
                                 self.err(
                                     inst.span,
                                     format!(
@@ -556,6 +556,11 @@ impl Resolver {
                                         inst.name.name, need_name.name, iface, head, target.ty
                                     ),
                                 );
+                            }
+                            // §4.1/D18: check the `where` constraint over the
+                            // provider's semantic properties.
+                            if let Some(constraint) = nd.constraint.clone() {
+                                self.check_need_properties(&inst.name.name, &need_name.name, &iface, &target.ty, &constraint, inst.span);
                             }
                         }
                     }
@@ -789,6 +794,69 @@ impl Resolver {
                     );
                 }
             }
+        }
+    }
+
+    /// §4.1/D18: const-evaluate an interface-need's `where` constraint against the
+    /// provider's declared semantic properties (`provides <iface> { … }`), falling
+    /// back to the interface's `property` defaults.  A false result — or a
+    /// reference to a property the provider neither sets nor the interface
+    /// defaults — is a compile error.
+    #[allow(clippy::too_many_arguments)]
+    fn check_need_properties(
+        &mut self,
+        inst_name: &str,
+        need_name: &str,
+        iface: &str,
+        provider_ty: &str,
+        constraint: &Expr,
+        span: Span,
+    ) {
+        let mut env: HashMap<String, ConstVal> = HashMap::new();
+        // 1. interface property defaults.
+        if let Some(idef) = self.interfaces.get(iface) {
+            for p in &idef.properties {
+                if let Some(def) = &p.default {
+                    if let Some(v) = const_eval(def, &HashMap::new()) {
+                        env.insert(p.name.name.clone(), v);
+                    }
+                }
+            }
+        }
+        // 2. the provider's declared values for this interface (override defaults).
+        if let Some(dev) = self.device_defs.get(provider_ty) {
+            for block in &dev.sections.provides {
+                if block.iface.name == iface {
+                    for (k, vexpr) in &block.values {
+                        if let Some(v) = const_eval(vexpr, &HashMap::new()) {
+                            env.insert(k.name.clone(), v);
+                        }
+                    }
+                }
+            }
+        }
+        // 3. any property referenced but undeclared → error (typo / unsupported).
+        let mut missing: Option<String> = None;
+        collect_idents(constraint, &mut |name| {
+            if missing.is_none() && !env.contains_key(name) {
+                missing = Some(name.to_string());
+            }
+        });
+        if let Some(prop) = missing {
+            self.err(span, format!(
+                "instance '{inst_name}': `{need_name}` constrains property `{prop}`, which the `{iface}` provider (type '{provider_ty}') does not declare (§4.1/D18)"
+            ));
+            return;
+        }
+        // 4. evaluate the constraint.
+        match const_eval(constraint, &env) {
+            Some(ConstVal::Bool(true)) => {}
+            Some(ConstVal::Bool(false)) => self.err(span, format!(
+                "instance '{inst_name}': the `{iface}` provider (type '{provider_ty}') does not satisfy the property constraint on `{need_name}` (§4.1/D18)"
+            )),
+            _ => self.err(span, format!(
+                "instance '{inst_name}': the `where` constraint on `{need_name}` did not reduce to a boolean (§4.1/D18)"
+            )),
         }
     }
 
@@ -1829,6 +1897,19 @@ enum ConstVal {
 /// Evaluate a constraint/config expression against the bound config `env`.
 /// Returns `None` for anything not reducible to a constant (the caller decides
 /// whether that is an error in context); never panics on bad operands.
+/// Visit every identifier name referenced in a constant expression.
+fn collect_idents(e: &Expr, f: &mut impl FnMut(&str)) {
+    match &e.kind {
+        ExprKind::Ident(id) => f(&id.name),
+        ExprKind::BinOp { lhs, rhs, .. } => {
+            collect_idents(lhs, f);
+            collect_idents(rhs, f);
+        }
+        ExprKind::Not(inner) => collect_idents(inner, f),
+        _ => {}
+    }
+}
+
 fn const_eval(e: &Expr, env: &HashMap<String, ConstVal>) -> Option<ConstVal> {
     match &e.kind {
         ExprKind::IntLit(n) => Some(ConstVal::Int(*n)),

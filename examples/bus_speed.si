@@ -1,0 +1,54 @@
+// Interface semantic-property checks (§4.1/D18).
+//
+// An interface carries *semantic properties* beyond op shapes — for `i2c`, the
+// maximum bus speed and addressing mode (std/i2c.si).  A controller declares the
+// values it actually provides (`provides i2c { … }`); a device declares what it
+// requires (`needs { bus : i2c where … }`).  At board-bind time the compiler
+// const-evaluates the requirement against the provider's properties, so a
+// 400 kHz sensor on a 100 kHz controller is a compile error, not a runtime
+// surprise.
+//
+// Here the fast sensor requires ≥ 400 kHz and the std controller provides exactly
+// 400 kHz, so the constraint is satisfied.  Raising the requirement to
+// `>= 1_000_000`, or pointing it at a slower controller, would fail to compile.
+//
+//   silicac --sim examples/bus_speed.si
+
+device fast_sensor {
+  needs {
+    bus : i2c where max_speed >= 400_000 and addressing == 7
+  }
+  ops {
+    op read() -> u32 or fault{nak, timeout, arblost} yields {
+      let v = bus.read_reg(0x40, 0x00)?
+      return v
+    }
+  }
+}
+
+board demo {
+  soc s {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+  i2c0 : i2c_controller at 0x4000_3000 { needs { clock = soc.sysclk } }
+  env  : fast_sensor { needs { bus = i2c0 } }
+}
+
+program app {
+  use board demo as b
+  let sensor = b.env
+  cell samples : u32 = 0
+
+  every 100ms {
+    let v = sensor.read()?
+    samples = samples + 1
+  }
+}
+
+sim app_sim for app {
+  run until 350ms
+}
