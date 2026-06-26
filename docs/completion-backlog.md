@@ -258,8 +258,11 @@ Each item is its own branch (`feat/p0-<id>`) + PR behind the hard gate.
       `__si_fixmul_*`/`__si_fixdiv_*` helpers (64-bit intermediate, mul `>>F`, div `<<F` then divide,
       div0/out-of-range → trap), sim `eval_fixed`. tests/fixed.rs (+4: 2*3=6, (7/2)*2=7, mul overflow
       traps, metal helper) + examples/fixed.si (prod 12, half 3). metal_vs_sim Renode sanity PASS.
-- [ ] P0-3b Decimal + voltage literals — lexer decimal-point path + documented `3v3`/`1v8` →
-      `Token::FixedLit` → `ExprKind::FixedLit` typed as `fixed`.
+- [x] P0-3b Decimal + voltage literals — PR #44. Lexer: a `.`/`v` between digits →
+      `Token::FixedLit(mantissa, frac_digits)` (`0.5`→(5,1), `3v3`→(33,1)); `ExprKind::FixedLit`
+      adopts the enclosing fixed scale (default Q16.16) via `arith_frac` threaded through let/cell/
+      assign/reg-write. tests/fixed.rs (+3: 0.5*2=1, 3v3*10=33, fixed<8,8> 0.5 scales at F=8) +
+      examples/fixed.si (gained = 3.0*1.5 → 4). metal_vs_sim Renode sanity PASS.
 - [ ] P0-3d BME280 datasheet compensation end-to-end (the proof point) — replace the elided math in
       `std/bme280.si` with real `fixed<>` compensation ops; sim composition test asserts a
       compensated value; keep existing BME280 regressions green.
