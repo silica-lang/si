@@ -1282,6 +1282,16 @@ and the canonical device types `uart`, `gpio`, `i2c`, `spi`, `timer` (and the in
 implement). Every std-lib device is built from datasheets (§8), is un-privileged (§2), and
 demonstrates one pattern cleanly, because the agent will learn the language *from these files*.
 
+> **Status (implemented — escape-hatch metric, audit #35 P2-2).** Risk #4 said to *measure* how often
+> escape hatches appear in the idiom corpus rather than assert it. `backend`-free `metrics::
+> count_escape_hatches` (token-based, comment-safe) counts the strictness escape hatches — `<expr> as
+> <type>` casts, the `+%`/`+|`/… wrap-sat ops, and (forward-compat, 0 today) `.raw`/`.le`/`.be` — and
+> the `escape_audit` bin + `harness/escape_hatch_audit.sh` report them per file. Baseline: corpus
+> total **11** (9 casts, 2 wrap/sat), with the **std lib at just 1** (the bme280 compensation cast).
+> `tests/escape_hatch.rs` gates the std lib at ≤ 3 so a regression toward "escape-hatch everywhere"
+> fails CI — the concrete, deterministic proxy for the agentic-native thesis (a live agent eval, risk
+> #5, remains future work).
+
 ### 7.5 Self-versioning
 
 The spec, the std lib, and the agent-facing guidance **version together** (cf. version-matched
