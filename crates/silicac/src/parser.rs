@@ -1273,6 +1273,19 @@ impl Parser {
                 let block = self.parse_block()?;
                 Ok(Stmt::Atomic(block, Span::new(start, self.prev_span().end)))
             }
+            Some(Token::KwPoll) => {
+                self.advance();
+                // `cond` is parsed below assignment precedence so the trailing
+                // `within`/`else` clauses are never swallowed.
+                let cond = self.parse_or()?;
+                self.eat(&Token::KwWithin)?;
+                let within = self.parse_duration()?;
+                self.eat(&Token::KwElse)?;
+                self.eat(&Token::KwFault)?;
+                let fault_code = self.eat_ident()?;
+                self.eat_optional_semi();
+                Ok(Stmt::Poll { cond, within, fault_code, span: Span::new(start, self.prev_span().end) })
+            }
             Some(Token::KwBecome) => {
                 self.advance();
                 let state = self.eat_ident()?;

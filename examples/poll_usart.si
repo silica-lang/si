@@ -1,0 +1,52 @@
+// Bounded busy-wait (§3.2): `poll <cond> within <d> else fault <code>`.
+//
+// `poll` spins until the condition holds (used for sub-microsecond hardware
+// waits like a UART transmit-empty flag) and does NOT yield the scheduler — its
+// suspending sibling is `await`.  If the bound elapses it raises the fault,
+// which flows to the reaction's Layer-2 disposition (here `skip`).
+//
+//   silicac --sim examples/poll_usart.si
+
+device usart {
+  regs {
+    SR : reg32 at 0x00 access rw { txe: bit[7] }   // status: TXE = transmit-empty
+    DR : reg32 at 0x04 access rw {}                // data
+  }
+  ops {
+    // Mark the transmitter ready (stands in for the hardware setting TXE).
+    op set_ready() -> () { SR.txe = 1 }
+    // Send a byte: wait (bounded, busy) for TXE, then write DR.  Fallible: a
+    // stuck TXE faults with `timeout`.
+    op send(b: u32) -> () or fault{timeout} {
+      poll SR.txe == 1 within 2ms else fault timeout
+      DR = b
+    }
+  }
+}
+
+board demo {
+  soc s {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+  u : usart at 0x4000_4000
+}
+
+program app {
+  use board demo as b
+  let dev = b.u
+  cell sent : u32 = 0
+
+  every 1000ms on fault skip {
+    dev.set_ready()           // TXE now set → the poll below is satisfied
+    dev.send(0x41)?           // busy-wait on TXE, then write DR
+    sent = sent + 1
+  }
+}
+
+sim app_sim for app {
+  run until 2100ms
+}
