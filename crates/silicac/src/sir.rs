@@ -243,6 +243,17 @@ pub enum SirStmt {
     Intrinsic(SirIntrinsic),
     /// Assign `target = value`.
     Assign { target: SirPlace, value: SirExpr },
+    /// `REG{ a = .., b = .. }` — a multi-field single write to one register
+    /// (§4.2, audit #35 P0-2c): the backend combines all fields into ONE store
+    /// (a single masked write when no field needs a read, else one RMW over the
+    /// union mask) instead of a separate read-modify-write per field.
+    RegWrite {
+        device: usize,
+        reg_offset: u64,
+        width: u8,
+        /// (field_mask, field_shift, access, value) per field, in source order.
+        writes: Vec<(u64, u8, SirRegAccess, SirExpr)>,
+    },
     /// `ring.push(v)` (§5.3): enqueue `value`; on a full ring the oldest element
     /// is overwritten (a defined, bounded overflow policy).
     RingPush { ring: String, value: SirExpr },
@@ -372,6 +383,11 @@ pub enum SirExpr {
     /// `to_width` bits (narrowing) or zero/sign-extend (widening); `signed`
     /// records the target signedness for the C emission.
     Cast { inner: Box<SirExpr>, to_width: u8, signed: bool },
+    /// A fixed-point rescaling cast (§4.3, audit #35 P0-3a): convert between
+    /// `fixed<I,F>` scales (or int↔fixed) by shifting the binary point.
+    /// `shift > 0` shifts left (more fractional bits), `shift < 0` shifts right
+    /// (arithmetic when `signed`); the result is truncated to `to_width` bits.
+    FixedCast { inner: Box<SirExpr>, shift: i8, to_width: u8, signed: bool },
     /// `ring.len()` — current element count (§5.3).
     RingLen(String),
     /// `ring.is_empty()` — count == 0.
@@ -452,6 +468,11 @@ pub enum SirType {
     /// a follow-up — these carry the type so the gate is enforceable.
     F32,
     F64,
+    /// `fixed<I, F>` — binary fixed-point with `int_bits` integer and `frac_bits`
+    /// fractional bits (§4.3, audit #35 P0-3a).  The FPU-less fractional path:
+    /// it is integer math underneath, stored in a 2's-complement integer of
+    /// `storage_bits` rounded up to 8/16/32/64.
+    Fixed { int_bits: u8, frac_bits: u8, signed: bool },
 }
 
 impl SirType {
@@ -473,6 +494,33 @@ impl SirType {
             SirType::Ring { .. } => "struct __ring",
             SirType::F32 => "float",
             SirType::F64 => "double",
+            SirType::Fixed { int_bits, frac_bits, signed } => {
+                match (SirType::fixed_storage_bits(*int_bits, *frac_bits), signed) {
+                    (8, true) => "int8_t",
+                    (8, false) => "uint8_t",
+                    (16, true) => "int16_t",
+                    (16, false) => "uint16_t",
+                    (32, true) => "int32_t",
+                    (32, false) => "uint32_t",
+                    (_, true) => "int64_t",
+                    (_, false) => "uint64_t",
+                }
+            }
+        }
+    }
+
+    /// Storage width in bits for a `fixed<I, F>` — the smallest of 8/16/32/64
+    /// that holds `int_bits + frac_bits` (capped at 64).
+    pub fn fixed_storage_bits(int_bits: u8, frac_bits: u8) -> u32 {
+        let total = int_bits as u32 + frac_bits as u32;
+        if total <= 8 {
+            8
+        } else if total <= 16 {
+            16
+        } else if total <= 32 {
+            32
+        } else {
+            64
         }
     }
 
@@ -495,6 +543,9 @@ impl SirType {
             SirType::U64 | SirType::S64 | SirType::Instant | SirType::Duration | SirType::F64 => 8,
             // cap elements + head/tail/count (3 × u32).
             SirType::Ring { elem_bytes, cap } => (*cap as u64) * (*elem_bytes as u64) + 12,
+            SirType::Fixed { int_bits, frac_bits, .. } => {
+                (SirType::fixed_storage_bits(*int_bits, *frac_bits) / 8) as u64
+            }
         }
     }
 }

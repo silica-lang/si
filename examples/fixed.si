@@ -1,0 +1,31 @@
+// Fixed-point `fixed<I, F>` (§4.3, audit #35 P0-3a): the FPU-less fractional
+// path the `float`-requires-an-FPU error points to.  It is integer math
+// underneath — int↔fixed casts shift the binary point, and same-scale add/sub
+// are raw integer ops at the storage width (here Q16.16 → int32_t).
+//
+//   silicac --sim                    examples/fixed.si
+//   silicac --target metal-nrf52840  examples/fixed.si -o fixed.elf
+//
+// (Decimal/voltage literals like `0.5` / `3v3` and fixed multiply/divide land in
+//  P0-3b / P0-3c; this slice is the type, casts, and add/sub.)
+
+board demo {
+  soc s {
+    memory { flash : region at 0x0 size 256K   ram : region at 0x2000_0000 size 64K }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+}
+
+program app {
+  use board demo as b
+  cell sum : u32 = 0
+
+  on sys.start {
+    let a = 3 as fixed<16,16>
+    let b2 = 4 as fixed<16,16>
+    let c = a + b2        // 7.0 in Q16.16 — a raw 32-bit add at the shared scale
+    sum = c as u32        // shift the binary point back out → 7
+  }
+}
+
+sim app_sim for app { run until 1ms }

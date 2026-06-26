@@ -608,9 +608,13 @@ fixed-width volatile pointers (§6.2, D09).
 > are now load-bearing: a register read with a side effect (`rc` access, the `pop_on_read`/`side_effect`
 > modifier — now captured rather than swallowed — or any `rc` field) makes a partial *field* write a
 > **compile error** (the implicit read-modify-write would disturb it) — write the whole register, use a
-> `w1c` field, or `.raw`. The sim models `rc` read-to-clear at assignment sites. **Remaining:** P0-2c
-> adds the multi-field single write `CR1{a=1, b=1}`; `rc` read-clear for reads buried in conditions
-> (not assignment RHS), and `reserved`/`width=` enforcement, are still deferred.
+> `w1c` field, or `.raw`. The sim models `rc` read-to-clear at assignment sites. **Multi-field single
+> write (audit #35 P0-2c).** `REG{ a = .., b = .. }` updates several fields of one register in **one**
+> store (`Stmt::RegWrite` → `SirStmt::RegWrite`): a single masked write when every field is w1c/wo,
+> else one read-modify-write over the *union* mask — never one RMW per field. Direction (`ro`),
+> duplicate-field, unknown-field, and read-side-effect-RMW errors all apply. **Finding 2 complete.**
+> **Remaining (deferred):** `rc` read-clear for reads buried in conditions (not assignment RHS), and
+> `reserved`/`width=` enforcement.
 
 ### 4.3 The number / data model
 
@@ -685,6 +689,17 @@ silent soft-float fallback. In the toy we *refuse* rather than emit slow soft-fl
 > devices" check — is not yet built (the FPU capability is the first, concrete instance); float
 > *arithmetic* at runtime (sim ops, float literals) is a follow-up, so today a `float` value is
 > carried/stored but not computed on.
+
+> **Status (implemented — `fixed<I,F>` type + casts + add/sub, audit #35 P0-3a).** `fixed<I,F>` is a
+> first-class `SirType::Fixed { int_bits, frac_bits, signed }` stored in a 2's-complement integer of
+> the smallest of 8/16/32/64 bits that holds `I+F` (e.g. Q16.16 → `int32_t`). It is a **distinct**
+> `ValType` from integers: mixing fixed with an integer, or two different `fixed<I,F>` scales, is a
+> compile error (cast explicitly). A cast touching fixed-point rescales by shifting the binary point
+> (`SirExpr::FixedCast`): int→fixed `<< F`, fixed→int `>> F`, fixed→fixed by the frac-bit difference.
+> Same-scale **add/sub** are raw integer ops at the storage width (so they are overflow-checked exactly
+> like the backing integer). `examples/fixed.si`, `tests/fixed.rs`. **Remaining:** fixed **multiply/
+> divide** with rescale (P0-3c), decimal/voltage **literals** like `0.5`/`3v3` (P0-3b), and the BME280
+> compensation that uses them (P0-3d).
 
 ### 4.4 Fallibility and faults
 

@@ -312,7 +312,7 @@ fn collect_rc_reads(expr: &SirExpr, out: &mut Vec<(usize, u64)>) {
                 out.push((*device, *reg_offset));
             }
         }
-        SirExpr::Not(inner) | SirExpr::Cast { inner, .. } => collect_rc_reads(inner, out),
+        SirExpr::Not(inner) | SirExpr::Cast { inner, .. } | SirExpr::FixedCast { inner, .. } => collect_rc_reads(inner, out),
         SirExpr::BinOp(_, l, r) => {
             collect_rc_reads(l, out);
             collect_rc_reads(r, out);
@@ -789,6 +789,14 @@ impl<'m> Sim<'m> {
                     }
                 }
             }
+            SirStmt::RegWrite { device, reg_offset, writes, .. } => {
+                // Multi-field single write (§4.2 P0-2c): apply each field to the
+                // mock register; the net state matches the backend's one store.
+                for (mask, shift, access, value) in writes {
+                    let v = self.eval_expr(value, frame);
+                    self.write_reg(*device, *reg_offset, *mask, *shift, *access, v);
+                }
+            }
             SirStmt::RingPush { ring, value } => {
                 let v = self.eval_expr(value, frame);
                 if let Some((q, cap)) = self.rings.get_mut(ring) {
@@ -988,6 +996,23 @@ impl<'m> Sim<'m> {
                     v
                 } else {
                     v & ((1u64 << to_width) - 1)
+                }
+            }
+            // Fixed-point rescale (§4.3, P0-3a): shift the binary point, sign-
+            // aware on a right shift, then truncate to the target width.
+            SirExpr::FixedCast { inner, shift, to_width, signed } => {
+                let v = self.eval_expr(inner, frame);
+                let scaled = if *shift >= 0 {
+                    v.wrapping_shl(*shift as u32)
+                } else if *signed {
+                    ((v as i64) >> (-(*shift as i32)) as u32) as u64
+                } else {
+                    v >> (-(*shift as i32)) as u32
+                };
+                if *to_width >= 64 {
+                    scaled
+                } else {
+                    scaled & ((1u64 << to_width) - 1)
                 }
             }
             // Bounded-ring reads (§5.3).

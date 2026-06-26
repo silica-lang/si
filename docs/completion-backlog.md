@@ -242,10 +242,17 @@ Each item is its own branch (`feat/p0-<id>`) + PR behind the hard gate.
       `rc` read-to-clear at assignment sites. tests/reg_access.rs (rc/pop_on_read rejected; w1c-on-
       pop_on_read allowed; sim read-clear 5→0). metal_vs_sim Renode gate PASS. NOTE: rc read-clear in
       conditions (not assignment RHS) and `reserved`/`width=` enforcement deferred.
-- [ ] P0-2c Multi-field single write `REG{a=1, b=1}` — lexer/parser/AST + `SirStmt::RegWrite` with
-      multiple `(mask,shift,value)`; backend emits one combined masked write (not N RMWs). `[metal]`
-- [ ] P0-3a `fixed<I,F>` type + casts + add/sub — `SirType::Fixed`, map `TypeKind::Fixed`, number
-      model + scale-shift casts (mirrors the float/F1 template). examples/fixed.si + tests/fixed.rs.
+- [x] P0-2c Multi-field single write `REG{a=1, b=1}` — PR #41. `Stmt::RegWrite`→`SirStmt::RegWrite`
+      with `(mask,shift,access,value)` per field; parser detects `IDENT {` via peek2; backend
+      `emit_mmio_store_multi` ORs the fields into ONE store (single write when all w1c/wo, else one RMW
+      over the union mask); resolver rejects unknown/duplicate/`ro` fields + read-side-effect RMW; sim
+      applies all fields. tests/reg_multifield.rs (5) + examples/reg_multifield.si. metal_vs_sim Renode
+      gate PASS. **Completes Finding 2** (register access semantics).
+- [x] P0-3a `fixed<I,F>` type + casts + add/sub — PR #42. `SirType::Fixed{int_bits,frac_bits,signed}`
+      (2's-complement int of smallest 8/16/32/64 ≥ I+F); `ValType::Fixed` distinct from int (mixing
+      int / different scales is a compile error); `SirExpr::FixedCast` rescales (int↔fixed `<<`/`>>F`,
+      fixed↔fixed by frac diff) via scope-aware `expr_sirtype`; same-scale add/sub reuse `Arith` at the
+      storage width. examples/fixed.si (sum=7) + tests/fixed.rs (6). metal_vs_sim Renode sanity PASS.
 - [ ] P0-3c Fixed multiply/divide with rescale — new `SirExpr::FixedArith` (mul: wider intermediate
       then `>>F`; div: `<<F` then divide), obeying trap/wrap/saturate; C helpers + sim.
 - [ ] P0-3b Decimal + voltage literals — lexer decimal-point path + documented `3v3`/`1v8` →

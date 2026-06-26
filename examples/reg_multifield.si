@@ -1,0 +1,44 @@
+// Multi-field single register write (§4.2, audit #35 P0-2c): set several fields
+// of one register in ONE store instead of a separate read-modify-write per
+// field — the spec's `CR1{ enable = 1, rxneie = 1 }` shape.
+//
+//   silicac --sim                    examples/reg_multifield.si
+//   silicac --target metal-nrf52840  examples/reg_multifield.si -o uart.elf
+//
+// On metal the three fields lower to a single masked read-modify-write over the
+// union mask (one store), not three; in the sim the net register state matches.
+
+device uartlike {
+  regs {
+    CR1 : reg32 at 0x0 access rw {
+      enable : bit[0]
+      rxneie : bit[5]
+      mode   : field[3:2]
+    }
+  }
+  ops {
+    op configure() -> () { CR1{ enable = 1, rxneie = 1, mode = 2 } }
+    op rd_mode()   -> u32 { return CR1.mode }
+  }
+}
+
+board demo {
+  soc s {
+    memory { flash : region at 0x0 size 256K   ram : region at 0x2000_0000 size 64K }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+  u0 : uartlike at 0x40000000
+}
+
+program app {
+  use board demo as b
+  let u = b.u0
+  cell mode : u32 = 0
+
+  on sys.start {
+    u.configure()
+    mode = u.rd_mode()   // reads back 2 — the mode field survived the combined write
+  }
+}
+
+sim app_sim for app { run until 1ms }

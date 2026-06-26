@@ -614,6 +614,10 @@ pub enum Stmt {
     /// conditional.  Matching must be **total** — a `_` wildcard arm is required,
     /// so no case is silently unhandled.
     Match { scrutinee: Expr, arms: Vec<MatchArm>, span: Span },
+    /// `REG{ field = expr, … }` (§4.2): a multi-field single write — several
+    /// fields of one register updated in **one** store, instead of a separate
+    /// read-modify-write per field (audit #35 P0-2c).
+    RegWrite { reg: Ident, writes: Vec<(Ident, Expr)>, span: Span },
 }
 
 #[derive(Debug, Clone)]

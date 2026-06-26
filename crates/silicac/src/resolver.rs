@@ -1235,7 +1235,16 @@ impl Resolver {
                         self.float_needs_fpu(&ann, t.span); // §4.3 FPU gate
                         ann
                     }
-                    None => time_kind_sirtype(tk).unwrap_or_else(|| infer_type_from_expr(&l.init)),
+                    None => time_kind_sirtype(tk).unwrap_or_else(|| {
+                        // Scope-aware inference picks up a fixed-point scale (§4.3
+                        // P0-3a); otherwise keep the existing literal inference.
+                        let scoped = self.expr_sirtype(&l.init, scope);
+                        if matches!(scoped, SirType::Fixed { .. }) {
+                            scoped
+                        } else {
+                            infer_type_from_expr(&l.init)
+                        }
+                    }),
                 };
                 // §4.3: arithmetic in the initialiser is checked at the binding width.
                 let saved = (self.arith_width, self.arith_signed);
@@ -1306,7 +1315,74 @@ impl Resolver {
             Stmt::Match { scrutinee, arms, span } => {
                 self.lower_match(scrutinee, arms, *span, scope, vars, out);
             }
+            Stmt::RegWrite { reg, writes, span } => {
+                self.lower_reg_write(reg, writes, *span, scope, vars, out);
+            }
         }
+    }
+
+    /// Lower `REG{ a = .., b = .. }` to a single `SirStmt::RegWrite` (§4.2 P0-2c).
+    fn lower_reg_write(
+        &mut self,
+        reg: &Ident,
+        writes: &[(Ident, Expr)],
+        span: Span,
+        scope: &mut Scope,
+        vars: &[SirVar],
+        out: &mut Vec<SirStmt>,
+    ) {
+        let Some(Binding::Reg(ri)) = scope.lookup(&reg.name) else {
+            self.err(reg.span, format!("'{}' is not a register", reg.name));
+            return;
+        };
+        let (device, reg_offset, width, read_side_effect) =
+            (ri.device, ri.offset, ri.width, ri.read_side_effect);
+        // Resolve each field to (mask, shift, access) up front (immutable borrow
+        // of scope) so we can then lower the value exprs (which need &mut self).
+        let mut resolved = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut needs_rmw = false;
+        for (field, _) in writes {
+            match ri.fields.get(&field.name) {
+                Some(&(mask, shift, access)) => {
+                    if !seen.insert(field.name.clone()) {
+                        self.err(field.span, format!("field '{}' written more than once in one `{}{{…}}`", field.name, reg.name));
+                    }
+                    if matches!(access, SirRegAccess::Ro) {
+                        self.err(field.span, format!("cannot write read-only field '{}.{}' (§4.2)", reg.name, field.name));
+                    }
+                    if !matches!(access, SirRegAccess::W1c | SirRegAccess::Wo) {
+                        needs_rmw = true;
+                    }
+                    resolved.push((mask, shift, access));
+                }
+                None => {
+                    self.err(field.span, format!("register '{}' has no field '{}'", reg.name, field.name));
+                    resolved.push((0, 0, SirRegAccess::Rw));
+                }
+            }
+        }
+        // A combined write that still needs a read (any non-w1c/wo field) must
+        // not RMW a register whose read has a side effect (§4.2/D04, P0-2b).
+        if needs_rmw && read_side_effect {
+            self.err(span, format!(
+                "register '{}' has a read-side-effect (rc/pop_on_read); a multi-field write that needs a read-modify-write would disturb it — write only w1c/wo fields, or the whole register, or `.raw` (§4.2)",
+                reg.name
+            ));
+        }
+        // Lower the value exprs at the register width.
+        let saved = (self.arith_width, self.arith_signed);
+        (self.arith_width, self.arith_signed) = (width, false);
+        let sir_writes = writes
+            .iter()
+            .zip(resolved)
+            .map(|((_, value), (mask, shift, access))| {
+                let v = self.lower_expr_emit(value, scope, vars, out);
+                (mask, shift, access, v)
+            })
+            .collect();
+        (self.arith_width, self.arith_signed) = saved;
+        out.push(SirStmt::RegWrite { device, reg_offset, width, writes: sir_writes });
     }
 
     /// Lower `match <scrut> { <pat> => <body>, … }` (§4.4/D14) to a guarded
@@ -1503,6 +1579,21 @@ impl Resolver {
     /// Recursively compute an expression's width/sign category (§4.3), emitting
     /// errors on implicit narrowing and mixed signed/unsigned operands.  Called
     /// once per statement-root expression so each node is visited once.
+    /// Best-effort source `SirType` of an expression — used by `lower_cast` to
+    /// find the fixed-point scale being converted *from* (§4.3, P0-3a).
+    fn expr_sirtype(&self, expr: &Expr, scope: &Scope) -> SirType {
+        match &expr.kind {
+            ExprKind::Ident(id) => match scope.lookup(&id.name) {
+                Some(Binding::Local(_, t)) | Some(Binding::Cell(_, t)) => t.clone(),
+                _ => SirType::U32,
+            },
+            ExprKind::Cast(_, ty) => resolve_type_expr(ty),
+            ExprKind::Try(inner) => self.expr_sirtype(inner, scope),
+            ExprKind::BinOp { lhs, .. } => self.expr_sirtype(lhs, scope),
+            _ => SirType::U32,
+        }
+    }
+
     fn value_type(&mut self, expr: &Expr, scope: &Scope) -> ValType {
         match &expr.kind {
             ExprKind::IntLit(_) => ValType::Literal,
@@ -1572,24 +1663,56 @@ impl Resolver {
 
     /// Reject `signed <op> unsigned` between two declared-typed operands (§4.3).
     fn check_mixed_sign(&mut self, l: ValType, r: ValType, span: Span) {
-        if let (ValType::Int { signed: sl, .. }, ValType::Int { signed: sr, .. }) = (l, r) {
-            if sl != sr {
+        use ValType::{Fixed, Int, Literal};
+        match (l, r) {
+            (Int { signed: sl, .. }, Int { signed: sr, .. }) if sl != sr => {
                 self.err(span, "mixed signed/unsigned operands (§4.3) — add an explicit cast");
             }
+            // Two fixed operands must share the exact same scale to add/sub.
+            (Fixed { int_bits: il, frac_bits: fl, signed: sl }, Fixed { int_bits: ir, frac_bits: fr, signed: sr }) => {
+                if (il, fl, sl) != (ir, fr, sr) {
+                    self.err(span, "fixed-point operands have different `fixed<I,F>` scales (§4.3) — add an explicit cast");
+                }
+            }
+            // Fixed mixed with a *declared* integer needs an explicit cast (a
+            // bare literal is fine — it adopts the fixed scale).
+            (Fixed { .. }, Int { .. }) | (Int { .. }, Fixed { .. }) => {
+                self.err(span, "cannot mix fixed-point and integer operands (§4.3) — add an explicit cast");
+            }
+            (Fixed { .. }, Literal) | (Literal, Fixed { .. }) => {}
+            _ => {}
         }
     }
 
     /// Reject an implicit narrowing or sign change on assignment (§4.3).
     fn check_assign_type(&mut self, target: ValType, v: ValType, span: Span) {
-        if let (ValType::Int { width: tw, signed: ts }, ValType::Int { width: vw, signed: vs }) = (target, v) {
-            if ts != vs {
-                self.err(span, "assigning across signedness (§4.3) — add an explicit cast");
-            } else if vw > tw {
-                self.err(
-                    span,
-                    format!("implicit narrowing from {vw}-bit to {tw}-bit (§4.3) — add an explicit cast"),
-                );
+        use ValType::{Fixed, Int, Literal};
+        match (target, v) {
+            (Int { width: tw, signed: ts }, Int { width: vw, signed: vs }) => {
+                if ts != vs {
+                    self.err(span, "assigning across signedness (§4.3) — add an explicit cast");
+                } else if vw > tw {
+                    self.err(
+                        span,
+                        format!("implicit narrowing from {vw}-bit to {tw}-bit (§4.3) — add an explicit cast"),
+                    );
+                }
             }
+            // Fixed target accepts the same fixed scale or a bare literal; an
+            // integer or a different scale needs an explicit cast.
+            (Fixed { int_bits: ti, frac_bits: tf, signed: ts }, Fixed { int_bits: vi, frac_bits: vf, signed: vs }) => {
+                if (ti, tf, ts) != (vi, vf, vs) {
+                    self.err(span, "assigning a different `fixed<I,F>` scale (§4.3) — add an explicit cast");
+                }
+            }
+            (Fixed { .. }, Int { .. }) => {
+                self.err(span, "assigning an integer to a fixed-point binding (§4.3) — cast with `as fixed<…>`");
+            }
+            (Int { .. }, Fixed { .. }) => {
+                self.err(span, "assigning fixed-point to an integer binding (§4.3) — cast with `as <int>`");
+            }
+            (Fixed { .. }, Literal) | (Literal, _) | (_, Literal) => {}
+            _ => {}
         }
     }
 
@@ -1725,8 +1848,9 @@ impl Resolver {
             }
             ExprKind::Not(inner) => SirExpr::Not(Box::new(self.lower_expr_emit(inner, scope, vars, out))),
             ExprKind::Cast(inner, ty) => {
+                let from = self.expr_sirtype(inner, scope);
                 let v = self.lower_expr_emit(inner, scope, vars, out);
-                lower_cast(v, ty)
+                lower_cast(v, &from, &resolve_type_expr(ty))
             }
             _ => self.lower_expr(expr, scope),
         }
@@ -2076,8 +2200,9 @@ impl Resolver {
             }
             ExprKind::Not(inner) => SirExpr::Not(Box::new(self.lower_expr(inner, scope))),
             ExprKind::Cast(inner, ty) => {
+                let from = self.expr_sirtype(inner, scope);
                 let v = self.lower_expr(inner, scope);
-                lower_cast(v, ty)
+                lower_cast(v, &from, &resolve_type_expr(ty))
             }
             ExprKind::BinOp { op, lhs, rhs } => {
                 let l = self.lower_expr(lhs, scope);
@@ -2457,6 +2582,9 @@ fn stmt_touches_cell(stmt: &SirStmt, cell: &str) -> bool {
         SirStmt::Assign { target, value } => {
             place_touches_cell(target, cell) || expr_touches_cell(value, cell)
         }
+        // A register multi-field write touches a cell only via its value exprs
+        // (the target is MMIO, not a cell).
+        SirStmt::RegWrite { writes, .. } => writes.iter().any(|(_, _, _, v)| expr_touches_cell(v, cell)),
         SirStmt::If { cond, then } => expr_touches_cell(cond, cell) || stmts_touch_cell(then, cell),
         SirStmt::Poll { cond, .. } => expr_touches_cell(cond, cell),
         // An `await` *polls* its condition (it must observe a cell another reaction
@@ -2523,7 +2651,7 @@ fn expr_touches_cell(expr: &SirExpr, cell: &str) -> bool {
     match expr {
         SirExpr::Load(n) => n == cell,
         SirExpr::Not(inner) => expr_touches_cell(inner, cell),
-        SirExpr::Cast { inner, .. } => expr_touches_cell(inner, cell),
+        SirExpr::Cast { inner, .. } | SirExpr::FixedCast { inner, .. } => expr_touches_cell(inner, cell),
         SirExpr::BinOp(_, l, r) => expr_touches_cell(l, cell) || expr_touches_cell(r, cell),
         SirExpr::Arith { lhs, rhs, .. } => expr_touches_cell(lhs, cell) || expr_touches_cell(rhs, cell),
         SirExpr::RingLen(r) | SirExpr::RingEmpty(r) | SirExpr::RingFull(r) => r == cell,
@@ -2571,14 +2699,30 @@ fn sirtype_width_sign(t: &SirType) -> Option<(u8, bool)> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ValType {
     Int { width: u8, signed: bool },
+    /// `fixed<I,F>` (§4.3, P0-3a): distinct from `Int` so mixing fixed with an
+    /// integer — or a different fixed scale — is a type error (needs a cast).
+    Fixed { int_bits: u8, frac_bits: u8, signed: bool },
     Literal,
     Flexible,
 }
 
 fn sirtype_valtype(t: &SirType) -> ValType {
-    match sirtype_width_sign(t) {
-        Some((width, signed)) => ValType::Int { width, signed },
-        None => ValType::Flexible,
+    match t {
+        SirType::Fixed { int_bits, frac_bits, signed } => {
+            ValType::Fixed { int_bits: *int_bits, frac_bits: *frac_bits, signed: *signed }
+        }
+        _ => match sirtype_width_sign(t) {
+            Some((width, signed)) => ValType::Int { width, signed },
+            None => ValType::Flexible,
+        },
+    }
+}
+
+/// `(frac_bits)` of a fixed type, else 0 — the scale used by `lower_cast`.
+fn fixed_frac_bits(t: &SirType) -> u8 {
+    match t {
+        SirType::Fixed { frac_bits, .. } => *frac_bits,
+        _ => 0,
     }
 }
 
@@ -2589,10 +2733,14 @@ fn is_comparison(op: BinOp) -> bool {
 /// The width/sign of an arithmetic result (sign already mixed-checked): the
 /// wider of two declared types, or the typed operand when the other is a literal.
 fn arith_result(l: ValType, r: ValType) -> ValType {
-    use ValType::{Flexible, Int, Literal};
+    use ValType::{Fixed, Flexible, Int, Literal};
     match (l, r) {
         (Int { width: wl, signed }, Int { width: wr, .. }) => Int { width: wl.max(wr), signed },
         (Int { width, signed }, Literal) | (Literal, Int { width, signed }) => Int { width, signed },
+        // Fixed add/sub: both operands must share the same scale (checked in
+        // check_mixed_sign); a literal adopts the fixed scale.
+        (f @ Fixed { .. }, Fixed { .. }) => f,
+        (f @ Fixed { .. }, Literal) | (Literal, f @ Fixed { .. }) => f,
         (Literal, Literal) => Literal,
         _ => Flexible,
     }
@@ -2600,8 +2748,16 @@ fn arith_result(l: ValType, r: ValType) -> ValType {
 
 /// Lower a `<value> as <ty>` cast to a SIR `Cast` (numeric target) or a
 /// pass-through (non-numeric target — the type checker already flagged it).
-fn lower_cast(value: SirExpr, ty: &TypeExpr) -> SirExpr {
-    match sirtype_width_sign(&resolve_type_expr(ty)) {
+fn lower_cast(value: SirExpr, from: &SirType, to: &SirType) -> SirExpr {
+    // A cast touching fixed-point rescales by shifting the binary point
+    // (§4.3, P0-3a): int→fixed shifts left F, fixed→int shifts right F, and
+    // fixed→fixed shifts by the frac-bit difference.
+    if matches!(from, SirType::Fixed { .. }) || matches!(to, SirType::Fixed { .. }) {
+        let shift = (fixed_frac_bits(to) as i16 - fixed_frac_bits(from) as i16).clamp(-64, 64) as i8;
+        let (to_width, signed) = sirtype_ctx(to);
+        return SirExpr::FixedCast { inner: Box::new(value), shift, to_width, signed };
+    }
+    match sirtype_width_sign(to) {
         Some((to_width, signed)) => SirExpr::Cast { inner: Box::new(value), to_width, signed },
         None => value,
     }
@@ -2688,6 +2844,12 @@ fn resolve_type_expr(ty: &TypeExpr) -> SirType {
             "f64" | "double" => SirType::F64,
             _ => SirType::U32,
         },
+        // `fixed<I, F>` — 2's-complement binary fixed-point (§4.3, P0-3a).
+        TypeKind::Fixed(int_bits, frac_bits) => SirType::Fixed {
+            int_bits: (*int_bits).min(64) as u8,
+            frac_bits: (*frac_bits).min(64) as u8,
+            signed: true,
+        },
         TypeKind::Unit => SirType::U8,
         TypeKind::Bytes => SirType::Bytes,
         // `ring<T, N>` — element size from `T`, capacity from the const `N`.
@@ -2742,6 +2904,11 @@ fn sirtype_ctx(ty: &SirType) -> (u8, bool) {
         SirType::Ring { .. } => (32, false),
         // floats are not integer-overflow-checked (§4.3); width is unused here.
         SirType::F32 | SirType::F64 => (32, false),
+        // fixed-point is integer math at its storage width (§4.3, P0-3a), so
+        // add/sub are overflow-checked exactly like the backing integer.
+        SirType::Fixed { int_bits, frac_bits, signed } => {
+            (SirType::fixed_storage_bits(*int_bits, *frac_bits) as u8, *signed)
+        }
     }
 }
 
