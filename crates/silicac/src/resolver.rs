@@ -231,6 +231,15 @@ impl Resolver {
             }
         }
 
+        // ── Apply typed overlays (§3.6) to their target boards, before any
+        //    board is built — so the config `where`-check below validates the
+        //    overlaid value, not the original. ──
+        for item in &module.items {
+            if let Item::Overlay(o) = item {
+                self.apply_overlay(o);
+            }
+        }
+
         // ── Check `implements` conformance (§4.1/D18) + register layout ──
         for item in &module.items {
             if let Item::Device(d) = item {
@@ -396,6 +405,63 @@ impl Resolver {
             ["sys"] => Some(Binding::IntrinsicDevice(IntrinsicDevice::Sys)),
             _ => None,
         }
+    }
+
+    /// Apply a typed overlay (§3.6) to its target board, type-checking each edit.
+    /// `set` overrides a config field (whose `where` constraint is then checked by
+    /// `build_board` on the new value); `remove` deletes an instance/pin binding.
+    fn apply_overlay(&mut self, o: &OverlayDef) {
+        let target = o.target.name.clone();
+        let Some(mut board) = self.boards.remove(&target) else {
+            self.err(o.span, format!("overlay '{}' targets unknown board '{}'", o.name.name, target));
+            return;
+        };
+        for edit in &o.edits {
+            match edit {
+                OverlayEdit::Set { path, value, span } => {
+                    if path.len() != 3 || path[1].name != "config" {
+                        self.err(*span, "overlay `set` path must be `<instance>.config.<field>` (§3.6)");
+                        continue;
+                    }
+                    let inst_name = path[0].name.clone();
+                    let field = path[2].name.clone();
+                    let Some(inst) = board.instances.iter_mut().find(|i| i.name.name == inst_name) else {
+                        self.err(*span, format!("overlay `set`: board '{target}' has no instance '{inst_name}'"));
+                        continue;
+                    };
+                    let dev_ty = inst.device_ty.name.clone();
+                    let is_field = self
+                        .device_defs
+                        .get(&dev_ty)
+                        .and_then(|d| d.sections.config.as_ref())
+                        .map(|c| c.fields.iter().any(|f| f.name.name == field))
+                        .unwrap_or(false);
+                    if !is_field {
+                        self.err(*span, format!("overlay `set`: device '{dev_ty}' has no config field '{field}' (§3.6)"));
+                        continue;
+                    }
+                    if let Some(slot) = inst.config.iter_mut().find(|(k, _)| k.name == field) {
+                        slot.1 = value.clone();
+                    } else {
+                        inst.config.push((path[2].clone(), value.clone()));
+                    }
+                }
+                OverlayEdit::Remove { path, span } => {
+                    if path.len() != 1 {
+                        self.err(*span, "overlay `remove` takes a single instance/binding name (§3.6)");
+                        continue;
+                    }
+                    let name = path[0].name.clone();
+                    let before = board.instances.len() + board.pin_bindings.len();
+                    board.instances.retain(|i| i.name.name != name);
+                    board.pin_bindings.retain(|p| p.name.name != name);
+                    if before == board.instances.len() + board.pin_bindings.len() {
+                        self.err(*span, format!("overlay `remove`: board '{target}' has no '{name}'"));
+                    }
+                }
+            }
+        }
+        self.boards.insert(target, board);
     }
 
     /// Build a board's device instances + pin bindings, populate `self.devices`

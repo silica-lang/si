@@ -91,6 +91,29 @@ pub enum Item {
     /// `sim <name> for <program> { inject ...; run until ... }` — the
     /// deterministic host-simulation script (§7.1).
     Sim(SimDef),
+    /// `overlay <name> for board.<b> { set …; remove … }` — a typed structured
+    /// edit over a board, applied and type-checked at compile time (§3.6).
+    Overlay(OverlayDef),
+}
+
+/// A typed overlay/patch over a named board (§3.6).
+#[derive(Debug, Clone)]
+pub struct OverlayDef {
+    pub name: Ident,
+    /// The board this overlay edits (the `for board.<target>` clause).
+    pub target: Ident,
+    pub edits: Vec<OverlayEdit>,
+    pub span: Span,
+}
+
+/// A single structured edit inside an overlay.  Each addresses a **named path**,
+/// never a textual position, and is checked against the target's schema.
+#[derive(Debug, Clone)]
+pub enum OverlayEdit {
+    /// `set <inst>.config.<field> = <value>` — override a config field.
+    Set { path: Vec<Ident>, value: Expr, span: Span },
+    /// `remove <name>` — delete an instance / pin binding.
+    Remove { path: Vec<Ident>, span: Span },
 }
 
 // ─── Program ─────────────────────────────────────────────────────────────────

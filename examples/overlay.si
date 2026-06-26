@@ -1,0 +1,48 @@
+// Typed overlays / patches (§3.6).
+//
+// An overlay is a *typed structured edit* over a board — the Devicetree-overlay
+// replacement and the agent graph-edit surface, one mechanism.  Every edit
+// addresses a **named path** (never a textual position) and is checked against
+// the target's schema at compile time: `set` must name a real config field and
+// satisfy its `where` constraint; `remove` must name an entity that exists.  A
+// malformed overlay fails to compile, like malformed code — there is no
+// "the patch applied but the result is nonsense" failure mode.
+//
+// Here the overlay retunes the watchdog window and drops a spare sensor the
+// final image does not need.  Building the program uses the *patched* board.
+//
+//   silicac --sim examples/overlay.si
+
+board base {
+  soc s {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+  i2c0  : i2c_controller at 0x4000_3000 { needs { clock = soc.sysclk } }
+  env   : bme280 { needs { bus = i2c0 } }
+  spare : bme280 { needs { bus = i2c0 } }            // dropped by the overlay
+  wdt0  : wdt at 0x4001_0000 { config { timeout = 50ms } }
+}
+
+overlay tune for board.base {
+  set wdt0.config.timeout = 200ms   // retune (checked: 200ms satisfies `where`)
+  remove spare                      // drop the unused sensor
+}
+
+program app {
+  use board base as b
+  let sensor = b.env
+  cell samples : u32 = 0
+
+  every 100ms {
+    let t = sensor.read_temp()?
+    samples = samples + 1
+  }
+}
+
+sim app_sim for app {
+  run until 250ms
+}

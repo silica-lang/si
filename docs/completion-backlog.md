@@ -54,7 +54,13 @@ pick the spec-consistent default and note it in the PR.
       (reuses the priority-ceiling machinery); reject a yield inside. Distinct from the
       per-access auto-critical. examples/atomic.si + tests/atomic.rs.
 - [ ] C2 Bounded types `pool`/`arena`/`ring`/`buffer`/`bytes` (§5.3/§4.3)
-- [ ] C3 Typed overlays — language construct only (§3.6)
+- [x] C3 Typed overlays — compile-time `set`/`remove` (§3.6) — PR #27. `overlay <name> for
+      board.<b> { set <inst>.config.<field> = <v>; remove <name> }` (Item::Overlay). Applied to the
+      target board before build_board, so the §4.1 config `where`-check validates the patched value.
+      `set` checks instance+field exist & overrides (out-of-range → where violation); `remove` deletes
+      an instance/pin-binding (errors if absent); unknown-board target rejected. examples/overlay.si +
+      tests/overlay.rs (6). Sim/resolve gate. NOTE: `extend …needs` parse-rejected (follow-up); remove
+      dangling-ref check not yet enforced; agent overlay-edit API out of scope (Phase 2).
 
 ### Cluster D — Phase-1 yields keystone
 - [x] D1 spi controller leaf + composed example (§3.5) `[metal]` — PR #13. std/spi.si +
