@@ -47,6 +47,9 @@ pub struct SirModule {
     pub core_hz: u64,
     /// Hardware watchdog timeout in ns (§5.6/SIL-006), if the board declares one.
     pub watchdog_timeout_ns: Option<u64>,
+    /// The `SirDevice` id of the system watchdog, so the metal backend can
+    /// configure and feed it over its declared CR/RLR/KR registers (§5.6).
+    pub watchdog_device: Option<usize>,
     /// Number of bus transactions to *hang* (wedged bus, never complete); from
     /// `inject bus_hang times <n>`.
     pub bus_hangs: u32,

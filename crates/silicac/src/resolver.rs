@@ -154,6 +154,7 @@ pub struct Resolver {
     bus_fault_queue: Vec<String>,
     safe_seqs: Vec<SafeSeq>,
     watchdog_timeout_ns: Option<u64>,
+    watchdog_device: Option<usize>,
     bus_hangs: u32,
     run_until_ns: Option<u64>,
     memory: Vec<SirRegion>,
@@ -196,6 +197,7 @@ impl Resolver {
             bus_fault_queue: Vec::new(),
             safe_seqs: Vec::new(),
             watchdog_timeout_ns: None,
+            watchdog_device: None,
             bus_hangs: 0,
             run_until_ns: None,
             memory: Vec::new(),
@@ -270,6 +272,7 @@ impl Resolver {
                 pins: self.pins,
                 core_hz: self.core_hz,
                 watchdog_timeout_ns: self.watchdog_timeout_ns,
+                watchdog_device: self.watchdog_device,
                 bus_hangs: self.bus_hangs,
             })
         } else {
@@ -594,6 +597,7 @@ impl Resolver {
                     .and_then(|e| if let ExprKind::IntLit(n) = e.kind { Some(n) } else { None }),
             };
             self.watchdog_timeout_ns = timeout;
+            self.watchdog_device = instance_ids.get(&inst.name.name).copied();
         }
 
         // Lower each instance's safe op (§5.6), if its type declares one.
