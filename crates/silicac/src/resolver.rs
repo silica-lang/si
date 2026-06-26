@@ -156,6 +156,12 @@ pub struct Resolver {
     /// §4.1/D07 static typestate: device id → its provable current state within
     /// the reaction being lowered (cleared at each reaction boundary).
     device_states: HashMap<usize, String>,
+    /// §4.1/D07 persistent typestate (audit #35 P2-2): device id → the state
+    /// established during `on sys.start` (the boot-time, runs-first state writer).
+    /// Non-`sys.start` reactions are seeded with this instead of starting from the
+    /// declared initial state — so a device configured at boot is provably in its
+    /// configured state in every later reaction.
+    persistent_states: HashMap<usize, String>,
     /// (device id, op name) currently being inlined — the active call path.  A
     /// re-entry of the same entry is recursion, which is banned (§5.3/SIL-005)
     /// and would also hang the inliner.
@@ -214,6 +220,7 @@ impl Resolver {
             tmp_counter: 0,
             op_result: Vec::new(),
             device_states: HashMap::new(),
+            persistent_states: HashMap::new(),
             inlining: Vec::new(),
             devices: Vec::new(),
             events: Vec::new(),
@@ -848,10 +855,26 @@ impl Resolver {
             Trigger::Every(dur) => (SirTrigger::EveryNs(dur.to_ns()), 1),
         };
 
-        // §4.1/D07: each reaction starts with every device in its declared
-        // initial state — typestate is not carried across an event boundary.
-        self.device_states.clear();
+        // §4.1/D07 + persistent typestate (audit #35 P2-2): a reaction starts
+        // with each device in the state `on sys.start` left it (the boot-time,
+        // runs-first writer), else its declared initial state.  `sys.start` runs
+        // exactly once before the scheduler, so its end-state is a sound baseline
+        // for every later reaction; this is the canonical "configure at boot,
+        // use everywhere" pattern.  A `sys.start` reaction itself starts clean
+        // (from the declared initial state) and *publishes* its end-state below.
+        let is_sys_start = matches!(trigger, SirTrigger::SysStart);
+        if is_sys_start {
+            self.device_states.clear();
+        } else {
+            self.device_states = self.persistent_states.clone();
+        }
         let body = self.lower_block(&r.body, scope, vars);
+        if is_sys_start {
+            // Publish the boot configuration so later reactions can rely on it.
+            for (dev, state) in &self.device_states {
+                self.persistent_states.insert(*dev, state.clone());
+            }
+        }
         let yields = body_yields(&body);
         let disposition = lower_disposition(&r.fault_disp);
         let deadline_ns = r.within.as_ref().map(|d| d.to_ns());

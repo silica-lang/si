@@ -63,6 +63,55 @@ fn state_persists_across_multiple_calls_in_one_reaction() {
     let _ = compile(&program("", "dev.power_on()  let a = dev.read()  let b = dev.read()  n = a + b"));
 }
 
+/// A `thermostat` device + board, with two program reactions woven in
+/// (`sys.start` body + an `every` body) — for cross-reaction typestate.
+fn two_reaction_program(sys_start_body: &str, every_body: &str) -> String {
+    format!(
+        r#"
+device thermostat {{
+  regs {{ CTRL : reg32 at 0x00 access rw {{ enable: bit[0] }}  TEMP : reg32 at 0x04 access ro {{}} }}
+  states {{ idle, ready }}
+  ops {{
+    op power_on() -> () {{ CTRL.enable = 1  become ready }}
+    op read() when ready -> u32 {{ return TEMP }}
+  }}
+}}
+board demo {{
+  soc s {{ memory {{ flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K }} clocks {{ sysclk : clock_source = 64MHz }} }}
+  t : thermostat at 0x5000_0000
+}}
+program app {{
+  use board demo as b
+  let dev = b.t
+  cell n : u32 = 0
+  on sys.start {{ {sys_start_body} }}
+  every 100ms {{ {every_body} }}
+}}
+sim app_sim for app {{ run until 150ms }}
+"#
+    )
+}
+
+#[test]
+fn sys_start_typestate_persists_into_later_reactions() {
+    // `power_on()` in `sys.start` leaves the device `ready`; a `read()` in a
+    // *separate* `every` reaction is now provably in state `ready` (audit #35
+    // P2-2) — this was a compile error under reaction-local typestate.
+    let _ = compile(&two_reaction_program("dev.power_on()", "let v = dev.read()  n = v"));
+}
+
+#[test]
+fn without_sys_start_init_a_later_guarded_op_still_errors() {
+    // No boot-time `power_on()` → the device is still `idle` in the `every`
+    // reaction, so `read()` is a compile error (persistence is sound, not blind).
+    let errs = resolve_err(&two_reaction_program("n = 0", "let v = dev.read()  n = v"));
+    assert!(
+        errs.iter().any(|m| m.contains("to be in state 'ready'") && m.contains("'idle'")),
+        "errs: {:?}",
+        errs
+    );
+}
+
 #[test]
 fn calling_a_guarded_op_in_the_wrong_state_is_a_compile_error() {
     // No `power_on()` → the device is still in its initial `idle` state.
