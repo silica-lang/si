@@ -598,6 +598,17 @@ reordered before the buffer is written). The **C backend must not emit C bitfiel
 (their layout is implementation-defined); register access lowers to explicit masked loads/stores on
 fixed-width volatile pointers (§6.2, D09).
 
+> **Status (implemented — per-field access + direction, audit #35 P0-2a).** Access qualifiers attach
+> at the **register or the field** level and are now **load-bearing**: `RegInfo.fields` carries each
+> field's resolved access (its own qualifier, else the register's), threaded resolver→SIR→backend, so
+> a `w1c` field inside an `rw` register lowers to a **single masked write** (not a sibling-clobbering
+> read-modify-write) and a plain `rw` field still RMWs. Writing a `ro` register/field or reading a
+> `wo` one is a **compile error**. `w1c`/`wo` already emit a single write in the backend
+> (`emit_mmio_store`); the sim models `w1c`. **Remaining:** P0-2b makes `rc`/`pop_on_read`
+> read-side-effects load-bearing (forbid the implicit RMW that would read them; model the read-clear
+> in the sim); P0-2c adds the multi-field single write `CR1{a=1, b=1}`; `reserved`/`width=` enforcement
+> still deferred.
+
 ### 4.3 The number / data model
 
 Fixed-width integers are first-class and width is **always explicit**: `u8 u16 u32 u64` and signed
