@@ -7,7 +7,7 @@
 use silicac::backend::stackinfo::{self, FuncFrame};
 use silicac::backend::Target;
 
-// arm-gcc 15.2 -O1 inlines single-use statics, so a leaf/__react_*_run folds
+// arm-gcc 15.2 -Os inlines single-use statics, so a leaf/__react_*_run folds
 // into its caller's frame (here, __reaction_0).
 const CI: &str = r#"graph: { title: "/tmp/x.c"
 node: { title: "__reaction_0" label: "__reaction_0\n/tmp/x.c:5:6\n56 bytes (static)\n0 dynamic objects" }

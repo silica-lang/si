@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 const USAGE: &str =
-    "usage: silicac <input.si> [-o <output>] [--emit-c] [--sim] [--target host|metal-nrf52840] [--cc <compiler>] [--std <dir>]";
+    "usage: silicac <input.si> [-o <output>] [--emit-c] [--sim] [--target host|metal-nrf52840] [--cc <compiler>] [--opt <level>] [--std <dir>]";
 
 /// `-dumpbase` for the metal stack-accounting dumps (`silica_stack.{su,ci}`).
 const STACK_DUMP_BASE: &str = "silica_stack";
@@ -45,6 +45,8 @@ struct Config {
     target: Target,
     cc: Option<String>,
     std_dir: PathBuf,
+    /// `--opt <level>` — override the target's default optimisation level.
+    opt: Option<String>,
 }
 
 impl Config {
@@ -56,6 +58,7 @@ impl Config {
         let mut target = Target::Host;
         let mut cc: Option<String> = None;
         let mut std_dir: Option<PathBuf> = None;
+        let mut opt: Option<String> = None;
 
         let mut i = 0;
         while i < args.len() {
@@ -82,6 +85,10 @@ impl Config {
                     i += 1;
                     std_dir = Some(PathBuf::from(args.get(i).ok_or("--std requires a value")?));
                 }
+                "--opt" => {
+                    i += 1;
+                    opt = Some(args.get(i).ok_or("--opt requires a value (e.g. s, 2, z)")?.clone());
+                }
                 arg if !arg.starts_with('-') => {
                     if input.is_some() {
                         return Err(format!("unexpected argument: {}", arg));
@@ -100,7 +107,7 @@ impl Config {
         });
         let std_dir = std_dir.unwrap_or_else(silicac::default_std_dir);
 
-        Ok(Config { input, output, emit_c, sim, target, cc, std_dir })
+        Ok(Config { input, output, emit_c, sim, target, cc, std_dir, opt })
     }
 }
 
@@ -183,8 +190,16 @@ fn run(cfg: &Config) -> Result<(), String> {
             .map_err(|e| format!("cannot write temp file '{}': {}", c_path.display(), e))?;
 
         let mut cmd = process::Command::new(&cc);
+        // `--opt <level>` replaces the target's default `-O…` flag (P1-2).
+        let opt_override = backend::opt_override_flag(cfg.opt.as_deref());
         for flag in cfg.target.cc_flags() {
+            if opt_override.is_some() && flag.starts_with("-O") {
+                continue; // dropped in favour of the override appended below
+            }
             cmd.arg(flag);
+        }
+        if let Some(o) = &opt_override {
+            cmd.arg(o);
         }
         // Metal needs the generated linker script (§6.4); it must persist for
         // the link, so write it next to the output.
