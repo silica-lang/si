@@ -1,0 +1,45 @@
+// Worst-case stack analysis (§5.3/SIL-005).
+//
+// Total RAM use is a compile-time constant: statics + pools + handler frames +
+// a *bounded worst-case stack*.  Because reactions and ops never recurse (the
+// compiler bans it — the call graph must be acyclic), the stack high-water mark
+// is computable at build time: each reaction's frame is sized from its locals,
+// and the worst-case ISR nesting stacks at most one frame per distinct static
+// priority level.  Building this for `--target metal-nrf52840` prints a budget
+// line whose stack term is *computed from this program*, not a fixed reserve:
+//
+//   silicac --target metal-nrf52840 examples/stack_budget.si -o /dev/null
+//   → silicac: RAM budget <N> B used (<S> statics + <stack> stack) of 262144 B
+//
+// Two reaction priority levels here (the boot one-shot and the periodic timer)
+// nest, so the stack term reflects both.
+//
+//   silicac --sim examples/stack_budget.si
+
+board demo {
+  soc s {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+}
+
+program app {
+  use board demo as b
+  cell boots : u32 = 0
+  cell ticks : u32 = 0
+
+  on sys.start {
+    boots = boots + 1
+  }
+
+  every 100ms {
+    ticks = ticks + 1
+  }
+}
+
+sim app_sim for app {
+  run until 250ms
+}

@@ -67,7 +67,9 @@ fn ram_budget_within_region() {
     let sir = compile(BOOT);
     let b = c::ram_budget(&sir).expect("budget");
     assert_eq!(b.statics, 4); // one u32 cell
-    assert_eq!(b.stack_reserve, c::STACK_RESERVE);
+    // The stack reserve is now the computed worst-case (§5.3), not a flat stub.
+    assert_eq!(b.stack_reserve, c::worst_case_stack(&sir));
+    assert!(b.stack_reserve >= 512, "at least the base context");
     assert_eq!(b.ram_size, 262144);
     assert!(b.used() < b.ram_size);
 }

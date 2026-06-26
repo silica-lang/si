@@ -149,6 +149,10 @@ pub struct Resolver {
     /// §4.1/D07 static typestate: device id → its provable current state within
     /// the reaction being lowered (cleared at each reaction boundary).
     device_states: HashMap<usize, String>,
+    /// (device id, op name) currently being inlined — the active call path.  A
+    /// re-entry of the same entry is recursion, which is banned (§5.3/SIL-005)
+    /// and would also hang the inliner.
+    inlining: Vec<(usize, String)>,
 
     // ── output accumulators ──
     devices: Vec<SirDevice>,
@@ -200,6 +204,7 @@ impl Resolver {
             tmp_counter: 0,
             op_result: Vec::new(),
             device_states: HashMap::new(),
+            inlining: Vec::new(),
             devices: Vec::new(),
             events: Vec::new(),
             cells: Vec::new(),
@@ -1804,6 +1809,18 @@ impl Resolver {
             return SirExpr::Load(dst);
         }
 
+        // §5.3/SIL-005 — recursion is banned: a re-entry of an op already on the
+        // active inline path is a compile error (and would otherwise hang the
+        // inliner with no fixed stack bound).
+        if self.inlining.iter().any(|(d, o)| *d == inst.device && o == op_name) {
+            self.err(
+                span,
+                format!("op '{op_name}' is recursive — recursion is banned so the worst-case stack stays bounded (§5.3/SIL-005)"),
+            );
+            return SirExpr::U64(0);
+        }
+        self.inlining.push((inst.device, op_name.to_string()));
+
         // Otherwise inline the op body with params + needs substituted.
         let mut inner = Scope::new();
         for (p, v) in op.params.iter().zip(arg_vals) {
@@ -1834,6 +1851,7 @@ impl Resolver {
             self.lower_stmt(stmt, &mut inner, vars, out);
         }
         self.op_result.pop();
+        self.inlining.pop();
         SirExpr::Load(result)
     }
 

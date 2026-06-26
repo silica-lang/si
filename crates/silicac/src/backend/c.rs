@@ -10,7 +10,7 @@
 //!
 //! Output is a single `.c` file.  The caller invokes `cc` to compile it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
 
 use crate::backend::Target;
@@ -1851,9 +1851,23 @@ fn c_escape_bytes(bytes: &[u8]) -> String {
 
 // ─── Metal: linker script + RAM budget (§6.4, §5.3) ──────────────────────────
 
-/// Reserved stack budget (bytes).  Worst-case stack analysis (§5.3) is deferred;
-/// for now a fixed reservation is summed into the RAM-budget gate.
-pub const STACK_RESERVE: u64 = 2048;
+// ── Worst-case stack analysis (§5.3/SIL-005) ────────────────────────────────
+// Reactions and ops never recurse (the resolver bans it), so the call graph is
+// acyclic and the worst-case stack is a compile-time sum.  We over-approximate
+// soundly from the SIR: each reaction's frame = its frame-local count × a word
+// plus a fixed per-frame overhead; the worst-case ISR nesting stacks at most one
+// frame per *distinct* static priority level (a reaction cannot preempt one at
+// its own level — non-reentrant, run-to-completion), so the bound is the sum of
+// the largest frame at each level, plus an exception frame per level and a base.
+
+/// Machine word (Cortex-M, AAPCS) — each spilled local rounds up to this.
+const STACK_WORD: u64 = 4;
+/// Per active handler frame: saved registers + call args + spill headroom.
+const FRAME_OVERHEAD: u64 = 96;
+/// Cortex-M hardware exception stack frame pushed per nesting level.
+const EXC_FRAME: u64 = 64;
+/// Base context (main / startup / idle loop) plus headroom.
+const STACK_BASE: u64 = 512;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RamBudget {
@@ -1888,14 +1902,52 @@ pub fn ram_budget(module: &SirModule) -> Result<RamBudget, String> {
         off += size;
     }
     let statics = off;
-    let budget = RamBudget { statics, stack_reserve: STACK_RESERVE, ram_size: ram.size };
+    let stack = worst_case_stack(module);
+    let budget = RamBudget { statics, stack_reserve: stack, ram_size: ram.size };
     if budget.used() > budget.ram_size {
         return Err(format!(
-            "RAM budget exceeded: {} B (statics {} + stack {}) > {} B region '{}'",
-            budget.used(), statics, STACK_RESERVE, ram.size, ram.name
+            "RAM budget exceeded: {} B (statics {} + worst-case stack {}) > {} B region '{}'",
+            budget.used(), statics, stack, ram.size, ram.name
         ));
     }
     Ok(budget)
+}
+
+/// The worst-case stack high-water mark (§5.3/SIL-005), in bytes.  A sound
+/// over-approximation from the SIR: the sum, over distinct static priority
+/// levels, of the largest reaction frame at that level (+ an exception frame),
+/// plus a base context.  Recursion would make this unbounded, so it is banned in
+/// the resolver.
+pub fn worst_case_stack(module: &SirModule) -> u64 {
+    let globals: HashSet<&str> = module.vars.iter().map(|v| v.name.as_str()).collect();
+    // Largest frame seen at each distinct priority level.
+    let mut by_level: BTreeMap<u8, u64> = BTreeMap::new();
+    for r in &module.reactions {
+        let mut frame = HashSet::new();
+        count_frame_vars(&r.body, &globals, &mut frame);
+        let bytes = frame.len() as u64 * STACK_WORD + FRAME_OVERHEAD + EXC_FRAME;
+        let slot = by_level.entry(r.priority).or_insert(0);
+        *slot = (*slot).max(bytes);
+    }
+    STACK_BASE + by_level.values().sum::<u64>()
+}
+
+/// Count a reaction's distinct frame-local slots (assignment targets + bus
+/// destinations that are not module globals), recursing into `if`/critical.
+fn count_frame_vars<'a>(stmts: &'a [SirStmt], globals: &HashSet<&str>, seen: &mut HashSet<&'a str>) {
+    for s in stmts {
+        match s {
+            SirStmt::Assign { target: SirPlace::Var(n), .. } if !globals.contains(n.as_str()) => {
+                seen.insert(n.as_str());
+            }
+            SirStmt::BusXfer { dst, .. } => {
+                seen.insert(dst.as_str());
+            }
+            SirStmt::If { then, .. } => count_frame_vars(then, globals, seen),
+            SirStmt::Critical { body, .. } => count_frame_vars(body, globals, seen),
+            _ => {}
+        }
+    }
 }
 
 // ─── Metal: `every` → SysTick plan (§4.5) ─────────────────────────────────────

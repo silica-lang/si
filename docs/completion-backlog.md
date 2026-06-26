@@ -196,7 +196,15 @@ pick the spec-consistent default and note it in the PR.
       tests/fpu.rs (5). Sim/resolve gate; metal ELF compiles (float→C float). NOTE: the broader
       capability system (unforgeable device grants + handler-touches-only-granted check) and float
       *arithmetic* at runtime are follow-ups — float values are carried but not yet computed on.
-- [ ] F2 Worst-case stack analysis (§5.3/SIL-005) `[metal]`
+- [x] F2 Worst-case stack analysis (§5.3/SIL-005) `[metal]` — PR #32. Replaced the flat
+      `STACK_RESERVE = 2048` stub with `worst_case_stack(module)`: per-reaction frame = frame-locals ×
+      word + fixed overhead; sum over distinct priority levels of the max frame (+ exc frame) + base
+      (the worst-case ISR nest — a reaction can't preempt its own level). Recursion banned in the
+      resolver (inlining-path re-entry → compile error; also keeps the inliner finite).
+      examples/stack_budget.si + tests/stack.rs (3: computed-not-stub, more-levels-grow-it, recursion
+      rejected). ram_budget now prints the computed stack (blink 992B, stack_budget 832B vs 2048).
+      metal_vs_sim + bus_parity gates PASS. NOTE: sound over-approximation (conservative overheads;
+      yielding __rf temps counted as stack) not exact -fstack-usage; frame-union opt not yet applied.
 
 ## Completed log
 _(append `item — PR #NN — date` here as items land)_
