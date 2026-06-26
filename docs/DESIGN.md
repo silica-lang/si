@@ -814,9 +814,20 @@ monotonic clock; arithmetic is defined so only sensible combinations type-check.
 > `instant + instant`, `now() + <bare int>`, scaling an instant, comparing an instant to a
 > non-instant, and assigning an instant to a non-instant cell. A duration literal (`500ms`) is kept
 > type-distinct from a bare integer (`5`) via a dedicated `DurationLit` AST node, so the canonical
-> `now() + 500ms` (ok) vs `now() + 5` (error) distinction holds. **Remaining:** the exact-or-error
-> tick-rate conversion and `rounded` modes below (D15) are not yet enforced; metal `now()` is at
-> 1 ms (SysTick base) resolution.
+> `now() + 500ms` (ok) vs `now() + 5` (error) distinction holds. **Remaining:** the `rounded` modes
+> below (D15) are not yet enforced; metal `now()` is still at 1 ms (SysTick base) resolution.
+
+> **Status (implemented — `every` on a hardware TIMER, audit #35 P1-4).** `every` no longer runs on a
+> 1 ms-quantized SysTick prescaler; it is lowered onto **nRF52840 TIMER1** (1 MHz, free-running 32-bit
+> counter, one CC compare channel per `every` reaction, dispatched from `TIMER1_IRQHandler`, re-armed
+> `CC += period`). Period→ticks is **exact-or-error** at 1 µs resolution (`backend::c::timer_plan`):
+> a sub-µs period, a period beyond the 32-bit counter, or more than 4 `every` reactions is a compile
+> error — but `every 1500us` (rejected by the old 1 ms grid) now just works. SysTick is retained only
+> for `now()`/`within`-deadline bookkeeping and the watchdog feed cadence. Validated on Renode
+> (`metal_vs_sim`, `bus_parity`, `deadline_reset`, `watchdog_reset` all PASS); `examples/
+> every_timer_nrf52840.si` runs two fine-grained periods on two compare channels. **Remaining
+> (deferred):** re-basing `now()`/deadlines onto the TIMER for sub-ms resolution (and fully retiring
+> SysTick) — the chosen P1-4 scope keeps them on SysTick.
 
 **Depth.** v1 ships *unit-safety* (the above). The representation is chosen so that **deadline /
 WCET annotations attach later without redesign**: a reaction may already be written `on x within

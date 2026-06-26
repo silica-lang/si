@@ -141,49 +141,64 @@ program p {
 "#;
 
 #[test]
-fn every_lowers_to_systick_plan() {
+fn every_lowers_to_timer_plan() {
+    // §4.5 P1-4: `every` runs on TIMER1 at 1 MHz — 500 ms = 500_000 ticks
+    // (exact, no 1 ms grid), one compare channel per reaction.
     let sir = compile(BLINK);
-    let plan = c::systick_plan(&sir).expect("plan ok").expect("has periodic reactions");
-    assert_eq!(plan.reload, 63_999); // 64 MHz / 1000 - 1
-    assert_eq!(plan.thresholds.len(), 1);
-    assert_eq!(plan.thresholds[0].1, 500); // 500 ms / 1 ms base
+    let plan = c::timer_plan(&sir).expect("plan ok").expect("has periodic reactions");
+    assert_eq!(plan.channels.len(), 1);
+    assert_eq!(plan.channels[0].1, 500_000); // 500 ms / 1 µs tick
 }
 
 #[test]
-fn every_emits_systick_handler_and_config() {
+fn every_emits_timer_handler_and_config() {
+    // BLINK has no now()/deadline, so SysTick is OFF; `every` is on TIMER1.
     let sir = compile(BLINK);
     let src = c::CBackend::with_target(Target::MetalNrf52840).emit(&sir);
-    assert!(src.contains("void SysTick_Handler(void)"));
-    assert!(src.contains("__systick_ctr_"));
-    assert!(src.contains("= 500U;"), "per-reaction threshold");
-    assert!(src.contains("15 SysTick"), "SysTick in the vector table");
-    assert!(src.contains("(void *)&SysTick_Handler"), "vector entry");
-    assert!(src.contains("0xE000E014UL = 63999UL"), "SYST_RVR config");
-    assert!(src.contains("0xE000E010UL = 0x7UL"), "SYST_CSR enable");
+    assert!(src.contains("void TIMER1_IRQHandler(void)"), "TIMER1 handler:\n{src}");
+    assert!(src.contains("25 TIMER1 (every)"), "TIMER1 in the vector table (IRQ9 → idx 25)");
+    assert!(src.contains("(void *)&TIMER1_IRQHandler"), "vector entry");
+    assert!(src.contains("= 500000UL; /* CC[0] = period"), "compare value = 500_000 ticks");
+    assert!(src.contains(&format!("0x{:08x}UL = 1UL; /* TASKS_START", 0x4000_9000u64)), "TIMER1 started");
+    assert!(src.contains("0xE000E100UL = 0x200UL"), "NVIC ISER0 enables IRQ9 (bit 9 = 0x200)");
+    // No SysTick: BLINK uses neither now() nor a deadline.
+    assert!(!src.contains("void SysTick_Handler(void)"), "SysTick not needed for BLINK");
     assert!(src.contains("cpsie i"), "interrupts enabled");
 }
 
 #[test]
-fn non_whole_millisecond_period_is_an_error() {
+fn sub_microsecond_period_is_an_error() {
+    // 500 ns is not a whole 1 µs TIMER tick (exact-or-error).  Note 1500us — once
+    // an error on the 1 ms grid — is now VALID.
     let src = r#"
 board b { soc s { memory { flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K } clocks { sysclk : clock_source = 64MHz } } }
-program p { use board b as dev  every 1500us { } }
+program p { use board b as dev  every 500ns { } }
 "#;
     let sir = compile(src);
-    let err = c::systick_plan(&sir).expect_err("expected timing error");
+    let err = c::timer_plan(&sir).expect_err("expected timing error");
     assert!(err.contains("whole"), "got: {err}");
 }
 
 #[test]
-fn systick_reload_overflow_is_an_error() {
-    // A core clock so fast that a 1 ms reload exceeds SysTick's 24-bit counter.
+fn sub_millisecond_period_is_now_valid() {
+    // 1500 µs was rejected by the old 1 ms SysTick grid; TIMER1 handles it.
     let src = r#"
-board b { soc s { memory { flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K } clocks { sysclk : clock_source = 20000MHz } } }
-program p { use board b as dev  every 500ms { } }
+board b { soc s { memory { flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K } clocks { sysclk : clock_source = 64MHz } } }
+program p { use board b as dev  every 1500us { } }
 "#;
-    let sir = compile(src);
-    let err = c::systick_plan(&sir).expect_err("expected reload overflow");
-    assert!(err.contains("24 bits"), "got: {err}");
+    let plan = c::timer_plan(&compile(src)).expect("ok").expect("periodic");
+    assert_eq!(plan.channels[0].1, 1_500); // 1500 µs at 1 µs/tick
+}
+
+#[test]
+fn period_exceeding_the_32_bit_counter_is_an_error() {
+    // 5000 s = 5e9 ticks at 1 MHz > 2^32-1.
+    let src = r#"
+board b { soc s { memory { flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K } clocks { sysclk : clock_source = 64MHz } } }
+program p { use board b as dev  every 5000s { } }
+"#;
+    let err = c::timer_plan(&compile(src)).expect_err("expected overflow");
+    assert!(err.contains("32-bit"), "got: {err}");
 }
 
 const BLINK_BTN: &str = r#"
@@ -234,9 +249,9 @@ fn shared_cell_critical_lowers_to_basepri_ceiling() {
     assert!(src.contains("__set_BASEPRI(0x20U)"), "raise to ceiling (button prio)");
     assert!(src.contains("__set_BASEPRI(__bp_saved)"), "restore BASEPRI");
     // Distinct interrupt priorities so the ceiling is meaningful: GPIOTE (button)
-    // more urgent (0x20) than SysTick (timer, 0x40).
+    // more urgent (0x20) than TIMER1 (the `every` timer, 0x40).
     assert!(src.contains("0x20U; /* NVIC IPR IRQ6 priority */"));
-    assert!(src.contains("0x40U; /* SysTick priority */"));
+    assert!(src.contains("0x40U; /* NVIC IPR IRQ9 (TIMER1) priority */"));
 }
 
 #[test]

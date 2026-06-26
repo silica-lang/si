@@ -1384,7 +1384,25 @@ impl CBackend {
         const GPIOTE_IRQN: usize = 6;
         const BUS_IRQN: usize = 8; // nRF52840 SPI0/TWI0 line (matches __BUS_IRQN)
 
-        let systick = match systick_plan(module) {
+        // SysTick is kept for `now()`, `within` deadline bookkeeping, and — when a
+        // watchdog exists — the 1 ms wake cadence the idle-loop feed relies on
+        // (without it the CPU could sleep past the watchdog timeout between
+        // `every` fires).  `every` itself now runs on a hardware TIMER (P1-4).
+        let needs_systick = module_uses_now(module)
+            || !self.deadline_ticks.is_empty()
+            || module.watchdog_device.is_some();
+        let systick_rvr = if needs_systick {
+            match systick_reload(module) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    self.line(&format!("#error \"{}\"", e));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let timer = match timer_plan(module) {
             Ok(p) => p,
             Err(e) => {
                 self.line(&format!("#error \"{}\"", e));
@@ -1423,17 +1441,14 @@ impl CBackend {
         // Layer-3 fault decoder: address-ownership table + HardFault handler.
         self.emit_fault_decoder(module);
 
-        // SysTick handler: software-prescaled per-reaction counters (§4.5).
-        if let Some(plan) = &systick {
+        // SysTick handler: 1 ms bookkeeping for now() + `within` deadlines (§4.5).
+        // (`every` dispatch moved to TIMER1, below.)
+        if needs_systick {
             self.emit_newline();
-            self.line("/* every -> SysTick dispatch (1ms base, per-reaction counters) */");
-            for (id, threshold) in &plan.thresholds {
-                self.line(&format!("static volatile uint32_t __systick_ctr_{} = {}U;", id, threshold));
-            }
+            self.line("/* SysTick 1ms tick: now() uptime + within-deadline countdown (§4.5) */");
             self.line("void SysTick_Handler(void) {");
             self.indent += 1;
             if module_uses_now(module) {
-                // 1ms base tick → advance the uptime clock backing now() (§4.5).
                 self.line("__uptime_ns += UINT64_C(1000000);");
             }
             // §4.5/§5.6 — tick down each armed `within` deadline.  A reaction that
@@ -1448,10 +1463,29 @@ impl CBackend {
                     ));
                 }
             }
-            for (id, threshold) in &plan.thresholds {
-                self.line(&format!("if (--__systick_ctr_{} == 0U) {{", id));
+            self.indent -= 1;
+            self.line("}");
+        }
+
+        // TIMER1 handler: a free-running 1 MHz counter with one compare channel
+        // per `every` reaction; on compare, re-arm (CC += period) and dispatch
+        // (§4.5 P1-4).  Replaces the 1 ms-quantized SysTick prescaler.
+        if let Some(plan) = &timer {
+            self.emit_newline();
+            self.line("/* every -> TIMER1 compare dispatch (§4.5, 1us ticks, exact period) */");
+            self.line("void TIMER1_IRQHandler(void) {");
+            self.indent += 1;
+            for (idx, (id, ticks)) in plan.channels.iter().enumerate() {
+                let evt = TIMER_BASE + 0x140 + 4 * idx as u64; // EVENTS_COMPARE[idx]
+                let cc = TIMER_BASE + 0x540 + 4 * idx as u64; // CC[idx]
+                self.line(&format!("if (*(volatile uint32_t *)0x{:08x}UL != 0U) {{", evt));
                 self.indent += 1;
-                self.line(&format!("__systick_ctr_{} = {}U;", id, threshold));
+                self.line(&format!("*(volatile uint32_t *)0x{:08x}UL = 0U; /* clear EVENTS_COMPARE[{}] */", evt, idx));
+                self.line("__DSB();");
+                self.line(&format!(
+                    "*(volatile uint32_t *)0x{:08x}UL = (*(volatile uint32_t *)0x{:08x}UL + {}UL); /* CC[{}] += period (re-arm) */",
+                    cc, cc, ticks, idx
+                ));
                 self.line(&format!("{}();", reaction_fn_name(*id)));
                 self.indent -= 1;
                 self.line("}");
@@ -1510,7 +1544,7 @@ impl CBackend {
         self.line("__attribute__((section(\".vectors\"), used))");
         self.line("const void *const __vectors[] = {");
         self.indent += 1;
-        let systick_entry = if systick.is_some() { "SysTick_Handler" } else { "__default_handler" };
+        let systick_entry = if needs_systick { "SysTick_Handler" } else { "__default_handler" };
         let mut entries: Vec<(String, String)> = vec![
             ("&_estack".into(), "0  initial SP".into()),
             ("Reset_Handler".into(), "1  reset".into()),
@@ -1531,6 +1565,7 @@ impl CBackend {
         let max_irq = [
             (!events.is_empty()).then_some(GPIOTE_IRQN),
             has_bus.then_some(BUS_IRQN),
+            timer.is_some().then_some(TIMER_IRQN),
         ]
         .into_iter()
         .flatten()
@@ -1539,6 +1574,8 @@ impl CBackend {
             for irq in 0..=maxq {
                 let (sym, note) = if irq == GPIOTE_IRQN && !events.is_empty() {
                     ("GPIOTE_IRQHandler".to_string(), format!("{} GPIOTE", 16 + irq))
+                } else if irq == TIMER_IRQN && timer.is_some() {
+                    ("TIMER1_IRQHandler".to_string(), format!("{} TIMER1 (every)", 16 + irq))
                 } else if irq == BUS_IRQN && has_bus {
                     ("__BUS_IRQHandler".to_string(), format!("{} bus completion", 16 + irq))
                 } else {
@@ -1614,16 +1651,38 @@ impl CBackend {
             self.emit_newline();
         }
 
-        // Program SysTick (architectural system timer at the SCS, §4.5).
-        if let Some(plan) = &systick {
-            self.line("/* SysTick: 1ms base tick (§4.5) */");
-            self.line(&format!("*(volatile uint32_t *)0xE000E014UL = {}UL; /* SYST_RVR */", plan.reload));
+        // Program SysTick (architectural system timer at the SCS, §4.5) — kept
+        // for now()/deadline bookkeeping only, at the lowest urgency (it touches
+        // no cells, so it needs no ceiling priority).
+        if let Some(rvr) = systick_rvr {
+            self.line("/* SysTick: 1ms base tick for now()/deadlines (§4.5) */");
+            self.line(&format!("*(volatile uint32_t *)0xE000E014UL = {}UL; /* SYST_RVR */", rvr));
             self.line("*(volatile uint32_t *)0xE000E018UL = 0UL;        /* SYST_CVR */");
             self.line("__DSB();");
             self.line("*(volatile uint32_t *)0xE000E010UL = 0x7UL;      /* SYST_CSR: ENABLE|TICKINT|CLKSOURCE */");
-            // SysTick exception priority (SHPR3 byte [31:24]) for the ceiling (§5.5).
-            let sys_prio = systick_priority(module).map(|p| self.basepri_byte(p)).unwrap_or(0);
-            self.line(&format!("*(volatile uint8_t *)0xE000ED23UL = 0x{:02x}U; /* SysTick priority */", sys_prio));
+            self.line("*(volatile uint8_t *)0xE000ED23UL = 0xE0U;       /* SysTick priority: lowest */");
+            self.emit_newline();
+        }
+
+        // Program TIMER1 for `every` (§4.5 P1-4): 1 MHz free-running 32-bit
+        // counter, one compare channel per reaction, COMPARE interrupts enabled.
+        if let Some(plan) = &timer {
+            self.line("/* TIMER1: 1MHz free-running, one compare channel per `every` (§4.5) */");
+            self.line(&format!("*(volatile uint32_t *)0x{:08x}UL = 0UL; /* MODE = Timer */", TIMER_BASE + 0x504));
+            self.line(&format!("*(volatile uint32_t *)0x{:08x}UL = 3UL; /* BITMODE = 32-bit */", TIMER_BASE + 0x508));
+            self.line(&format!("*(volatile uint32_t *)0x{:08x}UL = {}UL; /* PRESCALER (16MHz>>{} = 1MHz) */", TIMER_BASE + 0x510, TIMER_PRESCALER, TIMER_PRESCALER));
+            self.line(&format!("*(volatile uint32_t *)0x{:08x}UL = 1UL; /* TASKS_CLEAR */", TIMER_BASE + 0x00C));
+            let mut intenset = 0u64;
+            for (idx, (_id, ticks)) in plan.channels.iter().enumerate() {
+                let cc = TIMER_BASE + 0x540 + 4 * idx as u64;
+                self.line(&format!("*(volatile uint32_t *)0x{:08x}UL = {}UL; /* CC[{}] = period (ticks) */", cc, ticks, idx));
+                intenset |= 1u64 << (16 + idx);
+            }
+            self.line(&format!("*(volatile uint32_t *)0x{:08x}UL = 0x{:x}UL; /* INTENSET: COMPARE[0..] */", TIMER_BASE + 0x304, intenset));
+            let prio = timer_priority(module).map(|p| self.basepri_byte(p)).unwrap_or(0);
+            self.line(&format!("*(volatile uint8_t *)0x{:08x}UL = 0x{:02x}U; /* NVIC IPR IRQ{} (TIMER1) priority */", 0xE000_E400u64 + TIMER_IRQN as u64, prio, TIMER_IRQN));
+            self.line(&format!("*(volatile uint32_t *)0xE000E100UL = 0x{:x}UL; /* NVIC ISER0: enable TIMER1 (IRQ{}) */", 1u64 << TIMER_IRQN, TIMER_IRQN));
+            self.line(&format!("*(volatile uint32_t *)0x{:08x}UL = 1UL; /* TASKS_START */", TIMER_BASE + 0x000));
             self.emit_newline();
         }
 
@@ -1686,7 +1745,7 @@ impl CBackend {
             Some(kr)
         });
 
-        if systick.is_some() || !events.is_empty() || module_has_bus_xfer(module) {
+        if needs_systick || timer.is_some() || !events.is_empty() || module_has_bus_xfer(module) {
             self.line("__DSB();");
             self.line("__asm__ volatile(\"cpsie i\"); /* enable interrupts */");
             self.emit_newline();
@@ -2207,27 +2266,49 @@ fn count_frame_vars<'a>(stmts: &'a [SirStmt], globals: &HashSet<&str>, seen: &mu
     }
 }
 
-// ─── Metal: `every` → SysTick plan (§4.5) ─────────────────────────────────────
+// ─── Metal: `every` → hardware TIMER compare (§4.5, audit #35 P1-4) ───────────
 
 /// Default core clock for the nRF52840 if the board declares none.
 pub const NRF52840_CORE_HZ: u64 = 64_000_000;
-/// SysTick base period: a 1 ms tick, software-prescaled per reaction.  A single
-/// 24-bit SysTick cannot hold long periods directly (500 ms at 64 MHz overflows),
-/// so the handler counts base ticks per `every` reaction.
+/// SysTick base period — a 1 ms tick, kept for `now()`/deadline bookkeeping only
+/// (`every` now runs on a hardware TIMER, below).
 pub const SYSTICK_BASE_NS: u64 = 1_000_000;
 
+/// nRF52840 TIMER1 — drives `every` (TIMER0/IRQ8 collides with the bus IRQ).
+pub const TIMER_BASE: u64 = 0x4000_9000;
+pub const TIMER_IRQN: usize = 9;
+/// PCLK16M (16 MHz) prescaled by 2^4 → a 1 MHz / 1 µs-resolution timer.
+pub const TIMER_PRESCALER: u64 = 4;
+pub const TIMER_HZ: u64 = 16_000_000 >> TIMER_PRESCALER; // 1_000_000
+/// Compare channels available on TIMER1 (one `every` reaction each).
+pub const TIMER_CHANNELS: usize = 4;
+
 #[derive(Debug, Clone)]
-pub struct SysTickPlan {
-    /// SysTick reload value (RVR): `core_hz * base_ns / 1e9 - 1`, must fit 24 bits.
-    pub reload: u64,
-    /// Per-`every`-reaction base-tick threshold: `(reaction_id, ticks)`.
-    pub thresholds: Vec<(usize, u64)>,
+pub struct TimerPlan {
+    /// `(reaction_id, period_ticks)` per `every` reaction — one CC channel each.
+    pub channels: Vec<(usize, u64)>,
 }
 
-/// Plan the SysTick programming for the module's `every` reactions (§4.5).
-/// `Ok(None)` if there are no periodic reactions.  Errors if a period is not a
-/// whole base tick or the reload does not fit SysTick's 24-bit counter.
-pub fn systick_plan(module: &SirModule) -> Result<Option<SysTickPlan>, String> {
+/// The SysTick reload (RVR) for a 1 ms base tick (§4.5) — used for `now()` and
+/// `within` deadline bookkeeping.  Errors if it does not fit the 24-bit counter.
+pub fn systick_reload(module: &SirModule) -> Result<u64, String> {
+    let core_hz = if module.core_hz != 0 { module.core_hz } else { NRF52840_CORE_HZ };
+    let ticks = core_hz * SYSTICK_BASE_NS / 1_000_000_000;
+    if ticks == 0 {
+        return Err(format!("core clock {} Hz too slow for a {} ns SysTick base", core_hz, SYSTICK_BASE_NS));
+    }
+    let reload = ticks - 1;
+    if reload > 0x00FF_FFFF {
+        return Err(format!("SysTick reload {} exceeds 24 bits (core {} Hz)", reload, core_hz));
+    }
+    Ok(reload)
+}
+
+/// Plan the TIMER programming for the module's `every` reactions (§4.5 P1-4).
+/// `Ok(None)` if there are none.  Period→ticks is **exact-or-error** against the
+/// 1 µs TIMER tick (no 1 ms grid); errors on a sub-µs period, a period beyond
+/// the 32-bit counter, or more `every` reactions than compare channels.
+pub fn timer_plan(module: &SirModule) -> Result<Option<TimerPlan>, String> {
     let everys: Vec<(usize, u64)> = module
         .reactions
         .iter()
@@ -2239,31 +2320,40 @@ pub fn systick_plan(module: &SirModule) -> Result<Option<SysTickPlan>, String> {
     if everys.is_empty() {
         return Ok(None);
     }
-    let core_hz = if module.core_hz != 0 { module.core_hz } else { NRF52840_CORE_HZ };
-    let ticks_per_base = core_hz * SYSTICK_BASE_NS / 1_000_000_000;
-    if ticks_per_base == 0 {
-        return Err(format!("core clock {} Hz too slow for a {} ns SysTick base", core_hz, SYSTICK_BASE_NS));
+    if everys.len() > TIMER_CHANNELS {
+        return Err(format!(
+            "{} `every` reactions exceed TIMER1's {} compare channels (§4.5)",
+            everys.len(),
+            TIMER_CHANNELS
+        ));
     }
-    let reload = ticks_per_base - 1;
-    if reload > 0x00FF_FFFF {
-        return Err(format!("SysTick reload {} exceeds 24 bits (core {} Hz)", reload, core_hz));
-    }
-    let mut thresholds = Vec::new();
+    let ns_per_tick = 1_000_000_000 / TIMER_HZ; // 1000 ns at 1 MHz
+    let mut channels = Vec::new();
     for (id, ns) in everys {
-        if ns % SYSTICK_BASE_NS != 0 {
+        if ns % ns_per_tick != 0 {
             return Err(format!(
-                "`every` period {} ns is not a whole {} ns SysTick base tick",
-                ns, SYSTICK_BASE_NS
+                "`every` period {} ns is not a whole {} ns TIMER tick (§4.5 exact-or-error)",
+                ns, ns_per_tick
             ));
         }
-        thresholds.push((id, ns / SYSTICK_BASE_NS));
+        let ticks = ns / ns_per_tick;
+        if ticks == 0 {
+            return Err(format!("`every` period {} ns is shorter than one TIMER tick", ns));
+        }
+        if ticks > u32::MAX as u64 {
+            return Err(format!(
+                "`every` period {} ns ({} ticks) exceeds the 32-bit TIMER counter (§4.5)",
+                ns, ticks
+            ));
+        }
+        channels.push((id, ticks));
     }
-    Ok(Some(SysTickPlan { reload, thresholds }))
+    Ok(Some(TimerPlan { channels }))
 }
 
 /// The abstract priority of the module's periodic (`every`) reactions, used to
-/// set the SysTick exception priority for the ceiling protocol (§5.5).
-fn systick_priority(module: &SirModule) -> Option<u8> {
+/// set the TIMER IRQ priority for the ceiling protocol (§5.5).
+fn timer_priority(module: &SirModule) -> Option<u8> {
     module
         .reactions
         .iter()
