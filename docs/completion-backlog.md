@@ -286,11 +286,13 @@ gate, and `every` on real timer hardware instead of a 1ms SysTick grid. Plan:
 - [ ] P1-3 Flash / code-size budget gate `[metal]` — `flash_budget()`/`enforce_flash()` symmetric to
       the RAM gate; measure `.text+.rodata+.data` via `arm-none-eabi-size` on the linked ELF vs the
       flash region, hard-error + delete ELF on overflow; `harness/flash_budget.sh`. (After P1-2.)
-- [ ] P1-4 `every` on a hardware timer (full rewrite) `[metal]` — replace the 1ms SysTick-prescaler
-      engine with a hardware TIMER/RTC compare (extend `std/timer.si` with compare channels; resolver
-      allocates a channel per `every` with exact-or-error period→ticks; backend programs the timer +
-      IRQ dispatch; re-base `now()`/`within` off it; retire the 1ms grid). Largest/riskiest (Renode
-      timer fidelity — may need a mock peripheral).
+- [x] P1-4 `every` on a hardware timer `[metal]` — PR #51. `every` lowers onto nRF52840 TIMER1
+      (1MHz free-running 32-bit, one CC channel per reaction, `TIMER1_IRQHandler` re-arms `CC+=period`;
+      `timer_plan` does exact-or-error period→ticks at 1µs — `every 1500us` now works, no 1ms grid/
+      24-bit cap). SysTick kept for now()/deadlines + the watchdog feed cadence. Renode models TIMER1
+      (no mock needed). tests/metal_codegen.rs (timer plan/handler/config + error cases) +
+      examples/every_timer_nrf52840.si. metal_vs_sim/bus_parity/deadline_reset/watchdog_reset PASS.
+      **Completes Cluster P1.** NOTE (deferred): re-base now()/deadlines onto the TIMER + retire SysTick.
 
 ## Completed log
 _(append `item — PR #NN — date` here as items land)_
