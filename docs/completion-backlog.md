@@ -285,9 +285,12 @@ gate, and `every` on real timer hardware instead of a 1ms SysTick grid. Plan:
       `backend::opt_override_flag` + a `--opt` CLI flag drop the default `-O…` and append the override
       in `run()` (keeps cc_flags `&'static`). backend::tests (default -Os; flag forming). Blink text
       512B (-Os) vs 552B (-O2) proves it reaches cc; metal_vs_sim Renode gate PASS at -Os.
-- [ ] P1-3 Flash / code-size budget gate `[metal]` — `flash_budget()`/`enforce_flash()` symmetric to
-      the RAM gate; measure `.text+.rodata+.data` via `arm-none-eabi-size` on the linked ELF vs the
-      flash region, hard-error + delete ELF on overflow; `harness/flash_budget.sh`. (After P1-2.)
+- [x] P1-3 Flash / code-size budget gate `[metal]` — PR #50 (stacked on #49). `flash_region_size`/
+      `parse_size`/`enforce_flash` in backend/c.rs; `run()` sizes the ELF via `arm-none-eabi-size`
+      (derived from the cc prefix) and prints `flash budget … of … B` (blink 520 B of 1 MiB), deleting
+      the ELF + erroring on overflow. The linker region check is the first-line hard enforcer;
+      enforce_flash is the clean-message backstop. tests/flash_budget.rs + examples/flash_over_budget_
+      nrf52840.si + harness/flash_budget.sh (healthy reports; oversized rejected, no ELF). metal_vs_sim PASS.
 - [ ] P1-4 `every` on a hardware timer (full rewrite) `[metal]` — replace the 1ms SysTick-prescaler
       engine with a hardware TIMER/RTC compare (extend `std/timer.si` with compare channels; resolver
       allocates a channel per `every` with exact-or-error period→ticks; backend programs the timer +
