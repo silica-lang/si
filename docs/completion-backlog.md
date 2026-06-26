@@ -113,7 +113,13 @@ pick the spec-consistent default and note it in the PR.
 - [ ] E4-metal: enforce `within <d>` on metal (per-reaction deadline timer) — builds on E5.
 
 ### Cluster F — exactness & capabilities (last)
-- [ ] F1 Capabilities + float/FPU gating (§4.1/§4.3)
+- [x] F1 Float/FPU capability gating (§4.1/§4.3) — PR #31. SoC declares `fpu` (SocDef.fpu, parsed as
+      a soc-block line; BoardContext.fpu). `float`/`f32`/`f64`/`double` → SirType::F32/F64 (c_type
+      float/double, byte_size 4/8). A `float` cell/let on a non-FPU SoC is a compile error
+      (float_needs_fpu, checked at program cell/let + reaction-body let). examples/fpu.si +
+      tests/fpu.rs (5). Sim/resolve gate; metal ELF compiles (float→C float). NOTE: the broader
+      capability system (unforgeable device grants + handler-touches-only-granted check) and float
+      *arithmetic* at runtime are follow-ups — float values are carried but not yet computed on.
 - [ ] F2 Worst-case stack analysis (§5.3/SIL-005) `[metal]`
 
 ## Completed log

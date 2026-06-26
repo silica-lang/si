@@ -125,6 +125,8 @@ struct BoardContext {
     pins: HashMap<String, PinRef>,
     /// Instance name → device instance (`env` → bme280 #3) for composed devices.
     instances: HashMap<String, InstanceRef>,
+    /// Whether this board's SoC declares an FPU (§4.1/§4.3), gating `float`.
+    fpu: bool,
 }
 
 // ─── Resolver ─────────────────────────────────────────────────────────────────
@@ -304,7 +306,15 @@ impl Resolver {
                     } else if let Some(inst) = self.try_resolve_instance_expr(&l.init, &scope) {
                         scope.insert(&l.name.name, Binding::Device(inst));
                     } else {
-                        let ty = infer_type_from_expr(&l.init);
+                        // An explicit annotation may name `float` → FPU-gate it.
+                        let ty = match &l.ty {
+                            Some(t) => {
+                                let st = resolve_type_expr(t);
+                                self.float_needs_fpu(&st, t.span);
+                                st
+                            }
+                            None => infer_type_from_expr(&l.init),
+                        };
                         let init = self.lower_expr(&l.init, &scope);
                         scope.insert(&l.name.name, Binding::Local(l.name.name.clone(), ty.clone()));
                         vars.push(SirVar { name: l.name.name.clone(), ty, init, is_cell: false });
@@ -312,6 +322,7 @@ impl Resolver {
                 }
                 ProgramItem::CellDecl(c) => {
                     let ty = resolve_type_expr(&c.ty);
+                    self.float_needs_fpu(&ty, c.ty.span); // §4.3 FPU gate
                     let init = self.lower_expr(&c.init, &scope);
                     scope.insert(&c.name.name, Binding::Cell(c.name.name.clone(), ty.clone()));
                     vars.push(SirVar { name: c.name.name.clone(), ty, init, is_cell: true });
@@ -667,7 +678,8 @@ impl Resolver {
         }
 
         let _ = use_span;
-        let ctx = BoardContext { pins, instances };
+        let fpu = board.soc.as_ref().map(|s| s.fpu).unwrap_or(false);
+        let ctx = BoardContext { pins, instances, fpu };
         self.boards_built.insert(board_name.to_string(), ctx.clone());
         self.board_ctx = Some(ctx);
     }
@@ -727,6 +739,20 @@ impl Resolver {
         let disposition = lower_disposition(&r.fault_disp);
         let deadline_ns = r.within.as_ref().map(|d| d.to_ns());
         Some(SirReaction { id, trigger, body, priority, disposition, yields, deadline_ns })
+    }
+
+    /// §4.1/§4.3 — `float`/`f64` is allowed only on a board whose SoC declares an
+    /// `fpu` capability; otherwise it is a compile error (no silent soft-float).
+    fn float_needs_fpu(&mut self, ty: &SirType, span: Span) {
+        if matches!(ty, SirType::F32 | SirType::F64) {
+            let fpu = self.board_ctx.as_ref().map(|c| c.fpu).unwrap_or(false);
+            if !fpu {
+                self.err(
+                    span,
+                    "`float` requires an FPU, but this program's SoC declares none (§4.3) — use `fixed<…>`, or add `fpu` to the soc on an FPU-bearing part",
+                );
+            }
+        }
     }
 
     /// Build the register bindings for a device type (its `regs` + fields), to
@@ -935,7 +961,15 @@ impl Resolver {
         match stmt {
             Stmt::Expr(expr) => self.lower_expr_stmt(expr, scope, vars, out),
             Stmt::Let(l) => {
-                let ty = infer_type_from_expr(&l.init);
+                // An explicit `: float` annotation is FPU-gated (§4.3).
+                let ty = match &l.ty {
+                    Some(t) => {
+                        let st = resolve_type_expr(t);
+                        self.float_needs_fpu(&st, t.span);
+                        st
+                    }
+                    None => infer_type_from_expr(&l.init),
+                };
                 let value = self.lower_expr_emit(&l.init, scope, vars, out);
                 scope.insert(&l.name.name, Binding::Local(l.name.name.clone(), ty));
                 out.push(SirStmt::Assign { target: SirPlace::Var(l.name.name.clone()), value });
@@ -1790,6 +1824,8 @@ fn resolve_type_expr(ty: &TypeExpr) -> SirType {
             "s64" | "i64" => SirType::S64,
             "bool" => SirType::Bool,
             "bytes" => SirType::Bytes,
+            "float" | "f32" => SirType::F32,
+            "f64" | "double" => SirType::F64,
             _ => SirType::U32,
         },
         TypeKind::Unit => SirType::U8,

@@ -1,0 +1,38 @@
+// Float is gated on an FPU capability (§4.1/§4.3).
+//
+// Floating point is not in the core: it is opt-in and allowed ONLY if the target
+// SoC declares an FPU (the `fpu` capability).  Using `float` on an FPU-less part
+// is a compile error — there is no silent slow soft-float fallback; the design
+// refuses rather than emit it.  For fractional math on parts without an FPU, the
+// first-class `fixed<I, F>` type is the answer.
+//
+// Here the SoC declares `fpu` (the nRF52840's Cortex-M4F has one), so a `float`
+// cell is allowed.  Deleting the `fpu` line below turns the `reading` cell into a
+// compile error.
+//
+//   silicac --sim examples/fpu.si
+
+board dk {
+  soc s {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+    fpu                       // Cortex-M4F: hardware single-precision FPU
+  }
+}
+
+program app {
+  use board dk as b
+  cell reading : float = 0    // allowed: the SoC declares an FPU
+  cell ticks   : u32   = 0
+
+  every 100ms {
+    ticks = ticks + 1
+  }
+}
+
+sim app_sim for app {
+  run until 250ms
+}

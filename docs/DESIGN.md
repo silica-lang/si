@@ -601,6 +601,15 @@ silent soft-float fallback. In the toy we *refuse* rather than emit slow soft-fl
 **not foreclosed**: soft-float can later be a std-lib-provided capability that satisfies the same
 `fpu` requirement.
 
+> **Status (implemented — FPU gate).** A SoC declares the capability with an `fpu` line in its `soc`
+> block (`SocDef.fpu`). `float`/`f32`/`f64`/`double` resolve to `SirType::F32`/`F64`, and a `float`
+> cell or `let` on a board whose SoC does *not* declare `fpu` is a compile error (no silent
+> soft-float). On an FPU board it is allowed and lowers to a C `float`/`double`. **Remaining:** the
+> broader capability system — unforgeable typed device grants and the "a handler touches only granted
+> devices" check — is not yet built (the FPU capability is the first, concrete instance); float
+> *arithmetic* at runtime (sim ops, float literals) is a follow-up, so today a `float` value is
+> carried/stored but not computed on.
+
 ### 4.4 Fallibility and faults
 
 Three distinct layers, kept distinct.
