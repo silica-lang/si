@@ -48,6 +48,22 @@ fn su_fallback_is_a_sound_upper_bound() {
 }
 
 #[test]
+fn enforce_is_the_authoritative_measured_budget() {
+    let m = stackinfo::measure(&stackinfo::parse_ci(CI)).unwrap();
+    // Fits a real 256 KB nRF52840: returns statics + measured stack.
+    assert_eq!(stackinfo::enforce(&m, 1, 262_144).unwrap(), 1 + m.bytes);
+    // Over a tiny region: hard error.
+    assert!(stackinfo::enforce(&m, 0, 256).is_err());
+    // A fabricated non-static (alloca/VLA) frame is rejected as unsound even if
+    // it would fit — recursion/VLAs are banned, so this should never arise.
+    let dynamic = stackinfo::parse_ci(
+        r#"node: { title: "Reset_Handler" label: "Reset_Handler\n16 bytes (dynamic)\n1 dynamic objects" }"#,
+    );
+    let dm = stackinfo::measure(&dynamic).unwrap();
+    assert!(stackinfo::enforce(&dm, 0, 262_144).is_err());
+}
+
+#[test]
 fn metal_target_requests_stack_dumps() {
     let flags = Target::MetalNrf52840.cc_flags();
     assert!(flags.contains(&"-fcallgraph-info=su,da"), "flags: {flags:?}");

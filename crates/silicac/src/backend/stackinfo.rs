@@ -200,6 +200,31 @@ pub fn measure_su(frames: &[FuncFrame]) -> MeasuredStack {
     MeasuredStack { bytes, any_dynamic, source: "stack-usage" }
 }
 
+/// Fold the measured worst-case stack into the RAM budget and enforce it
+/// (§5.3, audit #35, P0-1b).  Returns the total RAM used on success, or a hard
+/// error if the bound is unsound (a non-static alloca/VLA frame) or exceeds the
+/// chip's RAM region.  This is the authoritative metal budget — the SIR
+/// estimate is only a pre-compile fast-fail / host fallback.
+pub fn enforce(measured: &MeasuredStack, statics: u64, ram_size: u64) -> Result<u64, String> {
+    if measured.any_dynamic {
+        return Err(format!(
+            "worst-case stack is not bounded: the toolchain reported a non-static \
+             (alloca/VLA) frame — recursion and VLAs are banned (§5.3), so this is \
+             unexpected; refusing to emit an unsound RAM budget ({} source)",
+            measured.source
+        ));
+    }
+    let used = statics.saturating_add(measured.bytes);
+    if used > ram_size {
+        return Err(format!(
+            "RAM budget exceeded (measured): {} B ({} statics + {} worst-case stack, \
+             {} source) > {} B RAM region (§5.3)",
+            used, statics, measured.bytes, measured.source, ram_size
+        ));
+    }
+    Ok(used)
+}
+
 /// Read `<dir>/<base>.ci` (preferred) or `<dir>/<base>.su` (fallback) and
 /// compute the measured worst-case stack.  Returns `None` if neither dump is
 /// present/usable (e.g. a non-GCC `--cc`), so callers degrade to the estimate.
@@ -302,5 +327,28 @@ edge: { sourcename: "Reset_Handler" targetname: "__reaction_0" label: "/tmp/x.c:
         let m = measure_su(&parse_su(SU));
         assert_eq!(m.bytes, 712);
         assert_eq!(m.source, "stack-usage");
+    }
+
+    fn measured(bytes: u64, any_dynamic: bool) -> MeasuredStack {
+        MeasuredStack { bytes, any_dynamic, source: "callgraph" }
+    }
+
+    #[test]
+    fn enforce_passes_within_budget() {
+        assert_eq!(enforce(&measured(704, false), 1, 262_144).unwrap(), 705);
+    }
+
+    #[test]
+    fn enforce_rejects_over_ram() {
+        let err = enforce(&measured(2000, false), 100, 1024).unwrap_err();
+        assert!(err.contains("RAM budget exceeded"), "got: {err}");
+    }
+
+    #[test]
+    fn enforce_rejects_a_dynamic_frame() {
+        // A non-static frame means the bound is unsound — fail even if it would
+        // otherwise fit comfortably.
+        let err = enforce(&measured(64, true), 0, 262_144).unwrap_err();
+        assert!(err.contains("not bounded"), "got: {err}");
     }
 }

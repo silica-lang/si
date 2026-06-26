@@ -146,13 +146,19 @@ fn run(cfg: &Config) -> Result<(), String> {
     }
 
     // ── 5b. RAM-budget gate (metal only, validation gate #1, §5.3) ─────────────
-    if cfg.target == Target::MetalNrf52840 {
+    // The SIR estimate is a fast pre-compile fail; the *measured* budget after
+    // compile (P0-1b, audit #35) is the authoritative bound — kept here so its
+    // `statics`/`ram_size` are in scope for that check.
+    let metal_budget = if cfg.target == Target::MetalNrf52840 {
         let budget = backend::c::ram_budget(&sir)?;
         eprintln!(
-            "silicac: RAM budget {} B used ({} statics + {} stack) of {} B",
+            "silicac: RAM budget (estimate) {} B used ({} statics + {} stack) of {} B",
             budget.used(), budget.statics, budget.stack_reserve, budget.ram_size
         );
-    }
+        Some(budget)
+    } else {
+        None
+    };
 
     // ── 5c. C backend (host or metal — both consume the same SIR, §6.1) ────────
     let c_src = backend::c::CBackend::with_target(cfg.target).emit(&sir);
@@ -210,22 +216,36 @@ fn run(cfg: &Config) -> Result<(), String> {
         }
         eprintln!("silicac: compiled '{}' → '{}'", cfg.input.display(), cfg.output.display());
 
-        // Measured worst-case stack (§5.3, audit #35): fold the toolchain's own
-        // frame accounting over the (recursion-banned, acyclic) call graph and
-        // report it beside the SIR estimate printed in the budget gate above.
+        // Measured RAM-budget gate (§5.3, audit #35, P0-1b): fold the toolchain's
+        // own frame accounting over the (recursion-banned, acyclic) call graph
+        // into the *authoritative* budget — hard-error on over-RAM or any
+        // non-static (alloca/VLA) frame.  The SIR estimate above is only a
+        // fast pre-compile fail / host fallback.
         if cfg.target == Target::MetalNrf52840 {
-            if let Some(m) = backend::stackinfo::from_dump_dir(&dump_dir, STACK_DUMP_BASE) {
-                let warn = if m.any_dynamic {
-                    "  [!] non-static (alloca/VLA) frame present — bound is not sound"
-                } else {
-                    ""
-                };
-                eprintln!(
-                    "silicac: measured worst-case stack {} B ({} source){}",
-                    m.bytes, m.source, warn
-                );
+            match backend::stackinfo::from_dump_dir(&dump_dir, STACK_DUMP_BASE) {
+                Some(m) => {
+                    let budget = metal_budget.expect("metal budget computed before compile");
+                    let verdict = backend::stackinfo::enforce(&m, budget.statics, budget.ram_size);
+                    backend::stackinfo::cleanup_dump_dir(&dump_dir, STACK_DUMP_BASE);
+                    match verdict {
+                        Ok(used) => eprintln!(
+                            "silicac: RAM budget (measured) {} B used ({} statics + {} stack, {} source) of {} B",
+                            used, budget.statics, m.bytes, m.source, budget.ram_size
+                        ),
+                        Err(e) => {
+                            // The over-budget artifact must not look like a valid build.
+                            let _ = std::fs::remove_file(&cfg.output);
+                            return Err(e);
+                        }
+                    }
+                }
+                None => {
+                    backend::stackinfo::cleanup_dump_dir(&dump_dir, STACK_DUMP_BASE);
+                    eprintln!(
+                        "silicac: note: no measured stack dump (non-GCC --cc?); RAM budget is the SIR estimate only"
+                    );
+                }
             }
-            backend::stackinfo::cleanup_dump_dir(&dump_dir, STACK_DUMP_BASE);
         }
     }
 

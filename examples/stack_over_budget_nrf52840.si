@@ -1,0 +1,36 @@
+// P0-1b (audit #35, §5.3): a program whose worst-case stack alone overflows a
+// deliberately tiny RAM region — the RAM-budget gate must REJECT the build
+// (statics + worst-case stack > RAM) rather than emit firmware that would smash
+// the stack at runtime.  Used by harness/stack_budget.sh.
+//
+//   silicac --target metal-nrf52840 examples/stack_over_budget_nrf52840.si -o /dev/null
+//   # → error: RAM budget exceeded ...
+//
+// The only change from the canonical blink is `ram ... size 256` (256 bytes),
+// which no real reaction frame + Cortex-M exception frame can fit.
+
+board tiny_ram {
+  soc nrf52840 {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256
+    }
+    clocks {
+      sysclk : clock_source = 64MHz
+    }
+  }
+
+  gpio0 : nrf_gpio at 0x5000_0000
+  led_user : nrf_gpio.pin = gpio0.pin(13) as output
+}
+
+program over_budget {
+  use board tiny_ram as dev
+  let led = dev.led_user
+  cell lit : bool = false
+
+  every 500ms {
+    lit = not lit
+    led.set(lit)
+  }
+}
