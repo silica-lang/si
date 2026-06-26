@@ -657,6 +657,11 @@ pub enum ExprKind {
     },
     /// Integer literal.
     IntLit(u64),
+    /// Fixed-point decimal/voltage literal (§4.3 P0-3b): the decimal mantissa
+    /// and how many fractional decimal digits it has — `0.5` → `(5, 1)`, `3.25`
+    /// → `(325, 2)`, `3v3` → `(33, 1)`.  The binary scale is taken from the
+    /// `fixed<I,F>` context at lowering (default Q16.16).
+    FixedLit(u64, u32),
     /// Duration literal in nanoseconds (e.g. `500ms` → 500_000_000).  Folded to
     /// ns at parse time but kept distinct from a bare integer so the §4.5 time
     /// model can tell `now() + 500ms` (ok) from `now() + 5` (a type error).

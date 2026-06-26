@@ -119,6 +119,36 @@ fn fixed_mul_metal_emits_a_rescaling_helper() {
 }
 
 #[test]
+fn decimal_literal_carries_a_fraction() {
+    // 0.5 (inferred Q16.16) × 2 = 1.0 — proves the 0.5 was real, not truncated.
+    let src = program(
+        "  cell n : u32 = 0\n  on sys.start { let h = 0.5  let two = 2 as fixed<16,16>  n = (h * two) as u32 }",
+    );
+    let t = sim::run(&compile(&src)).render(&compile(&src));
+    assert!(t.contains("cell n = 1"), "0.5 * 2 = 1:\n{t}");
+}
+
+#[test]
+fn voltage_literal_parses_as_fixed() {
+    // 3v3 = 3.3; × 10 = 33.
+    let src = program(
+        "  cell n : u32 = 0\n  on sys.start { let v = 3v3  let ten = 10 as fixed<16,16>  n = (v * ten) as u32 }",
+    );
+    let t = sim::run(&compile(&src)).render(&compile(&src));
+    assert!(t.contains("cell n = 33"), "3v3 * 10 = 33:\n{t}");
+}
+
+#[test]
+fn decimal_literal_adopts_the_annotated_scale() {
+    // A `fixed<8,8>` cell scales 0.5 at F=8 (raw 128), not the default F=16.
+    let src = program(
+        "  cell q : fixed<8,8> = 0.5\n  cell n : u32 = 0\n  on sys.start { let two = 2 as fixed<8,8>  n = (q * two) as u32 }",
+    );
+    let t = sim::run(&compile(&src)).render(&compile(&src));
+    assert!(t.contains("cell n = 1"), "0.5(Q8.8) * 2 = 1:\n{t}");
+}
+
+#[test]
 fn assigning_an_integer_to_a_fixed_binding_needs_a_cast() {
     let errs = resolve_err(&program(
         "  cell q : fixed<16,16> = 0\n  on sys.start { let i : u32 = 5  q = i }",

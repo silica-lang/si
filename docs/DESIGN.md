@@ -700,9 +700,12 @@ silent soft-float fallback. In the toy we *refuse* rather than emit slow soft-fl
 > like the backing integer). **Multiply/divide (audit #35 P0-3c).** `SirExpr::FixedArith` rescales:
 > mul computes in a 64-bit intermediate then `>> F`; div `<< F` then divides (div-by-zero traps to
 > safe-state). The rescaled result obeys trap/wrap/saturate at the storage width via emitted
-> `__si_fixmul_*` / `__si_fixdiv_*` helpers; the sim mirrors it in `eval_fixed`. `examples/fixed.si`
-> (sum 7, prod 12, (7/2)*2 → 7), `tests/fixed.rs`. **Remaining:** decimal/voltage **literals** like
-> `0.5`/`3v3` (P0-3b), and the BME280 compensation that uses them (P0-3d).
+> `__si_fixmul_*` / `__si_fixdiv_*` helpers; the sim mirrors it in `eval_fixed`. **Literals (audit #35
+> P0-3b).** Decimal (`0.5`, `3.25`) and the documented voltage form (`3v3`, `1v8`) lex to
+> `Token::FixedLit(mantissa, frac_digits)` → `ExprKind::FixedLit`, and adopt the enclosing
+> `fixed<I,F>` scale (default Q16.16): `raw = round(mantissa·2^F / 10^digits)`. `examples/fixed.si`
+> (sum 7, prod 12, half 3, gained 4 = 3.0·1.5), `tests/fixed.rs`. **Remaining:** the BME280 datasheet
+> compensation that puts all of this to work end-to-end (P0-3d).
 
 ### 4.4 Fallibility and faults
 
