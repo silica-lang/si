@@ -1424,6 +1424,10 @@ impl Parser {
             let op = match self.peek() {
                 Some(Token::Plus) if !compound => BinOp::Add,
                 Some(Token::Minus) if !compound => BinOp::Sub,
+                Some(Token::PlusPercent) => BinOp::AddWrap,
+                Some(Token::PlusPipe) => BinOp::AddSat,
+                Some(Token::MinusPercent) => BinOp::SubWrap,
+                Some(Token::MinusPipe) => BinOp::SubSat,
                 _ => break,
             };
             self.advance();
@@ -1443,6 +1447,8 @@ impl Parser {
                 Some(Token::Star) if !compound => BinOp::Mul,
                 Some(Token::Slash) if !compound => BinOp::Div,
                 Some(Token::Percent) => BinOp::Rem,
+                Some(Token::StarPercent) => BinOp::MulWrap,
+                Some(Token::StarPipe) => BinOp::MulSat,
                 _ => break,
             };
             self.advance();

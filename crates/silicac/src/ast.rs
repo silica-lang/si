@@ -584,6 +584,14 @@ pub enum BinOp {
     Add,
     Sub,
     Mul,
+    /// Explicit wrapping/saturating arithmetic (§4.3).  Plain Add/Sub/Mul trap on
+    /// overflow by default (SIL-004); these opt out per-operation.
+    AddWrap,
+    AddSat,
+    SubWrap,
+    SubSat,
+    MulWrap,
+    MulSat,
     Div,
     Rem,
     And,

@@ -86,6 +86,14 @@ pub enum Token {
     Star,     // *
     Slash,    // /
     Percent,  // %
+    // Explicit overflow-mode arithmetic operators (§4.3): `%`-suffix = wrapping,
+    // `|`-suffix = saturating.  Plain +/-/* trap on overflow by default (SIL-004).
+    PlusPercent,  // +%  wrapping add
+    PlusPipe,     // +|  saturating add
+    MinusPercent, // -%  wrapping sub
+    MinusPipe,    // -|  saturating sub
+    StarPercent,  // *%  wrapping mul
+    StarPipe,     // *|  saturating mul
     Bang,     // !
     Lt,       // <
     Gt,       // >
@@ -336,6 +344,12 @@ pub fn lex(src: &str) -> Result<Vec<Spanned<Token>>, LexError> {
             let maybe = match pair {
                 (b'-', b'>') => Some(Token::Arrow),
                 (b'=', b'>') => Some(Token::FatArrow),
+                (b'+', b'%') => Some(Token::PlusPercent),
+                (b'+', b'|') => Some(Token::PlusPipe),
+                (b'-', b'%') => Some(Token::MinusPercent),
+                (b'-', b'|') => Some(Token::MinusPipe),
+                (b'*', b'%') => Some(Token::StarPercent),
+                (b'*', b'|') => Some(Token::StarPipe),
                 (b'<', b'=') => Some(Token::Le),
                 (b'>', b'=') => Some(Token::Ge),
                 (b'=', b'=') => Some(Token::EqEq),

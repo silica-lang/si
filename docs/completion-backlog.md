@@ -46,7 +46,18 @@ pick the spec-consistent default and note it in the PR.
 - [ ] A5 Interface semantic-property checks (§4.1/D18)
 
 ### Cluster B — arithmetic safety
-- [ ] B1 Saturating/wrapping ops + `@overflow` directive + overflow-trap-by-default (§4.3/SIL-004) `[metal]`
+- [x] B1 Saturating/wrapping ops + overflow-trap-by-default (§4.3/SIL-004) `[metal]` — PR #21.
+      Lex `+% +| -% -| *% *|`; AST/parse the wrap/sat operators; SIR gains a width-checked
+      `SirExpr::Arith{op,mode,width,signed}` (Add/Sub/Mul; Div/Rem stay `BinOp`). The width comes
+      from the assignment-target type (cell/local/register), threaded through the resolver — so the
+      same `+ 100` is safe on a u32 and a trap on a u8. Sim: trap → `OVERFLOW TRAP` trace + safe-state
+      (bypasses Layer-2 disposition — a system-integrity fault); wrap/saturate at width. Metal: one
+      `static inline __si_<op>_<mode>_<ty>` helper per shape; trap uses `__builtin_*_overflow` →
+      `__silica_overflow_trap` → `__drive_safe()` + halt. examples/overflow.si (sim demo) +
+      examples/overflow_nrf52840.si + tests/overflow.rs (5). **Renode**: harness/overflow_trap.sh
+      PASS (trap froze ticks=4, wrap ran to 10). NOTE: scoped `@overflow(...)` block directive
+      deferred (needs attribute syntax) — per-operator opt-out covers it; signed-`Div`/`Rem` overflow
+      (INT_MIN/-1) not yet trapped.
 
 ### Cluster C — bounded-memory & atomicity
 - [x] C1 `atomic { … }` multi-cell construct (§5.5/D03) — PR #16. Lex KwAtomic, parse

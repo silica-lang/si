@@ -330,6 +330,35 @@ pub enum SirExpr {
     Not(Box<SirExpr>),
     /// Binary arithmetic / comparison.
     BinOp(SirBinOp, Box<SirExpr>, Box<SirExpr>),
+    /// Width-checked integer arithmetic (§4.3 / SIL-004).  Carries the result
+    /// width + signedness (from the assignment-target type) and the overflow
+    /// disposition: `Trap` (default — overflow drives the system to safe-state),
+    /// `Wrap`, or `Saturate`.  Add/Sub/Mul lower here; Div/Rem stay `BinOp`.
+    Arith {
+        op: SirArithOp,
+        mode: OverflowMode,
+        width: u8,
+        signed: bool,
+        lhs: Box<SirExpr>,
+        rhs: Box<SirExpr>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SirArithOp {
+    Add,
+    Sub,
+    Mul,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OverflowMode {
+    /// Overflow drives the system to its safe state (SIL-004 trap-by-default).
+    Trap,
+    /// Two's-complement wraparound at `width` (`+%`/`-%`/`*%`).
+    Wrap,
+    /// Clamp to the type's min/max at `width` (`+|`/`-|`/`*|`).
+    Saturate,
 }
 
 #[derive(Debug, Clone, Copy)]

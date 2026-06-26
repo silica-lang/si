@@ -588,6 +588,16 @@ an odd width like `u7` or `u24`.
 > everywhere it is not explicitly overridden. The default must be safe; the opt-out must be loud.
 > (This is a place where the embedded goal and the agentic goal agree: an agent reasons far better
 > about a language whose `+` means one thing within a clearly-marked scope.)
+>
+> **Status (implemented).** Trap-by-default is now the resolved behaviour, sim *and* metal
+> (SIL-004 inconsistency closed — no "silent in release" carve-out). Plain `+`/`-`/`*` lower to
+> width-checked ops at the assignment-target type: in the sim an overflow drives the system to its
+> safe state (`OVERFLOW TRAP` trace); on metal the generated `__si_*` helper uses
+> `__builtin_*_overflow` and calls `__silica_overflow_trap` → `__drive_safe()` + halt. The explicit
+> `+%`/`-%`/`*%` (wrap) and `+|`/`-|`/`*|` (saturate) operators lex/parse/lower end-to-end. Proven on
+> nRF52840 in Renode by `harness/overflow_trap.sh` (a u8 counter halts at the overflow tick under
+> `+`, keeps running under `+%`). **Remaining:** the scoped `@overflow(saturate | wrap | trap)`
+> block directive (needs attribute syntax) — the per-operator opt-out covers the same ground for now.
 
 **Fixed-point is first-class.** The binary point is in the type: `fixed<16,16>` is 16 integer bits
 and 16 fractional bits. The compiler handles scaling on multiply/add (a `fixed<16,16>` multiply

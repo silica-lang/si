@@ -61,6 +61,9 @@ pub enum TraceKind {
     /// A reaction overran its `within <d>` deadline (§4.5/§5.6) — it starved the
     /// watchdog, so the system resets.
     DeadlineMissed { reaction: usize, budget_ns: u64 },
+    /// An integer operation overflowed its result type under the default trap
+    /// disposition (§4.3/SIL-004) — the system is driven to its safe state.
+    Overflow { reaction: usize, width: u8 },
 }
 
 #[derive(Debug, Default)]
@@ -134,6 +137,9 @@ impl SimResult {
                 }
                 TraceKind::WatchdogReset { timeout_ns } => {
                     format!("[{:>8.3}ms] WATCHDOG RESET — handler starved the watchdog ({}ms timeout, §5.6)", ms, timeout_ns / 1_000_000)
+                }
+                TraceKind::Overflow { reaction, width } => {
+                    format!("[{:>8.3}ms] OVERFLOW TRAP — reaction#{} overflowed a {}-bit integer op → safe-state (§4.3/SIL-004)", ms, reaction, width)
                 }
             };
             out.push_str(&line);
@@ -235,6 +241,10 @@ struct Sim<'m> {
     /// A `poll` raised a fault this step; the activation loop disposes of it
     /// (§3.2).  `None` between checks.
     pending_fault: Option<String>,
+    /// Set when an arithmetic op overflowed under `Trap` (§4.3).  Interior
+    /// mutability because expression evaluation is `&self`; the activation loop
+    /// observes it after each statement and drives the system to safe-state.
+    overflow_trap: std::cell::Cell<Option<u8>>,
 }
 
 /// Run the program in `module` under the deterministic host simulator.
@@ -260,6 +270,7 @@ pub fn run(module: &SirModule) -> SimResult {
         stdout: String::new(),
         stop: false,
         pending_fault: None,
+        overflow_trap: std::cell::Cell::new(None),
     };
     sim.run();
     SimResult { trace: sim.trace, stdout: sim.stdout }
@@ -511,6 +522,19 @@ impl<'m> Sim<'m> {
                 }
                 stmt => {
                     self.eval_stmt(stmt, &mut act.locals);
+                    // An integer op may have overflowed under the default trap
+                    // disposition (§4.3/SIL-004): drive the system safe and end
+                    // this activation — overflow is a system-integrity fault, not
+                    // a per-reaction recoverable one, so it bypasses disposition.
+                    if let Some(width) = self.overflow_trap.take() {
+                        self.trace.push(TraceRecord {
+                            at_ns: self.now,
+                            kind: TraceKind::Overflow { reaction: act.reaction, width },
+                        });
+                        self.in_flight[act.reaction] = false;
+                        self.drive_safe();
+                        return;
+                    }
                     // A `poll` inside this statement may have raised a fault
                     // (§3.2); short-circuit to the reaction's disposition.
                     if let Some(code) = self.pending_fault.take() {
@@ -785,7 +809,71 @@ impl<'m> Sim<'m> {
                     SirBinOp::Ge => (a >= b) as u64,
                 }
             }
+            SirExpr::Arith { op, mode, width, signed, lhs, rhs } => {
+                let a = self.eval_expr(lhs, frame);
+                let b = self.eval_expr(rhs, frame);
+                self.eval_arith(*op, *mode, *width, *signed, a, b)
+            }
         }
+    }
+
+    /// Evaluate width-checked integer arithmetic (§4.3).  Computes the exact
+    /// mathematical result in `i128`, then applies the overflow disposition at
+    /// `width`: `Trap` latches `overflow_trap` (the activation loop goes
+    /// safe-state), `Wrap` truncates two's-complement, `Saturate` clamps.
+    fn eval_arith(&self, op: SirArithOp, mode: OverflowMode, width: u8, signed: bool, a: u64, b: u64) -> u64 {
+        let bits = width as u32;
+        let (lo, hi): (i128, i128) = if signed {
+            (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+        } else {
+            (0, (1i128 << bits) - 1)
+        };
+        // Interpret operands at `width` (sign-extend signed operands).
+        let interp = |v: u64| -> i128 {
+            if signed && bits < 64 && (v >> (bits - 1)) & 1 == 1 {
+                (v as i128) - (1i128 << bits)
+            } else {
+                v as i128
+            }
+        };
+        let (x, y) = (interp(a), interp(b));
+        let full: i128 = match op {
+            SirArithOp::Add => x + y,
+            SirArithOp::Sub => x - y,
+            SirArithOp::Mul => x * y,
+        };
+        let fits = full >= lo && full <= hi;
+        let result: i128 = match mode {
+            OverflowMode::Trap => {
+                if !fits {
+                    self.overflow_trap.set(Some(width));
+                }
+                full // value is unused once the trap latches
+            }
+            OverflowMode::Saturate => full.clamp(lo, hi),
+            OverflowMode::Wrap => {
+                let m = 1i128 << bits;
+                let mut w = full % m;
+                if w < 0 {
+                    w += m;
+                }
+                // Re-interpret the low `bits` as signed if needed.
+                if signed && w > hi {
+                    w - m
+                } else {
+                    w
+                }
+            }
+        };
+        // Store back as raw bits at `width` (two's-complement for negatives).
+        let masked = if bits >= 64 {
+            result as u64
+        } else if result < 0 {
+            ((result + (1i128 << bits)) as u64) & ((1u64 << bits) - 1)
+        } else {
+            (result as u64) & ((1u64 << bits) - 1)
+        };
+        masked
     }
 }
 

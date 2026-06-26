@@ -163,6 +163,11 @@ pub struct Resolver {
 
     /// Device id → device-type name (for reg/op/emit lookups).
     dev_types: HashMap<usize, String>,
+    /// Result width + signedness for arithmetic currently being lowered, taken
+    /// from the enclosing assignment/`let` target type (§4.3 overflow checks).
+    /// Defaults to 32-bit unsigned (the implicit integer type).
+    arith_width: u8,
+    arith_signed: bool,
     /// The board context for the program *currently* being resolved.
     board_ctx: Option<BoardContext>,
     /// Per-program board context, so a `sim` block resolves against its own
@@ -203,6 +208,8 @@ impl Resolver {
             memory: Vec::new(),
             pins: Vec::new(),
             core_hz: 0,
+            arith_width: 32,
+            arith_signed: false,
             dev_types: HashMap::new(),
             board_ctx: None,
             program_ctx: HashMap::new(),
@@ -931,12 +938,53 @@ impl Resolver {
         out
     }
 
+    /// Build a binary-op SIR node.  Arithmetic ops (Add/Sub/Mul + their
+    /// wrapping/saturating forms) become a width-checked [`SirExpr::Arith`] using
+    /// the current target-type context; everything else stays an untyped `BinOp`.
+    fn make_binop(&self, op: BinOp, l: SirExpr, r: SirExpr) -> SirExpr {
+        if let Some((aop, mode)) = arith_mode(op) {
+            SirExpr::Arith {
+                op: aop,
+                mode,
+                width: self.arith_width,
+                signed: self.arith_signed,
+                lhs: Box::new(l),
+                rhs: Box::new(r),
+            }
+        } else {
+            SirExpr::BinOp(ast_binop_to_sir(op), Box::new(l), Box::new(r))
+        }
+    }
+
+    /// The `(width_bits, signed)` overflow context implied by an assignment
+    /// target — a register field's width, or a cell/local's declared type.
+    fn place_ctx(&self, place: &SirPlace, scope: &Scope, vars: &[SirVar]) -> (u8, bool) {
+        match place {
+            SirPlace::Reg { width, .. } => (*width, false),
+            SirPlace::Var(name) => {
+                if let Some(v) = vars.iter().find(|v| &v.name == name) {
+                    sirtype_ctx(&v.ty)
+                } else if let Some(Binding::Local(_, ty)) = scope.lookup(name) {
+                    sirtype_ctx(ty)
+                } else {
+                    (32, false)
+                }
+            }
+        }
+    }
+
     fn lower_stmt(&mut self, stmt: &Stmt, scope: &mut Scope, vars: &[SirVar], out: &mut Vec<SirStmt>) {
         match stmt {
             Stmt::Expr(expr) => self.lower_expr_stmt(expr, scope, vars, out),
             Stmt::Let(l) => {
-                let ty = infer_type_from_expr(&l.init);
+                let ty = match &l.ty {
+                    Some(t) => resolve_type_expr(t),
+                    None => infer_type_from_expr(&l.init),
+                };
+                let saved = (self.arith_width, self.arith_signed);
+                (self.arith_width, self.arith_signed) = sirtype_ctx(&ty);
                 let value = self.lower_expr_emit(&l.init, scope, vars, out);
+                (self.arith_width, self.arith_signed) = saved;
                 scope.insert(&l.name.name, Binding::Local(l.name.name.clone(), ty));
                 out.push(SirStmt::Assign { target: SirPlace::Var(l.name.name.clone()), value });
             }
@@ -990,15 +1038,23 @@ impl Resolver {
         match &expr.kind {
             ExprKind::Assign(lhs, rhs) => {
                 if let Some(place) = self.expr_to_place(lhs, scope) {
+                    let (w, s) = self.place_ctx(&place, scope, vars);
+                    let saved = (self.arith_width, self.arith_signed);
+                    (self.arith_width, self.arith_signed) = (w, s);
                     let value = self.lower_expr_emit(rhs, scope, vars, out);
+                    (self.arith_width, self.arith_signed) = saved;
                     out.push(SirStmt::Assign { target: place, value });
                 }
             }
             ExprKind::CompoundAssign(op, lhs, rhs) => {
                 if let Some(place) = self.expr_to_place(lhs, scope) {
+                    let (w, s) = self.place_ctx(&place, scope, vars);
+                    let saved = (self.arith_width, self.arith_signed);
+                    (self.arith_width, self.arith_signed) = (w, s);
                     let lhs_val = self.lower_expr(lhs, scope);
                     let rhs_val = self.lower_expr_emit(rhs, scope, vars, out);
-                    let combined = SirExpr::BinOp(ast_binop_to_sir(*op), Box::new(lhs_val), Box::new(rhs_val));
+                    let combined = self.make_binop(*op, lhs_val, rhs_val);
+                    (self.arith_width, self.arith_signed) = saved;
                     out.push(SirStmt::Assign { target: place, value: combined });
                 }
             }
@@ -1077,7 +1133,7 @@ impl Resolver {
             ExprKind::BinOp { op, lhs, rhs } => {
                 let l = self.lower_expr_emit(lhs, scope, vars, out);
                 let r = self.lower_expr_emit(rhs, scope, vars, out);
-                SirExpr::BinOp(ast_binop_to_sir(*op), Box::new(l), Box::new(r))
+                self.make_binop(*op, l, r)
             }
             ExprKind::Not(inner) => SirExpr::Not(Box::new(self.lower_expr_emit(inner, scope, vars, out))),
             _ => self.lower_expr(expr, scope),
@@ -1343,7 +1399,7 @@ impl Resolver {
             ExprKind::BinOp { op, lhs, rhs } => {
                 let l = self.lower_expr(lhs, scope);
                 let r = self.lower_expr(rhs, scope);
-                SirExpr::BinOp(ast_binop_to_sir(*op), Box::new(l), Box::new(r))
+                self.make_binop(*op, l, r)
             }
             ExprKind::Assign(_lhs, rhs) => self.lower_expr(rhs, scope),
             ExprKind::CompoundAssign(_, _, rhs) => self.lower_expr(rhs, scope),
@@ -1753,6 +1809,7 @@ fn expr_touches_cell(expr: &SirExpr, cell: &str) -> bool {
         SirExpr::Load(n) => n == cell,
         SirExpr::Not(inner) => expr_touches_cell(inner, cell),
         SirExpr::BinOp(_, l, r) => expr_touches_cell(l, cell) || expr_touches_cell(r, cell),
+        SirExpr::Arith { lhs, rhs, .. } => expr_touches_cell(lhs, cell) || expr_touches_cell(rhs, cell),
         _ => false,
     }
 }
@@ -1798,11 +1855,47 @@ fn resolve_type_expr(ty: &TypeExpr) -> SirType {
     }
 }
 
+/// Map an AST arithmetic operator to its SIR op + overflow disposition (§4.3).
+/// `None` for non-arithmetic operators (comparisons / logic / div / rem), which
+/// stay on the untyped `SirBinOp` path.
+fn arith_mode(op: BinOp) -> Option<(SirArithOp, OverflowMode)> {
+    use OverflowMode::{Saturate, Trap, Wrap};
+    use SirArithOp::{Add, Mul, Sub};
+    Some(match op {
+        BinOp::Add => (Add, Trap),
+        BinOp::Sub => (Sub, Trap),
+        BinOp::Mul => (Mul, Trap),
+        BinOp::AddWrap => (Add, Wrap),
+        BinOp::AddSat => (Add, Saturate),
+        BinOp::SubWrap => (Sub, Wrap),
+        BinOp::SubSat => (Sub, Saturate),
+        BinOp::MulWrap => (Mul, Wrap),
+        BinOp::MulSat => (Mul, Saturate),
+        _ => return None,
+    })
+}
+
+/// `(width_bits, signed)` for a SIR scalar type — drives overflow checks.
+fn sirtype_ctx(ty: &SirType) -> (u8, bool) {
+    match ty {
+        SirType::U8 => (8, false),
+        SirType::U16 => (16, false),
+        SirType::U32 => (32, false),
+        SirType::U64 => (64, false),
+        SirType::S8 => (8, true),
+        SirType::S16 => (16, true),
+        SirType::S32 => (32, true),
+        SirType::S64 => (64, true),
+        SirType::Bool => (8, false),
+        SirType::Bytes => (32, false),
+    }
+}
+
 fn ast_binop_to_sir(op: BinOp) -> SirBinOp {
     match op {
-        BinOp::Add => SirBinOp::Add,
-        BinOp::Sub => SirBinOp::Sub,
-        BinOp::Mul => SirBinOp::Mul,
+        BinOp::Add | BinOp::AddWrap | BinOp::AddSat => SirBinOp::Add,
+        BinOp::Sub | BinOp::SubWrap | BinOp::SubSat => SirBinOp::Sub,
+        BinOp::Mul | BinOp::MulWrap | BinOp::MulSat => SirBinOp::Mul,
         BinOp::Div => SirBinOp::Div,
         BinOp::Rem => SirBinOp::Rem,
         BinOp::And => SirBinOp::And,
@@ -1851,9 +1944,9 @@ fn const_binop(op: BinOp, l: ConstVal, r: ConstVal) -> Option<ConstVal> {
     use ConstVal::{Bool, Int};
     match (op, l, r) {
         // Integer arithmetic (saturating on the rare overflow; div/rem-by-zero → None).
-        (BinOp::Add, Int(a), Int(b)) => Some(Int(a.saturating_add(b))),
-        (BinOp::Sub, Int(a), Int(b)) => Some(Int(a.saturating_sub(b))),
-        (BinOp::Mul, Int(a), Int(b)) => Some(Int(a.saturating_mul(b))),
+        (BinOp::Add | BinOp::AddWrap | BinOp::AddSat, Int(a), Int(b)) => Some(Int(a.saturating_add(b))),
+        (BinOp::Sub | BinOp::SubWrap | BinOp::SubSat, Int(a), Int(b)) => Some(Int(a.saturating_sub(b))),
+        (BinOp::Mul | BinOp::MulWrap | BinOp::MulSat, Int(a), Int(b)) => Some(Int(a.saturating_mul(b))),
         (BinOp::Div, Int(a), Int(b)) => (b != 0).then(|| Int(a / b)),
         (BinOp::Rem, Int(a), Int(b)) => (b != 0).then(|| Int(a % b)),
         // Integer comparisons → Bool.
