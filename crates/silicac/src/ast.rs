@@ -150,6 +150,9 @@ pub struct CellDecl {
 #[derive(Debug, Clone)]
 pub struct Reaction {
     pub trigger: Trigger,
+    /// `within <d>` deadline budget (§4.5/§5.6): the reaction must return to idle
+    /// within `d` of firing, else it overruns and the watchdog resets the system.
+    pub within: Option<Duration>,
     pub fault_disp: Option<FaultDisp>,
     pub body: Block,
     pub span: Span,

@@ -1620,6 +1620,7 @@ mod tests {
                 priority: 0,
                 disposition: SirDisposition::Escalate,
                 yields: false,
+                deadline_ns: None,
             }],
             ..Default::default()
         };
@@ -1640,6 +1641,7 @@ mod tests {
                 priority: 0,
                 disposition: SirDisposition::Escalate,
                 yields: false,
+                deadline_ns: None,
             }],
             ..Default::default()
         };

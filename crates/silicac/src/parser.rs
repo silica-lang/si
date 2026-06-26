@@ -237,6 +237,15 @@ impl Parser {
             }
         };
 
+        // Optional `within <d>` deadline budget (§4.5/§5.6), between the trigger
+        // and any `on fault` clause.
+        let within = if self.peek() == Some(&Token::KwWithin) {
+            self.advance();
+            Some(self.parse_duration()?)
+        } else {
+            None
+        };
+
         // Optional `on fault <disp>` clause.
         let fault_disp = if self.peek() == Some(&Token::KwOn) {
             // peek ahead for `fault`
@@ -253,7 +262,7 @@ impl Parser {
 
         let body = self.parse_block()?;
         let end = self.prev_span().end;
-        Ok(Reaction { trigger, fault_disp, body, span: Span::new(start, end) })
+        Ok(Reaction { trigger, within, fault_disp, body, span: Span::new(start, end) })
     }
 
     /// Parse `<ident>.<ident>` (or deeper) as an event reference.

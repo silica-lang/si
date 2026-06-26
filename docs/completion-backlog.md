@@ -94,7 +94,18 @@ pick the spec-consistent default and note it in the PR.
       Renode with trace-order parity" criterion met.** Hermetic sim oracle guards the example.
 - [ ] E2 `when`-typestate + Layer-3 site map (§4.1/§5.4) `[metal]`
 - [ ] E3 Bus arbitration / queues / scheduler overflow policy (§3.5/D06, §5.1/D02) `[metal]`
-- [ ] E4 `reaction … within <d>` deadline → watchdog starve (§4.5/§5.6) `[metal]`
+- [x] E4 `reaction … within <d>` deadline → watchdog starve (§4.5/§5.6) — PR #18. Parse
+      `every/on … within <d>`, lower to SirReaction.deadline_ns. Sim: arm a per-activation
+      deadline event on fire (generation-guarded); overrun while still in-flight →
+      DeadlineMissed reset. examples/deadline.si + tests/deadline.rs. NOTE: sim-enforced only
+      — the **metal watchdog itself isn't wired yet** (the backend never feeds a wdt), so
+      on-metal deadline enforcement is a follow-up gated on building the metal watchdog (a
+      new item). Metal firmware still compiles (deadline_ns unused on metal); blink gate PASS.
+
+### Cluster E (cont.) — discovered follow-ups
+- [ ] E5 Metal hardware watchdog wiring (§5.6) `[metal]` — the scheduler-fed watchdog is
+      sim-only today; the backend never feeds a `wdt` (RLR/KR). Needed before E4's deadline
+      and the watchdog reset are enforceable on metal. Renode-validatable once wired.
 
 ### Cluster F — exactness & capabilities (last)
 - [ ] F1 Capabilities + float/FPU gating (§4.1/§4.3)
