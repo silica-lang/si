@@ -6,6 +6,12 @@
 interface i2c {
   type address = u32
 
+  // Semantic properties (§4.1/D18) a controller provides and a device may
+  // constrain via `needs { bus : i2c where … }`.  Defaults describe the most
+  // permissive contract; a real controller narrows them in its `provides` block.
+  property max_speed  = 1_000_000   // Hz — fast-mode-plus ceiling by default
+  property addressing = 7           // address width in bits (7 or 10)
+
   // A register read/write over the bus.  Each is one indivisible transaction
   // that suspends once (§3.5/SIL-003) and can fault (NAK / clock-stretch
   // timeout / arbitration-lost, §4.4/D14).

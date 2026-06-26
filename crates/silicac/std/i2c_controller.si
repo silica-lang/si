@@ -24,6 +24,14 @@ device i2c_controller implements i2c {
     clock : clock_source
   }
 
+  // Semantic properties this controller actually provides (§4.1/D18): a
+  // 400 kHz fast-mode, 7-bit-addressing part.  A device that needs more than
+  // 400 kHz, or 10-bit addressing, is a compile error against this controller.
+  provides i2c {
+    max_speed  = 400_000
+    addressing = 7
+  }
+
   ops {
     op read_reg(addr: u32, reg: u32) -> u32 or fault{nak, timeout, arblost} yields
     op write_reg(addr: u32, reg: u32, val: u32) -> () or fault{nak, timeout, arblost} yields

@@ -63,7 +63,14 @@ pick the spec-consistent default and note it in the PR.
       literal arms rejected. Integer + bool literal patterns. examples/match.si + tests/match_stmt.rs
       (5); sim gate + metal compiles. NOTE: `ok`/`fault f` op-result patterns and exhaustiveness vs an
       op's declared fault-code set (the §4.4 `match usart2.write()` form) build on this — deferred.
-- [ ] A5 Interface semantic-property checks (§4.1/D18)
+- [x] A5 Interface semantic-property checks (§4.1/D18) — PR #25. Interface `property <name> [=
+      default]`; controller `provides <iface> { name = value }`; device `needs { bus : i2c where
+      <expr> }`. Resolver const-evaluates the requirement against the provider's values (over interface
+      defaults, reusing A1's `where` evaluator) at board-bind — false, or an undeclared property, is a
+      compile error. std/i2c.si declares max_speed/addressing; std/i2c_controller.si provides 400_000/7.
+      examples/bus_speed.si + tests/interface_props.rs (4). Sim/resolve gate. NOTE: richer property set
+      (atomicity/clock-stretch/recovery) expressible but not yet on the std interface; values are
+      int/bool constants.
 
 ### Cluster B — arithmetic safety
 - [x] B1 Saturating/wrapping ops + overflow-trap-by-default (§4.3/SIL-004) `[metal]` — PR #21.

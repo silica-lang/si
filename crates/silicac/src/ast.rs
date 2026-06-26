@@ -209,6 +209,8 @@ pub struct DeviceSections {
     pub states: Option<StatesSection>,
     pub safe_state: Option<Ident>,
     pub emits: Vec<EmitDecl>,
+    /// `provides <iface> { … }` blocks — semantic-property values (§4.1/D18).
+    pub provides: Vec<ProvidesBlock>,
 }
 
 // ─── Device: regs (§4.2) ──────────────────────────────────────────────────────
@@ -286,11 +288,32 @@ pub struct NeedsSection {
     pub span: Span,
 }
 
-/// A declared typed relation the device requires (`clock : clock_source`).
+/// A declared typed relation the device requires (`clock : clock_source`).  An
+/// interface-typed need may carry a `where` constraint over the provider's
+/// semantic properties (§4.1/D18), e.g. `bus : i2c where max_speed >= 400_000`.
 #[derive(Debug, Clone)]
 pub struct NeedDecl {
     pub name: Ident,
     pub ty: Ident,
+    pub constraint: Option<Expr>,
+    pub span: Span,
+}
+
+/// `provides <iface> { <prop> = <value>, … }` — the semantic-property values a
+/// controller declares for an interface it implements (§4.1/D18).
+#[derive(Debug, Clone)]
+pub struct ProvidesBlock {
+    pub iface: Ident,
+    pub values: Vec<(Ident, Expr)>,
+    pub span: Span,
+}
+
+/// `property <name> [= <default>]` — a semantic property an interface declares,
+/// with an optional default for providers that don't set it (§4.1/D18).
+#[derive(Debug, Clone)]
+pub struct PropertyDecl {
+    pub name: Ident,
+    pub default: Option<Expr>,
     pub span: Span,
 }
 
@@ -316,6 +339,8 @@ pub struct InterfaceDef {
     pub ops: Vec<OpDecl>,
     /// `type address = u7` members (parsed; the alias target is recorded).
     pub types: Vec<(Ident, Ident)>,
+    /// `property <name> [= <default>]` semantic properties (§4.1/D18).
+    pub properties: Vec<PropertyDecl>,
     pub span: Span,
 }
 

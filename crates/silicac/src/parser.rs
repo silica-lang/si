@@ -414,6 +414,10 @@ impl Parser {
                     self.eat_optional_semi();
                     sections.safe_state = Some(state);
                 }
+                // `provides <iface> { <prop> = <value>, … }` (§4.1/D18)
+                Some(Token::Ident(s)) if s == "provides" => {
+                    sections.provides.push(self.parse_provides_block()?);
+                }
                 other => {
                     return Err(ParseError {
                         span: self.current_span(),
@@ -728,6 +732,32 @@ impl Parser {
         Ok(ConfigSection { fields, span: Span::new(start, end) })
     }
 
+    /// `provides <iface> { <prop> = <value>, … }`
+    fn parse_provides_block(&mut self) -> Result<ProvidesBlock, ParseError> {
+        let start = self.current_span().start;
+        self.advance(); // consume `provides`
+        let iface = self.eat_ident()?;
+        self.eat(&Token::LBrace)?;
+        let mut values = Vec::new();
+        while self.peek() != Some(&Token::RBrace) {
+            if self.at_end() {
+                return Err(self.error("unexpected EOF in provides block"));
+            }
+            let name = self.eat_ident()?;
+            self.eat(&Token::Eq)?;
+            let value = self.parse_or()?;
+            values.push((name, value));
+            if self.peek() == Some(&Token::Comma) {
+                self.advance();
+            } else {
+                self.eat_optional_semi();
+            }
+        }
+        let end = self.current_span().end;
+        self.eat(&Token::RBrace)?;
+        Ok(ProvidesBlock { iface, values, span: Span::new(start, end) })
+    }
+
     fn parse_needs_section(&mut self) -> Result<NeedsSection, ParseError> {
         let start = self.current_span().start;
         self.eat(&Token::KwNeeds)?;
@@ -741,6 +771,14 @@ impl Parser {
             let name = self.eat_ident()?;
             self.eat(&Token::Colon)?;
             let ty = self.eat_ident()?;
+            // optional `where <constraint>` over the provider's properties (D18);
+            // parsed below assignment so a trailing `= <default>` is not swallowed.
+            let constraint = if self.peek() == Some(&Token::KwWhere) {
+                self.advance();
+                Some(self.parse_or()?)
+            } else {
+                None
+            };
             // optional `= <default>` (e.g. `addr : i2c.address = 0x76`) — skip value
             if self.peek() == Some(&Token::Eq) {
                 self.advance();
@@ -748,7 +786,7 @@ impl Parser {
             }
             self.eat_optional_semi();
             let nend = self.prev_span().end;
-            needs.push(NeedDecl { name, ty, span: Span::new(nstart, nend) });
+            needs.push(NeedDecl { name, ty, constraint, span: Span::new(nstart, nend) });
         }
         let end = self.current_span().end;
         self.eat(&Token::RBrace)?;
@@ -783,6 +821,7 @@ impl Parser {
         self.eat(&Token::LBrace)?;
         let mut ops = Vec::new();
         let mut types = Vec::new();
+        let mut properties = Vec::new();
         while self.peek() != Some(&Token::RBrace) {
             if self.at_end() {
                 return Err(self.error("unexpected EOF in interface body"));
@@ -798,17 +837,31 @@ impl Parser {
                     self.eat_optional_semi();
                     types.push((alias, target));
                 }
+                // `property <name> [= <default>]` (§4.1/D18)
+                Some(Token::Ident(s)) if s == "property" => {
+                    let pstart = self.current_span().start;
+                    self.advance();
+                    let pname = self.eat_ident()?;
+                    let default = if self.peek() == Some(&Token::Eq) {
+                        self.advance();
+                        Some(self.parse_or()?)
+                    } else {
+                        None
+                    };
+                    self.eat_optional_semi();
+                    properties.push(PropertyDecl { name: pname, default, span: Span::new(pstart, self.prev_span().end) });
+                }
                 other => {
                     return Err(ParseError {
                         span: self.current_span(),
-                        msg: format!("expected `op` or `type` in interface body, got {:?}", other),
+                        msg: format!("expected `op`, `type`, or `property` in interface body, got {:?}", other),
                     })
                 }
             }
         }
         let end = self.current_span().end;
         self.eat(&Token::RBrace)?;
-        Ok(InterfaceDef { name, ops, types, span: Span::new(start, end) })
+        Ok(InterfaceDef { name, ops, types, properties, span: Span::new(start, end) })
     }
 
     fn skip_balanced_braces(&mut self) -> Result<(), ParseError> {
