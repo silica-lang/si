@@ -34,6 +34,12 @@ pub struct CBackend {
     /// Max reaction priority in the module, for the priority-ceiling → BASEPRI
     /// mapping (§5.5).
     max_priority: u8,
+    /// While emitting a yielding reaction's body on metal, the temps that live
+    /// in its static frame struct (§5.2) and the struct's name, so var refs are
+    /// rewritten `name` → `__rf_N.name` (they must survive the dispatcher
+    /// returning between segments).  Empty/None otherwise.
+    frame_vars: HashSet<String>,
+    frame_name: Option<String>,
 }
 
 impl CBackend {
@@ -50,6 +56,18 @@ impl CBackend {
             device_regs: HashMap::new(),
             global_vars: HashSet::new(),
             max_priority: 0,
+            frame_vars: HashSet::new(),
+            frame_name: None,
+        }
+    }
+
+    /// A C reference to a SIR var: prefixed with the current yielding-reaction
+    /// frame (`__rf_N.name`) when `name` is one of its cross-yield temps, else
+    /// the bare name (function-local or module global).
+    fn var_ref(&self, name: &str) -> String {
+        match &self.frame_name {
+            Some(f) if self.frame_vars.contains(name) => format!("{}.{}", f, name),
+            _ => name.to_string(),
         }
     }
 
@@ -197,6 +215,14 @@ impl CBackend {
     fn emit_reaction_fn(&mut self, reaction: &SirReaction) {
         let fn_name = reaction_fn_name(reaction.id);
         let comment = trigger_comment(&reaction.trigger);
+        // On metal a yielding reaction lowers to an IRQ-driven segment state
+        // machine (§5.2): it suspends on each bus transaction so the scheduler
+        // runs other work, and the bus-completion IRQ resumes it.  This replaces
+        // the earlier bounded busy-wait, which could not interleave.
+        if self.target == Target::MetalNrf52840 && reaction.yields {
+            self.emit_yielding_reaction_metal(reaction, &fn_name, &comment);
+            return;
+        }
         self.line(&format!("/* {} */", comment));
         self.line(&format!("static void {}(void) {{", fn_name));
         self.indent += 1;
@@ -208,64 +234,151 @@ impl CBackend {
                 self.line(&format!("uint32_t {} = 0U;", name));
             }
         }
-        if self.target == Target::MetalNrf52840 && reaction.yields {
-            // A yielding reaction lowers to a real bus transaction + the §4.4
-            // fault disposition; the sim's run-to-completion suspend/resume is
-            // approximated by a bounded busy-wait (interleaving fidelity is the
-            // next increment — see docs/phase0-metal-scope.md).
-            self.emit_yielding_reaction_metal(reaction);
-        } else {
-            for stmt in &reaction.body {
-                self.emit_stmt(stmt);
-            }
+        for stmt in &reaction.body {
+            self.emit_stmt(stmt);
         }
         self.indent -= 1;
         self.line("}");
     }
 
-    /// Lower a yielding reaction (one or more `BusXfer`s) on metal: declare its
-    /// temporaries, then walk the body, lowering each `BusXfer` to a bounded
-    /// poll and applying the reaction's Layer-2 disposition on a propagated
-    /// fault.  A `retry` disposition wraps the whole body in a bounded loop;
-    /// `safe` drives the safe state; `skip`/`escalate` drop the activation.
-    fn emit_yielding_reaction_metal(&mut self, reaction: &SirReaction) {
-        // Temporaries are declared by `emit_reaction_fn`; this adds the bus
-        // fault flag shared by the transaction lowering and disposition.
-        self.line("uint8_t __faulted = 0U;");
+    /// Lower a yielding reaction to an IRQ-driven segment state machine (§5.2).
+    /// The flat body is split at each top-level `BusXfer` into segments held in a
+    /// static frame (`__rf_N`: segment state + retry counter + fault flag + every
+    /// cross-yield temp — these must survive the dispatcher returning, so they
+    /// live in the frame, not on the C stack).  Each transaction kicks the
+    /// controller, enables its completion IRQ, and **returns**; the scheduler
+    /// runs other reactions while it is in flight, and the bus IRQ handler
+    /// re-enters the dispatcher at the next segment, which reads the result and
+    /// continues.  A wedged bus never resumes, so the reaction stays in flight
+    /// and the watchdog catches it (§5.6) — matching the simulator's `Hang`.
+    fn emit_yielding_reaction_metal(&mut self, reaction: &SirReaction, fn_name: &str, comment: &str) {
+        let n = reaction.id;
+        let frame = format!("__rf_{}", n);
 
-        let is_retry = matches!(reaction.disposition, SirDisposition::Retry { .. });
-        if is_retry {
-            self.line("for (uint32_t __retry = 0U; ; __retry++) {");
-            self.indent += 1;
-            // The sim clears activation locals on each retry (§4.4); reset the
-            // temps so a re-run never reads a stale value from a prior attempt.
-            for name in self.collect_reaction_temps(reaction) {
-                self.line(&format!("{} = 0U;", name));
+        // Segment the body at each top-level BusXfer (yields are hoisted to the
+        // top level by the resolver, and a critical cannot span one).
+        let mut segs: Vec<(Vec<&SirStmt>, Option<&SirStmt>)> = Vec::new();
+        let mut cur: Vec<&SirStmt> = Vec::new();
+        for stmt in &reaction.body {
+            if matches!(stmt, SirStmt::BusXfer { .. }) {
+                segs.push((std::mem::take(&mut cur), Some(stmt)));
+            } else {
+                cur.push(stmt);
             }
         }
-        for stmt in &reaction.body {
-            match stmt {
-                SirStmt::BusXfer { device, op, args, dst, propagate, .. } => {
-                    for l in self.emit_bus_xfer_metal(*device, op, args, dst) {
+        segs.push((cur, None));
+
+        // Frame struct: dispatcher state + retry/fault + every cross-yield temp.
+        let temps = self.collect_reaction_temps(reaction);
+        self.line(&format!("/* {} — IRQ-driven yielding reaction (§5.2) */", comment));
+        self.line("static volatile struct {");
+        self.indent += 1;
+        self.line("uint32_t __state;   /* 0 = idle/ready; s = awaiting segment s's resume */");
+        self.line("uint32_t __retry;");
+        self.line("uint8_t  __faulted;");
+        for t in &temps {
+            self.line(&format!("uint32_t {};", t));
+        }
+        self.indent -= 1;
+        self.line(&format!("}} {} = {{0}};", frame));
+
+        // Rewrite body var refs to frame members while emitting the dispatcher.
+        self.frame_name = Some(frame.clone());
+        self.frame_vars = temps.iter().cloned().collect();
+
+        self.line(&format!("static void __react_{}_run(void) {{", n));
+        self.indent += 1;
+        self.line(&format!("switch ({}.__state) {{", frame));
+        self.indent += 1;
+        self.line(&format!("case 0U: {f}.__retry = 0U; {f}.__faulted = 0U; goto __seg_{n}_0;", f = frame, n = n));
+        for s in 1..segs.len() {
+            self.line(&format!("case {s}U: goto __seg_{n}_{s};", s = s, n = n));
+        }
+        self.line("default: return;");
+        self.indent -= 1;
+        self.line("}");
+
+        for (i, (pre, xfer)) in segs.iter().enumerate() {
+            // Segment label (labels sit at the dispatcher's brace level).
+            self.indent -= 1;
+            self.line(&format!("__seg_{}_{}:", n, i));
+            self.indent += 1;
+            // A resumed segment first reads the prior transaction's result and,
+            // on a propagated fault, applies the Layer-2 disposition.
+            if i >= 1 {
+                if let Some(SirStmt::BusXfer { device, op, dst, propagate, .. }) = segs[i - 1].1 {
+                    let dref = self.var_ref(dst);
+                    for l in self.emit_bus_resume_metal(*device, op, &dref, &frame) {
                         self.line(&l);
                     }
                     if *propagate {
-                        self.line("if (__faulted) {");
+                        self.line(&format!("if ({}.__faulted) {{", frame));
                         self.indent += 1;
-                        self.emit_disposition_terminal(reaction.disposition);
+                        self.emit_disposition_frame(reaction.disposition, &frame, n);
                         self.indent -= 1;
                         self.line("}");
                     }
-                    // A non-propagating fault leaves `dst` at 0 (set by the
-                    // lowering) and falls through, matching the sim.
                 }
-                other => self.emit_stmt(other),
+            }
+            for &stmt in pre.iter() {
+                self.emit_stmt(stmt);
+            }
+            // Terminate the segment: kick the next transaction (suspend) or, on
+            // the tail segment, complete and become ready to fire again.
+            if let Some(SirStmt::BusXfer { device, op, args, .. }) = xfer {
+                for l in self.emit_bus_kick_metal(*device, op, args, n) {
+                    self.line(&l);
+                }
+                self.line(&format!("{}.__state = {}U;", frame, i + 1));
+                self.line("return; /* suspend on the bus (§5.2) */");
+            } else {
+                self.line(&format!("{}.__state = 0U; /* complete; ready to fire again */", frame));
+                self.line("return;");
             }
         }
-        if is_retry {
-            self.line("return; /* clean completion exits the retry loop */");
-            self.indent -= 1;
-            self.line("}");
+        self.indent -= 1;
+        self.line("}");
+
+        self.frame_name = None;
+        self.frame_vars.clear();
+
+        // Trigger entry (SysTick/GPIOTE/main): coalesce a re-fire that arrives
+        // while a prior activation is still in flight (§5.1), as the sim does.
+        self.line(&format!("void {}(void) {{", fn_name));
+        self.indent += 1;
+        self.line(&format!("if ({}.__state != 0U) return; /* coalesce: still in flight (§5.1) */", frame));
+        self.line(&format!("__react_{}_run();", n));
+        self.indent -= 1;
+        self.line("}");
+    }
+
+    /// Layer-2 disposition at a resumed segment's propagated fault (§4.4/§5.4),
+    /// the frame-state counterpart of `emit_disposition_terminal`.
+    fn emit_disposition_frame(&mut self, disp: SirDisposition, frame: &str, n: usize) {
+        match disp {
+            SirDisposition::Retry { max } => {
+                // Re-run from segment 0 (re-kicks the first transaction) without
+                // resetting `__retry` (only a fresh fire, case 0, resets it).
+                self.line(&format!(
+                    "if ({f}.__retry < {max}U) {{ {f}.__retry++; {f}.__faulted = 0U; goto __seg_{n}_0; }}",
+                    f = frame, max = max, n = n
+                ));
+                self.line(&format!("{}.__state = 0U; return; /* retries exhausted → escalate */", frame));
+            }
+            SirDisposition::Skip => {
+                self.line(&format!("{}.__state = 0U; return; /* skip: drop this activation */", frame))
+            }
+            SirDisposition::Safe => {
+                // Mask interrupts before driving safe-state so nothing runs
+                // concurrently with (or after) the safe writes — the sim's
+                // `drive_safe` halts the whole machine.
+                self.line("__asm__ volatile(\"cpsid i\" ::: \"memory\"); /* no further reactions */");
+                self.line("__drive_safe();");
+                self.line("for (;;) { __asm__ volatile(\"wfi\"); } /* hold in safe state */");
+            }
+            SirDisposition::Escalate => {
+                self.line(&format!("{}.__state = 0U; return; /* escalate → Layer-3 */", frame))
+            }
         }
     }
 
@@ -299,65 +412,75 @@ impl CBackend {
         }
     }
 
-    /// Lower one `read_reg`/`write_reg` `BusXfer` to a bounded-poll transaction
-    /// over the controller's declared registers (CR/SR/SA/RA/DR, resolved by
-    /// name).  Sets `dst` from DR on success; sets `__faulted` on any error bit
-    /// or a poll overrun (→ timeout), mirroring the sim's bus outcome.
-    fn emit_bus_xfer_metal(&self, device: usize, op: &str, args: &[SirExpr], dst: &str) -> Vec<String> {
-        let regs = match self.device_regs.get(&device) {
-            Some(r) => r,
-            None => return vec![format!("#error \"i2c controller device {} has no MMIO base\"", device)],
-        };
-        let addr_of = |name: &str| regs.get(name).copied();
-        let (Some(cr), Some(sr), Some(sa), Some(ra), Some(dr)) =
-            (addr_of("CR"), addr_of("SR"), addr_of("SA"), addr_of("RA"), addr_of("DR"))
-        else {
-            return vec![format!(
-                "#error \"i2c controller device {} is missing a CR/SR/SA/RA/DR register\"",
+    /// Resolve a bus controller's CR/SR/SA/RA/DR MMIO addresses (declared by
+    /// name), or an `#error` line if the device has no base or is missing one.
+    fn bus_regs_metal(&self, device: usize) -> Result<(u64, u64, u64, u64, u64), String> {
+        let regs = self
+            .device_regs
+            .get(&device)
+            .ok_or_else(|| format!("#error \"bus controller device {} has no MMIO base\"", device))?;
+        let a = |name: &str| regs.get(name).copied();
+        match (a("CR"), a("SR"), a("SA"), a("RA"), a("DR")) {
+            (Some(cr), Some(sr), Some(sa), Some(ra), Some(dr)) => Ok((cr, sr, sa, ra, dr)),
+            _ => Err(format!(
+                "#error \"bus controller device {} is missing a CR/SR/SA/RA/DR register\"",
                 device
-            )];
+            )),
+        }
+    }
+
+    /// Kick a `read_reg`/`write_reg` transaction over the controller's declared
+    /// registers and enable its completion IRQ; the caller then suspends (sets
+    /// the next state and returns).  Mirrors the write side of the simulator's
+    /// bus servicing.  `n` is the owning reaction id (recorded in `__bus_owner`).
+    fn emit_bus_kick_metal(&self, device: usize, op: &str, args: &[SirExpr], n: usize) -> Vec<String> {
+        let (cr, _sr, sa, ra, dr) = match self.bus_regs_metal(device) {
+            Ok(t) => t,
+            Err(e) => return vec![e],
         };
         let is_read = op == "read_reg";
         if !is_read && op != "write_reg" {
-            return vec![format!("#error \"unsupported i2c op '{}' (expected read_reg/write_reg)\"", op)];
+            return vec![format!("#error \"unsupported bus op '{}' (expected read_reg/write_reg)\"", op)];
         }
         // read_reg(addr, reg); write_reg(addr, reg, val).
         let addr_arg = args.first().map(|a| self.emit_expr(a)).unwrap_or_else(|| "0U".into());
         let reg_arg = args.get(1).map(|a| self.emit_expr(a)).unwrap_or_else(|| "0U".into());
         let val_arg = args.get(2).map(|a| self.emit_expr(a));
 
-        let mut out = vec![format!(
-            "{{ /* i2c {} → {}: bounded-poll transaction (§3.5/§5.2) */",
-            op, dst
-        )];
-        out.push("    __faulted = 0U;".into());
-        out.push(format!("    *(volatile uint32_t *)0x{:08x}UL = (uint32_t)({}); /* SA */", sa, addr_arg));
-        out.push(format!("    *(volatile uint32_t *)0x{:08x}UL = (uint32_t)({}); /* RA */", ra, reg_arg));
+        let mut out = vec![format!("/* bus {} → kick + arm completion IRQ (§3.5/§5.2) */", op)];
+        out.push(format!("*(volatile uint32_t *)0x{:08x}UL = (uint32_t)({}); /* SA */", sa, addr_arg));
+        out.push(format!("*(volatile uint32_t *)0x{:08x}UL = (uint32_t)({}); /* RA */", ra, reg_arg));
         if let Some(val) = &val_arg {
-            out.push(format!("    *(volatile uint32_t *)0x{:08x}UL = (uint32_t)({}); /* DR (write) */", dr, val));
+            out.push(format!("*(volatile uint32_t *)0x{:08x}UL = (uint32_t)({}); /* DR (write) */", dr, val));
         }
-        out.push("    __DMB();".into());
+        out.push("__DMB();".into());
         let cr_kick = if is_read { "__I2C_CR_START | __I2C_CR_DIR_RD" } else { "__I2C_CR_START" };
-        out.push(format!("    *(volatile uint32_t *)0x{:08x}UL = ({}); /* CR: kick */", cr, cr_kick));
-        out.push("    __DMB();".into());
-        out.push("    uint32_t __sr = 0U, __spins = 0U;".into());
-        out.push("    for (;;) {".into());
-        out.push(format!("        __sr = *(volatile uint32_t *)0x{:08x}UL; /* SR */", sr));
-        // Check error before done: if the controller raises both in the same
-        // read, the transfer is a fault, not a success.
-        out.push("        if (__sr & __I2C_SR_ERR) break;".into());
-        out.push("        if (__sr & __I2C_SR_DONE) break;".into());
-        out.push("        if (++__spins > __I2C_POLL_BOUND) { __sr = __I2C_SR_TIMEOUT; break; }".into());
-        out.push("    }".into());
-        // Success only on `done` with no error bit set.
+        out.push(format!("*(volatile uint32_t *)0x{:08x}UL = ({}); /* CR: kick */", cr, cr_kick));
+        out.push("__DMB();".into());
+        out.push(format!("__bus_owner = (int32_t){}; /* this reaction now owns the bus */", n));
+        out.push("__bus_irq_enable();".into());
+        out
+    }
+
+    /// Read a completed transaction's result at the resumed segment: success →
+    /// `dst` from DR (reads) or 0 (writes); a `done`-with-error or a non-`done`
+    /// wake sets the frame's fault flag.  Mirrors the sim's bus outcome.
+    fn emit_bus_resume_metal(&self, device: usize, op: &str, dst: &str, frame: &str) -> Vec<String> {
+        let (_cr, sr, _sa, _ra, dr) = match self.bus_regs_metal(device) {
+            Ok(t) => t,
+            Err(e) => return vec![e],
+        };
+        let is_read = op == "read_reg";
+        let mut out = vec!["{ /* bus completion: read result (§5.2) */".into()];
+        out.push(format!("    uint32_t __sr = *(volatile uint32_t *)0x{:08x}UL; /* SR */", sr));
         if is_read {
             out.push("    if ((__sr & __I2C_SR_DONE) && !(__sr & __I2C_SR_ERR)) {".into());
             out.push(format!("        {} = *(volatile uint32_t *)0x{:08x}UL; /* DR (read result) */", dst, dr));
-            out.push("    } else { __faulted = 1U; }".into());
+            out.push(format!("    }} else {{ {}.__faulted = 1U; }}", frame));
         } else {
             out.push(format!(
-                "    if ((__sr & __I2C_SR_DONE) && !(__sr & __I2C_SR_ERR)) {{ {} = 0U; }} else {{ __faulted = 1U; }}",
-                dst
+                "    if ((__sr & __I2C_SR_DONE) && !(__sr & __I2C_SR_ERR)) {{ {} = 0U; }} else {{ {}.__faulted = 1U; }}",
+                dst, frame
             ));
         }
         out.push("}".into());
@@ -422,7 +545,7 @@ impl CBackend {
             SirStmt::Assign { target, value } => match target {
                 SirPlace::Var(name) => {
                     let val = self.emit_expr(value);
-                    self.line(&format!("{} = {};", name, val));
+                    self.line(&format!("{} = {};", self.var_ref(name), val));
                 }
                 place @ SirPlace::Reg { device, reg_offset, .. } => {
                     match self.target {
@@ -699,7 +822,7 @@ impl CBackend {
                 let escaped = c_escape_bytes(bytes);
                 format!("(const uint8_t *)\"{}\"", escaped)
             }
-            SirExpr::Load(name) => name.clone(),
+            SirExpr::Load(name) => self.var_ref(name),
             SirExpr::RegLoad { device, reg_offset, width, field_mask, field_shift, access } => {
                 self.emit_reg_load(*device, *reg_offset, *width, *field_mask, *field_shift, *access)
             }
@@ -841,8 +964,17 @@ impl CBackend {
             self.line("#define __I2C_CR_DIR_RD 0x2U         /* CR.dir = read */");
             self.line("#define __I2C_SR_DONE 0x1U           /* SR.done */");
             self.line("#define __I2C_SR_ERR 0xEU            /* SR.nak | arblost | timeout */");
-            self.line("#define __I2C_SR_TIMEOUT 0x8U        /* SR.timeout (synthesised on poll overrun) */");
-            self.line("#define __I2C_POLL_BOUND 1000000U    /* bounded busy-wait → timeout fault (§5.2/§5.6) */");
+            self.line("");
+            self.line("/* Cooperative bus suspension (§5.2): the reaction that owns the in-flight");
+            self.line("   transaction, and NVIC enable/disable for the controller's completion IRQ.");
+            self.line("   A wedged bus never raises the IRQ → the owner stays in flight and the");
+            self.line("   watchdog catches it (§5.6), matching the simulator's `Hang`. */");
+            self.line("static volatile int32_t __bus_owner = -1;");
+            self.line("#define __NVIC_ISER0 (*(volatile uint32_t *)0xE000E100UL)");
+            self.line("#define __NVIC_ICER0 (*(volatile uint32_t *)0xE000E180UL)");
+            self.line("#define __BUS_IRQN 8U                /* nRF52840 SPI0/TWI0 line; the mock controller raises it (E1) */");
+            self.line("static inline void __bus_irq_enable(void)  { __NVIC_ISER0 = (1UL << __BUS_IRQN); }");
+            self.line("static inline void __bus_irq_disable(void) { __NVIC_ICER0 = (1UL << __BUS_IRQN); }");
             self.line("");
         }
         self.line("/* BASEPRI access for priority-ceiling critical sections (§5.5). */");
@@ -866,6 +998,7 @@ impl CBackend {
     fn emit_metal_startup(&mut self, module: &SirModule) {
         const GPIOTE_BASE: u64 = 0x4000_6000;
         const GPIOTE_IRQN: usize = 6;
+        const BUS_IRQN: usize = 8; // nRF52840 SPI0/TWI0 line (matches __BUS_IRQN)
 
         let systick = match systick_plan(module) {
             Ok(p) => p,
@@ -947,6 +1080,29 @@ impl CBackend {
             self.indent -= 1;
             self.line("}");
         }
+
+        // Bus completion IRQ (§5.2): resume the in-flight reaction's dispatcher.
+        // Only one transaction is in flight at a time, tracked by `__bus_owner`.
+        let bus_reactions: Vec<usize> = module.reactions.iter().filter(|r| r.yields).map(|r| r.id).collect();
+        if module_has_bus_xfer(module) && !bus_reactions.is_empty() {
+            self.emit_newline();
+            self.line("/* bus completion IRQ (§5.2): resume the in-flight reaction (§5.1 single owner) */");
+            self.line("void __BUS_IRQHandler(void) {");
+            self.indent += 1;
+            self.line("__bus_irq_disable();");
+            self.line("int32_t __o = __bus_owner;");
+            self.line("__bus_owner = -1;");
+            self.line("switch (__o) {");
+            self.indent += 1;
+            for id in &bus_reactions {
+                self.line(&format!("case {id}: __react_{id}_run(); break;", id = id));
+            }
+            self.line("default: break;");
+            self.indent -= 1;
+            self.line("}");
+            self.indent -= 1;
+            self.line("}");
+        }
         self.emit_newline();
 
         // Vector table: system exceptions + external IRQs up to the highest used.
@@ -969,11 +1125,22 @@ impl CBackend {
         entries.push(("0".into(), "13".into()));
         entries.push(("__default_handler".into(), "14 PendSV".into()));
         entries.push((systick_entry.into(), "15 SysTick".into()));
-        // External IRQs (index 16 + n).  Extend to GPIOTE if any events.
-        if !events.is_empty() {
-            for irq in 0..=GPIOTE_IRQN {
-                let (sym, note) = if irq == GPIOTE_IRQN {
+        // External IRQs (index 16 + n).  Extend to the highest line used by
+        // GPIOTE (`on` events) and/or the bus completion IRQ (yielding reactions).
+        let has_bus = module_has_bus_xfer(module) && !bus_reactions.is_empty();
+        let max_irq = [
+            (!events.is_empty()).then_some(GPIOTE_IRQN),
+            has_bus.then_some(BUS_IRQN),
+        ]
+        .into_iter()
+        .flatten()
+        .max();
+        if let Some(maxq) = max_irq {
+            for irq in 0..=maxq {
+                let (sym, note) = if irq == GPIOTE_IRQN && !events.is_empty() {
                     ("GPIOTE_IRQHandler".to_string(), format!("{} GPIOTE", 16 + irq))
+                } else if irq == BUS_IRQN && has_bus {
+                    ("__BUS_IRQHandler".to_string(), format!("{} bus completion", 16 + irq))
                 } else {
                     ("__default_handler".to_string(), format!("{} IRQ{}", 16 + irq, irq))
                 };
@@ -1078,7 +1245,28 @@ impl CBackend {
             self.emit_newline();
         }
 
-        if systick.is_some() || !events.is_empty() {
+        // Bus completion IRQ priority (§5.5): resume the reaction at its own
+        // level so its cell critical sections still mask the right interrupts.
+        // The IRQ is *enabled per-transaction* by `__bus_irq_enable()`, not here.
+        if module_has_bus_xfer(module) && !bus_reactions.is_empty() {
+            let prio = module
+                .reactions
+                .iter()
+                .filter(|r| r.yields)
+                .map(|r| r.priority)
+                .max()
+                .unwrap_or(self.max_priority);
+            let pb = self.basepri_byte(prio);
+            self.line(&format!(
+                "*(volatile uint8_t *)0x{:08x}UL = 0x{:02x}U; /* NVIC IPR IRQ{}: bus completion priority */",
+                0xE000_E400u64 + BUS_IRQN as u64,
+                pb,
+                BUS_IRQN
+            ));
+            self.emit_newline();
+        }
+
+        if systick.is_some() || !events.is_empty() || module_has_bus_xfer(module) {
             self.line("__DSB();");
             self.line("__asm__ volatile(\"cpsie i\"); /* enable interrupts */");
             self.emit_newline();

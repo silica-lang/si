@@ -173,29 +173,36 @@ Closing the sim≡metal gap for the Phase-1 keystone (composition + yields). Don
   in `tests/metal_codegen.rs`. `SirStmt::DeviceOp` now emits `#error` on metal
   rather than a silent no-op.
 
-- **`SirStmt::BusXfer` → bounded-poll I²C transaction + fault disposition** — a
-  composed-device read (`sensor.read_temp()` → `i2c read_reg`) lowers to a
-  transaction over the controller's *declared* registers (`CR/SR/SA/RA/DR`,
-  resolved by name from the device's `regs`; the bit conventions are documented
-  on the fields in `std/i2c_controller.si` and encoded in the backend — the same
-  nRF-target/SIR-neutral split GPIOTE/SysTick use). The reaction's Layer-2
-  disposition is lowered to match the simulator's `dispose`: `retry(max)` wraps
-  the body in a bounded loop, `safe` runs the emitted `__drive_safe()` (each
-  device's bounded safe-op register writes) then holds, `skip`/`escalate` drop
-  the activation. Reaction-local temporaries (`__busN`, op-inlining `__rN`/`__argN`)
-  are now declared as C locals. `examples/sensor_i2c.si` and `examples/safe_state.si`
-  build and link with `arm-none-eabi-gcc`; covered by
-  `bus_xfer_lowers_to_bounded_poll_over_declared_registers`,
-  `propagated_bus_fault_lowers_to_the_reaction_disposition`, and
-  `safe_disposition_drives_safe_state_on_metal`.
+- **`SirStmt::BusXfer` → IRQ-driven segment state machine + fault disposition (D2)** —
+  a composed-device read (`sensor.read_temp()` → `i2c read_reg`) lowers to a real
+  suspend/resume state machine (§5.2), not a busy-wait. The yielding reaction's
+  flat body is split at each top-level `BusXfer` into segments held in a static
+  frame (`__rf_N`: dispatcher state + retry counter + fault flag + every
+  cross-yield temp). Each transaction writes the controller's *declared* registers
+  (`CR/SR/SA/RA/DR`, resolved by name; bit conventions documented in
+  `std/i2c_controller.si`), **arms the controller's completion IRQ, records the
+  owner (`__bus_owner`), and returns** — so the scheduler runs other reactions
+  while it is in flight. The generated `__BUS_IRQHandler` re-enters the owner's
+  dispatcher at the next segment, which reads the result and continues. The
+  trigger entry **coalesces** a re-fire that arrives while still in flight (§5.1).
+  The Layer-2 disposition matches the sim's `dispose` across the suspension:
+  `retry(max)` re-runs from segment 0 (re-kicks) until exhausted then escalates,
+  `safe` masks interrupts + runs `__drive_safe()` then holds, `skip`/`escalate`
+  drop the activation. `examples/sensor_i2c.si`, `examples/sensor_spi.si`, and
+  `examples/safe_state.si` build and link with `arm-none-eabi-gcc`; covered by
+  `bus_xfer_lowers_to_irq_driven_segment_state_machine`,
+  `propagated_bus_fault_lowers_to_the_reaction_disposition`,
+  `spi_bus_xfer_lowers_to_irq_driven_segment_state_machine`, and
+  `safe_disposition_drives_safe_state_on_metal`. A wedged bus never raises the
+  IRQ, so the owner stays in flight and the watchdog catches it (§5.6) — now
+  matching the simulator's `Hang` exactly.
 
-  *Limitation:* the bounded busy-wait approximates the sim's run-to-completion
-  suspend/resume but does **not** reproduce §5.2 *interleaving* (other reactions
-  cannot run mid-poll); a wedged bus still starves the watchdog (§5.6), and a
-  poll overrun synthesises a `timeout` fault. Trace-order parity via a real
-  state-machine + I²C-IRQ resume is the next increment. End-to-end Renode
-  validation of the transfer additionally needs a matching mock I²C controller
-  (the std `CR/SR/DR` protocol), tracked separately.
+  *Remaining (E1):* end-to-end Renode validation of the *interleaving* (a
+  higher-priority reaction running during the bus suspension) needs a matching
+  **mock I²C controller** peripheral implementing the std `CR/SR/SA/RA/DR`
+  protocol and raising the completion IRQ — Renode does not model the abstract
+  controller. The simulator already proves the interleaving; this lands the
+  on-hardware trace-order parity check.
 
 ## How the Phase-0 gates close
 

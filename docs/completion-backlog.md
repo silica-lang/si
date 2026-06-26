@@ -59,7 +59,15 @@ pick the spec-consistent default and note it in the PR.
       BusXfer path with **zero backend change** (metal emitter resolves CR/SR/SA/RA/DR by
       name). Metal firmware compiles + links with arm-gcc; full Renode bus execution lands
       with E1's mock controller.
-- [ ] D2 Real IRQ-driven yields state machine (§5.2/§6.1) `[metal]`  ← critical path
+- [x] D2 Real IRQ-driven yields state machine (§5.2/§6.1) `[metal]` — PR #14. Metal-only
+      (the sim was already a full suspend/resume scheduler via pc + Activation.locals).
+      Busy-poll → static frame struct + segment dispatcher (`switch(__state)`) that kicks +
+      arms the completion IRQ + returns; `__BUS_IRQHandler` resumes the owner; trigger entry
+      coalesces (§5.1). A wedged bus now matches the sim's `Hang` (watchdog catches it).
+      Cell-borrow-across-yield safety holds via the existing "critical can't span a yield"
+      check (cells are only touched inside criticals). 3 codegen tests rewritten to assert
+      the state machine; all metal examples link; baseline blink/button Renode gate still
+      PASS. **Interleaving on Renode** (vs just in sim) lands with E1's mock controller.
 - [ ] D3 `await <cond> within <d>` (§3.2/§5.2) `[metal]`  (dep: D2)
 
 ### Cluster E — Renode Phase-1 closure + fault depth

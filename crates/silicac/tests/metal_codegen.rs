@@ -333,40 +333,52 @@ program app {
 "#;
 
 #[test]
-fn bus_xfer_lowers_to_bounded_poll_over_declared_registers() {
-    // A composed-device read (`sensor.read_temp()` → `i2c read_reg`) lowers to a
-    // bounded-poll transaction over the controller's *declared* registers
-    // (CR/SR/SA/RA/DR, base 0x4000_3000), not a stub.
+fn bus_xfer_lowers_to_irq_driven_segment_state_machine() {
+    // A composed-device read (`sensor.read_temp()` → `i2c read_reg`) lowers to an
+    // IRQ-driven segment state machine (§5.2): a static frame, a dispatcher that
+    // kicks the transaction over the controller's *declared* registers
+    // (CR/SR/SA/RA/DR, base 0x4000_3000) and suspends, and a bus IRQ that resumes
+    // it.  No busy-wait — the scheduler runs other work while it is in flight.
     let sir = compile(SENSOR);
     let out = c::CBackend::with_target(Target::MetalNrf52840).emit(&sir);
-    // Addresses come from the controller's declared register offsets.
+    // A static frame holds the dispatcher state across the suspension.
+    assert!(out.contains("static volatile struct {") && out.contains("} __rf_0 = {0};"), "frame struct:\n{out}");
+    assert!(out.contains("static void __react_0_run(void)") && out.contains("switch (__rf_0.__state)"), "segment dispatcher:\n{out}");
+    // Segment 0 kicks over the controller's declared register offsets…
     assert!(out.contains("0x40003008UL = (uint32_t)(118ULL); /* SA */"), "slave addr 0x76 to SA:\n{out}");
     assert!(out.contains("0x4000300cUL = (uint32_t)(250ULL); /* RA */"), "reg 0xFA to RA:\n{out}");
     assert!(out.contains("0x40003000UL = (__I2C_CR_START | __I2C_CR_DIR_RD)"), "CR kick (read):\n{out}");
-    assert!(out.contains("0x40003004UL; /* SR */"), "poll SR:\n{out}");
+    // …arms the completion IRQ, records the owner, and suspends.
+    assert!(out.contains("__bus_owner = (int32_t)0;"), "records bus owner:\n{out}");
+    assert!(out.contains("__bus_irq_enable();"), "arms completion IRQ:\n{out}");
+    assert!(out.contains("__rf_0.__state = 1U;") && out.contains("return; /* suspend on the bus"), "suspend after kick:\n{out}");
+    // The resumed segment reads the result; success requires `done` AND no error.
+    assert!(out.contains("0x40003004UL; /* SR */"), "read SR on resume:\n{out}");
     assert!(out.contains("0x40003010UL; /* DR (read result) */"), "read DR on done:\n{out}");
-    // Success requires `done` AND no error bit — a controller that raises both
-    // must fault, not read DR.
     assert!(out.contains("(__sr & __I2C_SR_DONE) && !(__sr & __I2C_SR_ERR)"), "done-without-error success:\n{out}");
-    // Bounded poll → timeout, and ordered MMIO.
-    assert!(out.contains("__spins > __I2C_POLL_BOUND"), "bounded busy-wait:\n{out}");
     assert!(out.contains("__DMB();"), "ordering barriers around the kick:\n{out}");
-    // No stub left behind.
-    assert!(!out.contains("TODO(metal)") && !out.contains("increment 2"), "BusXfer stub must be gone:\n{out}");
+    // The trigger entry coalesces a re-fire while still in flight (§5.1).
+    assert!(out.contains("if (__rf_0.__state != 0U) return; /* coalesce"), "coalesce guard:\n{out}");
+    // The bus completion IRQ resumes the owner's dispatcher, and is vectored.
+    assert!(out.contains("void __BUS_IRQHandler(void)") && out.contains("case 0: __react_0_run();"), "bus IRQ resumes owner:\n{out}");
+    assert!(out.contains("__BUS_IRQHandler,") && out.contains("bus completion"), "bus IRQ vectored:\n{out}");
+    // The old bounded busy-wait is gone.
+    assert!(!out.contains("__I2C_POLL_BOUND") && !out.contains("__spins"), "busy-wait must be gone:\n{out}");
 }
 
 #[test]
 fn propagated_bus_fault_lowers_to_the_reaction_disposition() {
-    // `retry(max = 3)` wraps the body in a bounded loop that `continue`s on a
-    // propagated fault and escalates (returns) once retries are exhausted,
-    // mirroring the simulator's `dispose`.
+    // On a propagated fault at the resumed segment, `retry(max = 3)` re-runs from
+    // segment 0 (re-kicking the transaction) until the bounded retry count is
+    // exhausted, then escalates — mirroring the simulator's `dispose`, but across
+    // the IRQ-driven suspension rather than a busy loop.
     let sir = compile(SENSOR);
     let out = c::CBackend::with_target(Target::MetalNrf52840).emit(&sir);
-    assert!(out.contains("for (uint32_t __retry = 0U; ; __retry++)"), "retry loop:\n{out}");
-    assert!(out.contains("if (__retry < 3U) continue;"), "retry up to max:\n{out}");
-    assert!(out.contains("return; /* retries exhausted → escalate */"), "escalate after exhaustion:\n{out}");
-    // The post-fault body only runs on success (guarded by `if (__faulted)`).
-    assert!(out.contains("if (__faulted) {"), "fault guard:\n{out}");
+    // The fault is detected in the resumed segment, guarded on the frame flag.
+    assert!(out.contains("if (__rf_0.__faulted) {"), "fault guard on the frame flag:\n{out}");
+    // Retry re-runs from segment 0 without resetting the retry counter.
+    assert!(out.contains("if (__rf_0.__retry < 3U) { __rf_0.__retry++; __rf_0.__faulted = 0U; goto __seg_0_0; }"), "bounded retry re-kicks:\n{out}");
+    assert!(out.contains("__rf_0.__state = 0U; return; /* retries exhausted → escalate */"), "escalate after exhaustion:\n{out}");
 }
 
 #[test]
@@ -504,18 +516,20 @@ program app {
 "#;
 
 #[test]
-fn spi_bus_xfer_lowers_to_bounded_poll_over_declared_registers() {
+fn spi_bus_xfer_lowers_to_irq_driven_segment_state_machine() {
     let sir = compile(SENSOR_SPI);
     let out = c::CBackend::with_target(Target::MetalNrf52840).emit(&sir);
-    // cs = 0 → SA; remote reg 0xFA (250) → RA; both at the spi controller's
-    // declared offsets off base 0x4000_3000.
+    // Same IRQ-driven segment lowering as i2c, over the spi controller's declared
+    // registers: cs = 0 → SA; remote reg 0xFA (250) → RA; base 0x4000_3000.
+    assert!(out.contains("static void __react_0_run(void)") && out.contains("switch (__rf_0.__state)"), "segment dispatcher:\n{out}");
     assert!(out.contains("0x40003008UL = (uint32_t)(0ULL); /* SA */"), "cs 0 to SA:\n{out}");
     assert!(out.contains("0x4000300cUL = (uint32_t)(250ULL); /* RA */"), "reg 0xFA to RA:\n{out}");
     assert!(out.contains("0x40003000UL = (__I2C_CR_START | __I2C_CR_DIR_RD)"), "CR kick (read):\n{out}");
-    assert!(out.contains("0x40003004UL; /* SR */"), "poll SR:\n{out}");
+    assert!(out.contains("__bus_irq_enable();") && out.contains("return; /* suspend on the bus"), "arms IRQ + suspends:\n{out}");
+    assert!(out.contains("0x40003004UL; /* SR */"), "read SR on resume:\n{out}");
     assert!(out.contains("0x40003010UL; /* DR (read result) */"), "read DR on done:\n{out}");
-    // Same bounded-poll + ordering as i2c; no stub.
-    assert!(out.contains("__spins > __I2C_POLL_BOUND"), "bounded busy-wait:\n{out}");
-    assert!(out.contains("__DMB();"), "ordering barriers:\n{out}");
+    assert!(out.contains("void __BUS_IRQHandler(void)"), "bus IRQ handler emitted:\n{out}");
+    // No busy-wait, no unlowered-device-op stub.
+    assert!(!out.contains("__I2C_POLL_BOUND") && !out.contains("__spins"), "busy-wait must be gone:\n{out}");
     assert!(!out.contains("not yet lowered"), "no unlowered-device-op stub:\n{out}");
 }
