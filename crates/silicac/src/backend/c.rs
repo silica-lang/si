@@ -110,6 +110,7 @@ impl CBackend {
                 self.emit_newline();
                 self.emit_globals(module);
                 self.emit_arith_helpers();
+                self.emit_now_helper(module);
                 self.emit_newline();
                 self.emit_reaction_fns(module);
                 self.emit_newline();
@@ -119,6 +120,8 @@ impl CBackend {
                 self.emit_header_metal(module);
                 self.emit_newline();
                 self.emit_globals(module);
+                self.emit_now_helper(module);
+                self.emit_newline();
                 self.emit_drive_safe(module);
                 self.emit_arith_helpers();
                 self.emit_reaction_fns(module);
@@ -142,7 +145,7 @@ impl CBackend {
             .any(|r| any_stmt(&r.body, &stmt_uses_stdio));
         let needs_timer = module.reactions.iter().any(|r| {
             matches!(r.trigger, SirTrigger::EveryNs(_))
-        });
+        }) || module_uses_now(module); // `now()` needs the host monotonic clock (§4.5)
         let needs_exit = module
             .reactions
             .iter()
@@ -242,6 +245,27 @@ impl CBackend {
         }
         for (op, mode, w, s) in combos {
             self.line(&arith_helper_def(op, mode, w, s));
+        }
+        self.emit_newline();
+    }
+
+    /// Emit `__now_ns()` (§4.5) backing the `now()` expression, when used.  Host
+    /// reads the POSIX monotonic clock; metal returns a SysTick-driven uptime
+    /// counter (1 ms resolution — the reactive scheduling granularity).
+    fn emit_now_helper(&mut self, module: &SirModule) {
+        if !module_uses_now(module) {
+            return;
+        }
+        match self.target {
+            Target::Host => {
+                self.line("/* now() — current time, ns (§4.5) */");
+                self.line("static uint64_t __now_ns(void) { return __get_mono_ns(); }");
+            }
+            Target::MetalNrf52840 => {
+                self.line("/* now() — uptime in ns, advanced by SysTick (1ms base, §4.5) */");
+                self.line("static volatile uint64_t __uptime_ns = 0ULL;");
+                self.line("static uint64_t __now_ns(void) { return __uptime_ns; }");
+            }
         }
         self.emit_newline();
     }
@@ -952,6 +976,8 @@ impl CBackend {
                 let r = self.emit_expr(rhs);
                 format!("{}({}, {})", arith_helper_name(*op, *mode, *width, *signed), l, r)
             }
+            // `now()` — current time in ns (§4.5), from the monotonic source.
+            SirExpr::Now => "__now_ns()".to_string(),
         }
     }
 
@@ -1153,6 +1179,10 @@ impl CBackend {
             }
             self.line("void SysTick_Handler(void) {");
             self.indent += 1;
+            if module_uses_now(module) {
+                // 1ms base tick → advance the uptime clock backing now() (§4.5).
+                self.line("__uptime_ns += UINT64_C(1000000);");
+            }
             for (id, threshold) in &plan.thresholds {
                 self.line(&format!("if (--__systick_ctr_{} == 0U) {{", id));
                 self.indent += 1;
@@ -1600,6 +1630,34 @@ fn trigger_comment(trigger: &SirTrigger) -> String {
         SirTrigger::SysStart => "reaction: on sys.start".into(),
         SirTrigger::EveryNs(ns) => format!("reaction: every {}ns", ns),
         SirTrigger::Event(id) => format!("reaction: on event {}", id),
+    }
+}
+
+/// True if any expression in the module reads the clock via `now()` (§4.5) —
+/// gates the `__now_ns()` helper and the metal uptime counter.
+fn module_uses_now(module: &SirModule) -> bool {
+    module.reactions.iter().any(|r| stmts_have_now(&r.body))
+}
+
+fn stmts_have_now(stmts: &[SirStmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        SirStmt::Assign { value, .. } => expr_has_now(value),
+        SirStmt::If { cond, then } => expr_has_now(cond) || stmts_have_now(then),
+        SirStmt::Exit(e) => expr_has_now(e),
+        SirStmt::Critical { body, .. } => stmts_have_now(body),
+        SirStmt::Poll { cond, .. } => expr_has_now(cond),
+        SirStmt::DeviceOp { args, .. } | SirStmt::BusXfer { args, .. } => args.iter().any(expr_has_now),
+        SirStmt::Intrinsic(SirIntrinsic::HostIoPrint(e)) => expr_has_now(e),
+        SirStmt::Intrinsic(_) => false,
+    })
+}
+
+fn expr_has_now(e: &SirExpr) -> bool {
+    match e {
+        SirExpr::Now => true,
+        SirExpr::Not(i) => expr_has_now(i),
+        SirExpr::BinOp(_, l, r) => expr_has_now(l) || expr_has_now(r),
+        _ => false,
     }
 }
 

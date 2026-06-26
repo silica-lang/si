@@ -814,6 +814,8 @@ impl<'m> Sim<'m> {
                 let b = self.eval_expr(rhs, frame);
                 self.eval_arith(*op, *mode, *width, *signed, a, b)
             }
+            // `now()` — current virtual time in ns since boot (§4.5).
+            SirExpr::Now => self.now,
         }
     }
 

@@ -697,6 +697,17 @@ A `duration` is represented as a count of ticks in a **known monotonic tick doma
 clock, so `500ms` lowers to an exact tick count for *this* board. `instant` is a reading of the
 monotonic clock; arithmetic is defined so only sensible combinations type-check.
 
+> **Status (implemented).** `instant`/`duration` are distinct `SirType`s (both `uint64_t` ns at
+> runtime) and `now()` reads the clock — the sim's virtual time, a host `clock_gettime` monotonic
+> read, or a SysTick-driven uptime counter on metal. The resolver's `time_kind` pass enforces the
+> rules above: `instant - instant → duration`, `instant ± duration → instant`, and rejects
+> `instant + instant`, `now() + <bare int>`, scaling an instant, comparing an instant to a
+> non-instant, and assigning an instant to a non-instant cell. A duration literal (`500ms`) is kept
+> type-distinct from a bare integer (`5`) via a dedicated `DurationLit` AST node, so the canonical
+> `now() + 500ms` (ok) vs `now() + 5` (error) distinction holds. **Remaining:** the exact-or-error
+> tick-rate conversion and `rounded` modes below (D15) are not yet enforced; metal `now()` is at
+> 1 ms (SysTick base) resolution.
+
 **Depth.** v1 ships *unit-safety* (the above). The representation is chosen so that **deadline /
 WCET annotations attach later without redesign**: a reaction may already be written `on x within
 2ms { ... }` (§3.4), which today is a runtime-checked bound and tomorrow can feed a static

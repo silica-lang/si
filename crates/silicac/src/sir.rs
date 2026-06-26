@@ -342,6 +342,9 @@ pub enum SirExpr {
         lhs: Box<SirExpr>,
         rhs: Box<SirExpr>,
     },
+    /// `now()` — the current time as an `instant`, nanoseconds since boot (§4.5).
+    /// The sim reads its virtual clock; metal/host read a monotonic counter.
+    Now,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -402,6 +405,12 @@ pub enum SirType {
     S32,
     S64,
     Bytes,
+    /// A point in time — nanoseconds since boot (§4.5).  Distinct from a plain
+    /// `u64` at the type level (the resolver enforces `instant`/`duration`
+    /// arithmetic rules); stored as `uint64_t`.
+    Instant,
+    /// A span of time — nanoseconds (§4.5).  Stored as `uint64_t`.
+    Duration,
 }
 
 impl SirType {
@@ -417,6 +426,7 @@ impl SirType {
             SirType::S32 => "int32_t",
             SirType::S64 => "int64_t",
             SirType::Bytes => "const uint8_t *",
+            SirType::Instant | SirType::Duration => "uint64_t",
         }
     }
 
@@ -426,7 +436,7 @@ impl SirType {
             SirType::Bool | SirType::U8 | SirType::S8 => 1,
             SirType::U16 | SirType::S16 => 2,
             SirType::U32 | SirType::S32 | SirType::Bytes => 4,
-            SirType::U64 | SirType::S64 => 8,
+            SirType::U64 | SirType::S64 | SirType::Instant | SirType::Duration => 8,
         }
     }
 }
