@@ -1,1 +1,5 @@
 /target/
+
+# mdBook build output and generated full-text index
+/docs/book/book/
+/docs/book/src/llms-full.txt

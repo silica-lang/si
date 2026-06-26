@@ -1,5 +1,8 @@
 # Silica
 
+[![docs](https://img.shields.io/badge/docs-mdBook-blue)](https://silica-lang.github.io/si/)
+[![llms.txt](https://img.shields.io/badge/llms.txt-ai--ready-brightgreen)](https://silica-lang.github.io/si/llms.txt)
+
 > An experimental, **embedded-native** and **agentic-native** programming language.
 > File extension: `.si`. Status: early — a working Phase-0 compiler slice.
 
@@ -12,7 +15,12 @@ smuggle in, and the language deliberately removes the things that make code hard
 machine to reason about: hidden state, ambiguous grammar, and untyped text.
 
 The full rationale, type system, execution model, and roadmap live in
-**[`docs/DESIGN.md`](docs/DESIGN.md)** — start there.
+**[`docs/DESIGN.md`](docs/DESIGN.md)** — start there. A friendlier, user-facing version is
+published at **[silica-lang.github.io/si](https://silica-lang.github.io/si/)** (built from
+[`docs/book`](docs/book) with [mdBook](https://rust-lang.github.io/mdBook/)). The docs are
+also published in the [llms.txt](https://llmstxt.org/) format for AI agents:
+[`llms.txt`](https://silica-lang.github.io/si/llms.txt) (index) and
+[`llms-full.txt`](https://silica-lang.github.io/si/llms-full.txt) (the whole site in one file).
 
 ## Repository layout
 

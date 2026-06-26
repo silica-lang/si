@@ -1,0 +1,18 @@
+[book]
+title = "Silica"
+authors = ["silica-lang"]
+description = "An experimental, embedded-native and agentic-native programming language."
+src = "src"
+language = "en"
+
+[output.html]
+site-url = "/si/"
+git-repository-url = "https://github.com/silica-lang/si"
+edit-url-template = "https://github.com/silica-lang/si/edit/main/docs/book/{path}"
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-icon = "fa-github"
+
+[output.html.fold]
+enable = true
+level = 1
