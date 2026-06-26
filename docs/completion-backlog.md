@@ -263,9 +263,12 @@ Each item is its own branch (`feat/p0-<id>`) + PR behind the hard gate.
       adopts the enclosing fixed scale (default Q16.16) via `arith_frac` threaded through let/cell/
       assign/reg-write. tests/fixed.rs (+3: 0.5*2=1, 3v3*10=33, fixed<8,8> 0.5 scales at F=8) +
       examples/fixed.si (gained = 3.0*1.5 → 4). metal_vs_sim Renode sanity PASS.
-- [ ] P0-3d BME280 datasheet compensation end-to-end (the proof point) — replace the elided math in
-      `std/bme280.si` with real `fixed<>` compensation ops; sim composition test asserts a
-      compensated value; keep existing BME280 regressions green.
+- [x] P0-3d BME280 datasheet compensation end-to-end (the proof point) — PR #45. `std/bme280.si`
+      gains `read_temp_c() -> fixed<16,16>`: reads the raw ADC over I²C (yielding) and compensates
+      with fixed cast + subtract + divide `(adc - T0)/span`. resolver `expr_sirtype` resolves a
+      composed-op call's return type so `let t = sensor.read_temp_c()` is `fixed`. tests/bme280.rs
+      (raw 0x5AB0 → 25.00 °C; deg 25, centi 2500; raw not passed through) + examples/sensor_temp_c.si.
+      metal_vs_sim + bus_parity Renode gates PASS. **Completes Finding 3 and the P0 cluster.**
 
 ## Completed log
 _(append `item — PR #NN — date` here as items land)_
