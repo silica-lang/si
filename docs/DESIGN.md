@@ -483,6 +483,17 @@ runtime cost. Where the state cannot be statically established — across an eve
 violation is a Layer-3 fault (§5.4), not undefined behaviour. The design goal is to maximise the
 statically-proven fraction; the runtime check is the sound fallback, never silently skipped.
 
+> **Status (implemented — static half).** Devices declare `states { … }`; an op may be guarded
+> `when <state>` and transitions with `become <state>`. The resolver tracks each device's provable
+> state through a reaction's straight-line flow (reset at every event boundary, since typestate is
+> not carried across one): a `when S` op call when a dominating `become S` has not run is a compile
+> error; a `when`/`become` naming an undeclared state is rejected at the device. **Remaining:** the
+> *runtime-precondition* lowering for the unprovable cases (across a `yields` / dynamic ref →
+> Layer-3 fault) and the Layer-3 **site map** (per-call-site debug info so the decoder can name
+> "handler X touched device Y outside its valid state") are follow-ups; today the unprovable case is
+> conservatively a compile error rather than a runtime check, and op-internal transitions are read
+> from the op's own top-level `become` (not through nested sub-op inlining).
+
 An **interface** is the contract a device provides (`implements i2c`) or requires
 (`needs bus: i2c`). Interfaces are how composition is typed: any device providing `i2c` can satisfy
 any `needs bus: i2c` — a controller does not need to know about the sensors that will use it.

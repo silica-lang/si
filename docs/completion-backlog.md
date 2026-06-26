@@ -143,7 +143,14 @@ pick the spec-consistent default and note it in the PR.
       DURING the sensor's bus suspension (mid-window hits=1,samples=0; post hits=1,samples=1)
       — trace-order parity with sim, impossible under a busy-poll. **Headline "device on
       Renode with trace-order parity" criterion met.** Hermetic sim oracle guards the example.
-- [ ] E2 `when`-typestate + Layer-3 site map (§4.1/§5.4) `[metal]`
+- [x] E2 `when`-typestate — static half (§4.1/D07) `[metal]` — PR #28. `states { … }`, op `when
+      <state>`, `become <state>`. Resolver tracks each device's provable state through a reaction's
+      straight-line flow (cleared per reaction); a `when S` call without a dominating `become S` is a
+      compile error; `when`/`become` on an undeclared state rejected at the device (check_states).
+      examples/typestate.si + tests/typestate.rs (5). Compile-time-only → metal unaffected: example
+      ELF compiles, metal_vs_sim gate still PASS. NOTE: runtime-precondition lowering (unprovable
+      cases → Layer-3 fault) + the Layer-3 site-map debug info are follow-ups; op transitions read
+      from the op's own top-level `become` (not nested sub-op inlining).
 - [ ] E3 Bus arbitration / queues / scheduler overflow policy (§3.5/D06, §5.1/D02) `[metal]`
 - [x] E4 `reaction … within <d>` deadline → watchdog starve (§4.5/§5.6) — PR #18. Parse
       `every/on … within <d>`, lower to SirReaction.deadline_ns. Sim: arm a per-activation
