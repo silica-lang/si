@@ -58,6 +58,9 @@ pub enum TraceKind {
     SafeState { device: usize, state: String },
     /// The scheduler-fed hardware watchdog fired — a reaction starved it (§5.6).
     WatchdogReset { timeout_ns: u64 },
+    /// A reaction overran its `within <d>` deadline (§4.5/§5.6) — it starved the
+    /// watchdog, so the system resets.
+    DeadlineMissed { reaction: usize, budget_ns: u64 },
 }
 
 #[derive(Debug, Default)]
@@ -126,6 +129,9 @@ impl SimResult {
                 TraceKind::SafeState { device, state } => {
                     format!("[{:>8.3}ms]   SAFE-STATE: {} -> {} (§5.6)", ms, name_of(*device), state)
                 }
+                TraceKind::DeadlineMissed { reaction, budget_ns } => {
+                    format!("[{:>8.3}ms] DEADLINE MISSED — reaction#{} overran its {}ns `within` budget → reset (§4.5/§5.6)", ms, reaction, budget_ns)
+                }
                 TraceKind::WatchdogReset { timeout_ns } => {
                     format!("[{:>8.3}ms] WATCHDOG RESET — handler starved the watchdog ({}ms timeout, §5.6)", ms, timeout_ns / 1_000_000)
                 }
@@ -157,6 +163,9 @@ enum Payload {
     },
     /// The hardware watchdog deadline for arming generation `gen` (§5.6).
     WdtTimeout { gen: u64 },
+    /// A reaction's `within <d>` deadline elapsed (§4.5/§5.6); if `reaction` is
+    /// still in flight on the same activation `gen`, it overran.
+    Deadline { reaction: usize, gen: u64 },
 }
 
 struct QItem {
@@ -206,6 +215,9 @@ struct Sim<'m> {
     cell_names: std::collections::HashSet<String>,
     /// Per-reaction single-live-activation flag (§5.1).
     in_flight: Vec<bool>,
+    /// Per-reaction activation generation, bumped each fire, so a stale `within`
+    /// deadline event from a completed activation is ignored (§4.5).
+    react_gen: Vec<u64>,
     /// Index into `module.bus_fault_queue` (transactions failed so far).
     bus_fault_idx: usize,
     /// Bus transactions left to hang (wedged bus, §5.6 watchdog demo).
@@ -237,6 +249,7 @@ pub fn run(module: &SirModule) -> SimResult {
         cells: HashMap::new(),
         cell_names,
         in_flight: vec![false; module.reactions.len()],
+        react_gen: vec![0; module.reactions.len()],
         bus_fault_idx: 0,
         bus_hangs_left: module.bus_hangs,
         wdt_active: None,
@@ -363,6 +376,19 @@ impl<'m> Sim<'m> {
                     }
                     continue; // a watchdog tick is not a reaction; no idle check
                 }
+                Payload::Deadline { reaction, gen } => {
+                    // Overrun only if this exact activation is still in flight; a
+                    // completed-and-refired reaction has a newer generation.
+                    if self.in_flight[reaction] && self.react_gen[reaction] == gen {
+                        let budget = self.module.reactions[reaction].deadline_ns.unwrap_or(0);
+                        self.trace.push(TraceRecord {
+                            at_ns: self.now,
+                            kind: TraceKind::DeadlineMissed { reaction, budget_ns: budget },
+                        });
+                        self.stop = true; // overrun starves the watchdog → reset
+                    }
+                    continue; // a deadline tick is not a reaction; no idle check
+                }
             }
             // The scheduler feeds the watchdog on a clean return to idle (§5.6).
             if !self.any_in_flight() {
@@ -423,6 +449,14 @@ impl<'m> Sim<'m> {
             self.arm_watchdog();
         }
         self.in_flight[idx] = true;
+        self.react_gen[idx] += 1;
+        // Arm this activation's `within <d>` deadline (§4.5/§5.6): if it is still
+        // in flight when the budget elapses, it overran and the watchdog resets.
+        if let Some(d) = self.module.reactions[idx].deadline_ns {
+            let gen = self.react_gen[idx];
+            let seq = self.next_seq();
+            self.queue.push(QItem { at_ns: self.now + d, priority: 0, seq, payload: Payload::Deadline { reaction: idx, gen } });
+        }
         let source = trigger_desc(&self.module.reactions[idx].trigger);
         self.trace.push(TraceRecord {
             at_ns: self.now,

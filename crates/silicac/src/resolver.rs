@@ -721,7 +721,8 @@ impl Resolver {
         let body = self.lower_block(&r.body, scope, vars);
         let yields = body_yields(&body);
         let disposition = lower_disposition(&r.fault_disp);
-        Some(SirReaction { id, trigger, body, priority, disposition, yields })
+        let deadline_ns = r.within.as_ref().map(|d| d.to_ns());
+        Some(SirReaction { id, trigger, body, priority, disposition, yields, deadline_ns })
     }
 
     /// Build the register bindings for a device type (its `regs` + fields), to

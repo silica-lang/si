@@ -100,6 +100,10 @@ pub struct SirReaction {
     /// True if the body contains a yielding bus transaction — the handler is a
     /// state machine that suspends and resumes (§5.2).
     pub yields: bool,
+    /// `within <d>` deadline budget in ns (§4.5/§5.6): the reaction must return
+    /// to idle within this of firing, else it overruns and the watchdog resets.
+    /// `None` = no declared deadline.
+    pub deadline_ns: Option<u64>,
 }
 
 /// Reaction-boundary fault disposition (§4.4): what happens when a fault
