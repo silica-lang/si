@@ -215,11 +215,14 @@ not access *semantics* (`rc`/`pop_on_read`/per-field/multi-field), and the FPU-l
 (`fixed<I,F>`) is non-functional. Plan: `~/.claude/plans/as-an-embedded-firmware-functional-pebble.md`.
 Each item is its own branch (`feat/p0-<id>`) + PR behind the hard gate.
 
-- [ ] P0-1a Measured worst-case stack via `-fcallgraph-info=su,da` (`.ci`; `-fstack-usage`/`.su`
-      fallback) — parse per-function stack + call edges, walk the recursion-banned acyclic graph
-      from entry points (`Reset_Handler`/`SysTick_Handler`/`GPIOTE_IRQHandler`/`__BUS_IRQHandler`/
-      `HardFault_Handler` → `__reaction_<id>`(+`__react_<id>_run`)), print measured budget beside
-      the SIR estimate. `[metal]`
+- [x] P0-1a Measured worst-case stack via `-fcallgraph-info=su,da` (`.ci`; `-fstack-usage`/`.su`
+      fallback) — PR #37. `backend::stackinfo` parses GCC per-function frames + call edges and walks
+      the recursion-banned acyclic graph from entry points (`Reset_Handler`/`SysTick_Handler`/
+      `GPIOTE_IRQHandler`/`__BUS_IRQHandler`/`HardFault_Handler`); metal `cc_flags` request the dumps,
+      `main.rs` pins `-dumpdir`/`-dumpbase` and prints `measured worst-case stack N B` beside the SIR
+      estimate (blink: 704 measured vs 992 estimate). tests/stackinfo.rs + 6 unit tests over fixture
+      `.ci`/`.su`. metal_vs_sim Renode gate PASS. NOTE: reporting only — P0-1b folds the measured
+      number into the enforced `ram_budget()` and hard-errors on over-RAM / non-static frames.
 - [ ] P0-1b Enforce measured budget in `ram_budget()` — hard-error on over-RAM or any `dynamic`
       frame; keep the SIR estimate as host/unit-test fallback; `harness/stack_budget.sh`. `[metal]`
 - [ ] P0-2a Thread per-field access resolver→SIR→backend (`RegInfo.fields` carries access; field
