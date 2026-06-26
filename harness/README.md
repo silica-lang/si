@@ -64,6 +64,31 @@ busy-poll. Expected output ends with:
 PASS: the button reaction ran DURING the sensor's bus suspension (trace-order parity with sim).
 ```
 
+## `watchdog_reset.sh` — Phase-1 watchdog reset gate (§5.6)
+
+`watchdog_reset.sh` proves the generated metal idle loop feeds the hardware
+watchdog **only on a clean return to idle**, so a wedged reaction stops the feeds
+and the watchdog fires — the scheduler-fed behaviour the simulator models, on
+nRF52840 in Renode.
+
+```sh
+RENODE=/path/to/renode ./harness/watchdog_reset.sh
+```
+
+Default program: `examples/bus_watchdog_nrf52840.si` (a sensor read over I²C every
+100ms + a `wdt` with a 50ms timeout). Renode models a *real* nRF WDT (different
+registers) and no abstract bus controller, so the harness unregisters `wdt` +
+`twi0` and loads `harness/MockWatchdog.cs` (@`0x4001_0000`, latches `SR` when it
+expires unfed) and `harness/MockBusController.cs` (@`0x4000_3000`). It runs twice:
+a **wedged** bus (mock latency 100s → the transfer never completes, the sensor
+stays suspended, the idle loop stops feeding) must fire the watchdog (`SR=1`); a
+**healthy** bus (latency 1ms → completes each tick) must not (`SR=0`). Expected
+output ends with:
+
+```
+PASS: a wedged reaction starves the watchdog → reset; a healthy one is fed (§5.6).
+```
+
 ## Notes
 
 - The hermetic codegen tests in `crates/silicac/tests/metal_codegen.rs` run in CI

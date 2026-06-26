@@ -81,3 +81,23 @@ fn a_healthy_reaction_feeds_the_watchdog_so_it_never_fires() {
     assert!(joined.contains("bus i2c0.read_reg() — done, resume"), "the read completed:\n{joined}");
     assert!(!joined.contains("WATCHDOG RESET"), "a fed watchdog must not fire:\n{joined}");
 }
+
+#[test]
+fn bus_watchdog_example_runs_healthy_in_sim() {
+    // Hermetic guard for examples/bus_watchdog_nrf52840.si (the metal watchdog
+    // reset harness's program): in the sim the bus completes each tick, so the
+    // sensor reads succeed and the watchdog never fires.  The on-hardware wedged
+    // case (idle loop stops feeding → reset) is proven by harness/watchdog_reset.sh.
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/bus_watchdog_nrf52840.si");
+    let src = std::fs::read_to_string(&path).expect("read bus_watchdog example");
+    let std_items = silicac::load_std_items(&silicac::default_std_dir()).expect("std");
+    let tokens = lexer::lex(&src).expect("lex");
+    let mut ast = parser::parse(tokens).expect("parse");
+    ast.items.splice(0..0, std_items);
+    let sir = resolver::resolve(&ast)
+        .unwrap_or_else(|e| panic!("resolve: {:?}", e.iter().map(|d| &d.msg).collect::<Vec<_>>()));
+    let joined = lines(&sir).join("\n");
+    assert!(joined.contains("cell samples = 2"), "the sensor keeps reading:\n{joined}");
+    assert!(!joined.contains("WATCHDOG RESET"), "a fed watchdog must not fire in the healthy run:\n{joined}");
+}

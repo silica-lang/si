@@ -107,9 +107,11 @@ pick the spec-consistent default and note it in the PR.
       backend configures+starts the wdt at boot (RLR/CR/KR) and feeds it in the idle loop
       gated on all yielding frames being idle (a hung/suspended reaction → never fed → reset).
       Codegen test + compile/link; existing Renode gates unaffected (non-wdt programs unchanged).
-- [ ] E5b Renode mock watchdog + reset validation `[metal]` — 0x40010000 is the DK's real nRF
-      WDT, so on-hardware proof needs a MockWatchdog.cs (CR/RLR/KR; resets if unfed) + a harness
-      hanging a reaction (mock bus with infinite latency) and observing the reset. Parallels E1.
+- [x] E5b Renode mock watchdog + reset validation `[metal]` — PR #20. harness/MockWatchdog.cs
+      (CR/RLR/KR @ 0x40010000, latches SR on expiry-unfed) + harness/watchdog_reset.sh +
+      examples/bus_watchdog_nrf52840.si. On Renode: wedged bus (mock latency 100s) → idle loop
+      stops feeding → watchdog fires (SR=1); healthy bus (1ms) → kept fed (SR=0). On-hardware
+      proof of the scheduler-fed watchdog (§5.6), parallel to E1's bus parity.
 - [ ] E4-metal: enforce `within <d>` on metal (per-reaction deadline timer) — builds on E5.
 
 ### Cluster F — exactness & capabilities (last)
