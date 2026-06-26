@@ -54,6 +54,9 @@ pub enum TraceKind {
     Dispose { reaction: usize, action: String },
     /// A re-fire was coalesced because the reaction was still in-flight (§5.1).
     Coalesced { reaction: usize },
+    /// An event re-fired while in flight and its pending slot was full (§5.1/D02);
+    /// `policy` = the declared non-coalesce overflow policy that applied.
+    EventOverflow { reaction: usize, policy: String },
     /// A device was driven to its safe state on an unrecovered fault (§5.6).
     SafeState { device: usize, state: String },
     /// The scheduler-fed hardware watchdog fired — a reaction starved it (§5.6).
@@ -125,6 +128,9 @@ impl SimResult {
                 }
                 TraceKind::Coalesced { reaction } => {
                     format!("[{:>8.3}ms]   reaction#{} re-fire coalesced (in-flight, §5.1)", ms, reaction)
+                }
+                TraceKind::EventOverflow { reaction, policy } => {
+                    format!("[{:>8.3}ms]   reaction#{} EVENT OVERFLOW — re-fire while in-flight, policy={} (§5.1/D02)", ms, reaction, policy)
                 }
                 TraceKind::SafeState { device, state } => {
                     format!("[{:>8.3}ms]   SAFE-STATE: {} -> {} (§5.6)", ms, name_of(*device), state)
@@ -441,7 +447,29 @@ impl<'m> Sim<'m> {
     /// in-flight — single live activation, §5.1).
     fn fire(&mut self, idx: usize) {
         if self.in_flight[idx] {
-            self.trace.push(TraceRecord { at_ns: self.now, kind: TraceKind::Coalesced { reaction: idx } });
+            // The single pending slot is full (§5.1/D02): apply the declared
+            // overflow policy for this re-fire.
+            match self.module.reactions[idx].overflow {
+                SirOverflow::Coalesce => {
+                    self.trace.push(TraceRecord { at_ns: self.now, kind: TraceKind::Coalesced { reaction: idx } });
+                }
+                SirOverflow::DropNewest => {
+                    self.trace.push(TraceRecord {
+                        at_ns: self.now,
+                        kind: TraceKind::EventOverflow { reaction: idx, policy: "drop-newest".into() },
+                    });
+                }
+                SirOverflow::Fault => {
+                    self.trace.push(TraceRecord {
+                        at_ns: self.now,
+                        kind: TraceKind::EventOverflow { reaction: idx, policy: "fault".into() },
+                    });
+                    // Raise to the safe-state handler (§5.4/§5.6): an event-queue
+                    // overflow under `fault` policy is a system-integrity fault.
+                    self.drive_safe();
+                    self.stop = true;
+                }
+            }
             return;
         }
         // Leaving idle: arm the watchdog (§5.6) for this in-flight period.

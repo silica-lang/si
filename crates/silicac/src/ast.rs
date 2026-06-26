@@ -153,9 +153,23 @@ pub struct Reaction {
     /// `within <d>` deadline budget (§4.5/§5.6): the reaction must return to idle
     /// within `d` of firing, else it overruns and the watchdog resets the system.
     pub within: Option<Duration>,
+    /// `on overflow <policy>` (§5.1/D02): what happens when the event re-fires
+    /// while an activation is still in flight.  `None` = the default (coalesce).
+    pub overflow: Option<OverflowPolicy>,
     pub fault_disp: Option<FaultDisp>,
     pub body: Block,
     pub span: Span,
+}
+
+/// Event-source overflow policy (§5.1/D02): the single pending slot is full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverflowPolicy {
+    /// Collapse the re-fire into the pending activation (default).
+    Coalesce,
+    /// Discard the re-fire, keeping the in-flight one.
+    DropNewest,
+    /// Raise an event-overflow fault to the safe-state handler (§5.4/§5.6).
+    Fault,
 }
 
 #[derive(Debug, Clone)]

@@ -744,6 +744,16 @@ following, all statically sized to keep RAM a compile-time constant (§5.3):
   declared per source — **coalesce** (collapse to one pending — the default for level/periodic
   sources), **drop-newest**, or **fault** (raise to the Layer-3/overflow handler). There is no
   silent unbounded growth and no silent loss.
+
+  > **Status (implemented).** A reaction declares its policy with an `on overflow <coalesce |
+  > drop_newest | fault>` clause (`SirReaction.overflow`, default `Coalesce`). When an event
+  > re-fires while an activation is in flight, the sim's `fire()` applies it: coalesce (the prior
+  > behaviour) collapses the re-fire; drop-newest discards it (distinct trace); `fault` drives the
+  > device to its safe state and stops — a system-integrity fault. On metal the yielding-reaction
+  > trigger entry branches the same way (coalesce/drop → return; `fault` → `__drive_safe()` + halt).
+  > **Remaining:** a pending capacity > 1 (today the slot is exactly one, the common case) and a
+  > per-event-*source* declaration (vs per-reaction) are follow-ups; multi-consumer bus arbitration /
+  > a bounded per-bus wait queue beyond the §5.2 single-yield model is not yet built.
 - **Single live activation per reaction.** A reaction has at most one in-flight activation. If its
   event re-fires while it is running *or yielded*, the re-fire follows the overflow policy above
   (default: coalesce). Reactions are **not** re-entrant; there is no stack of suspended activations

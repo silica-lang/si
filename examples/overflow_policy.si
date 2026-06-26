@@ -1,0 +1,44 @@
+// Event-source overflow policy (§5.1/D02).
+//
+// A reaction has at most ONE in-flight activation (reactions are not re-entrant),
+// and its event source has a single, statically-sized pending slot.  When the
+// event re-fires while an activation is still running *or yielded* and that slot
+// is full, the declared overflow policy applies — `coalesce` (the default, drop
+// to one pending), `drop_newest`, or `fault` (raise to the safe-state handler).
+// There is no silent unbounded growth and no silent loss.
+//
+// Here the sensor read yields on the bus (~2µs) but the trigger fires every 1µs,
+// so the second tick arrives while the first is still suspended.  Under
+// `on overflow fault` that re-fire is a system-integrity fault: the device is
+// driven to its safe state and the system stops.  Changing the policy to
+// `coalesce` (or omitting it) would instead collapse the re-fire and keep running.
+//
+//   silicac --sim examples/overflow_policy.si
+
+board demo {
+  soc s {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+  i2c0 : i2c_controller at 0x4000_3000 { needs { clock = soc.sysclk } }
+  env  : bme280 { needs { bus = i2c0 } }
+}
+
+program app {
+  use board demo as b
+  let sensor = b.env
+  cell samples : u32 = 0
+
+  // Fires faster than the bus completes → the pending slot overflows.
+  every 1us on overflow fault {
+    let t = sensor.read_temp()?
+    samples = samples + 1
+  }
+}
+
+sim app_sim for app {
+  run until 10us
+}
