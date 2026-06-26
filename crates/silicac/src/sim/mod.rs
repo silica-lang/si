@@ -61,6 +61,8 @@ pub enum TraceKind {
     /// A reaction overran its `within <d>` deadline (§4.5/§5.6) — it starved the
     /// watchdog, so the system resets.
     DeadlineMissed { reaction: usize, budget_ns: u64 },
+    /// A bounded ring buffer op (§5.3): `op` is push/pop, `len` the resulting count.
+    RingOp { ring: String, op: String, len: u64 },
 }
 
 #[derive(Debug, Default)]
@@ -131,6 +133,9 @@ impl SimResult {
                 }
                 TraceKind::DeadlineMissed { reaction, budget_ns } => {
                     format!("[{:>8.3}ms] DEADLINE MISSED — reaction#{} overran its {}ns `within` budget → reset (§4.5/§5.6)", ms, reaction, budget_ns)
+                }
+                TraceKind::RingOp { ring, op, len } => {
+                    format!("[{:>8.3}ms]   ring {}.{}() — len {}", ms, ring, op, len)
                 }
                 TraceKind::WatchdogReset { timeout_ns } => {
                     format!("[{:>8.3}ms] WATCHDOG RESET — handler starved the watchdog ({}ms timeout, §5.6)", ms, timeout_ns / 1_000_000)
@@ -213,6 +218,8 @@ struct Sim<'m> {
     cells: HashMap<String, u64>,
     /// Names that are cells (vs per-activation locals).
     cell_names: std::collections::HashSet<String>,
+    /// Bounded `ring<T, N>` storage (§5.3): name → (queue, capacity).
+    rings: HashMap<String, (std::collections::VecDeque<u64>, u32)>,
     /// Per-reaction single-live-activation flag (§5.1).
     in_flight: Vec<bool>,
     /// Per-reaction activation generation, bumped each fire, so a stale `within`
@@ -248,6 +255,7 @@ pub fn run(module: &SirModule) -> SimResult {
         regs: HashMap::new(),
         cells: HashMap::new(),
         cell_names,
+        rings: HashMap::new(),
         in_flight: vec![false; module.reactions.len()],
         react_gen: vec![0; module.reactions.len()],
         bus_fault_idx: 0,
@@ -274,9 +282,14 @@ impl<'m> Sim<'m> {
                 map.insert(reg.offset, reg.reset);
             }
         }
-        // Initialise cells/locals from their declared initialisers.
+        // Initialise cells/locals from their declared initialisers; bounded rings
+        // get an empty queue sized to their capacity (§5.3).
         for var in &self.module.vars {
-            self.cells.insert(var.name.clone(), const_value(&var.init));
+            if let SirType::Ring { cap, .. } = var.ty {
+                self.rings.insert(var.name.clone(), (std::collections::VecDeque::new(), cap));
+            } else {
+                self.cells.insert(var.name.clone(), const_value(&var.init));
+            }
         }
 
         // Seed the event queue (timers / injects / faults).
@@ -652,6 +665,29 @@ impl<'m> Sim<'m> {
                     }
                 }
             }
+            SirStmt::RingPush { ring, value } => {
+                let v = self.eval_expr(value, frame);
+                if let Some((q, cap)) = self.rings.get_mut(ring) {
+                    if q.len() as u32 >= *cap {
+                        q.pop_front(); // bounded: overwrite the oldest (§5.3)
+                    }
+                    q.push_back(v);
+                    let len = q.len() as u64;
+                    self.trace.push(TraceRecord {
+                        at_ns: self.now,
+                        kind: TraceKind::RingOp { ring: ring.clone(), op: "push".into(), len },
+                    });
+                }
+            }
+            SirStmt::RingPop { ring, dst } => {
+                let v = self.rings.get_mut(ring).and_then(|(q, _)| q.pop_front()).unwrap_or(0);
+                let len = self.rings.get(ring).map(|(q, _)| q.len() as u64).unwrap_or(0);
+                frame.insert(dst.clone(), v);
+                self.trace.push(TraceRecord {
+                    at_ns: self.now,
+                    kind: TraceKind::RingOp { ring: ring.clone(), op: "pop".into(), len },
+                });
+            }
             SirStmt::If { cond, then } => {
                 if self.eval_expr(cond, frame) != 0 {
                     self.eval_stmts(then, frame);
@@ -785,6 +821,14 @@ impl<'m> Sim<'m> {
                     SirBinOp::Ge => (a >= b) as u64,
                 }
             }
+            // Bounded-ring reads (§5.3).
+            SirExpr::RingLen(r) => self.rings.get(r).map(|(q, _)| q.len() as u64).unwrap_or(0),
+            SirExpr::RingEmpty(r) => self.rings.get(r).map(|(q, _)| q.is_empty() as u64).unwrap_or(1),
+            SirExpr::RingFull(r) => self
+                .rings
+                .get(r)
+                .map(|(q, cap)| (q.len() as u32 >= *cap) as u64)
+                .unwrap_or(0),
         }
     }
 }

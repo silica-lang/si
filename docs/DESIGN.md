@@ -791,6 +791,16 @@ No general heap. Memory comes in **statically-sized** forms the compiler sums at
   `every` handler).
 - `buffer<N>` / `bytes` — bounded byte storage for DMA and protocol framing.
 
+> **Status (implemented — `ring<T, N>`).** The canonical producer/consumer queue is built: a
+> `ring<T, N>` cell with `push`/`pop`/`len`/`is_empty`/`is_full`, modelled in the sim and lowered on
+> metal to a backing array + head/tail/count indices, all summed into the static RAM budget
+> (`ring<u32,16>` → 76 B; verified by `c::ram_budget`). On a full ring `push` overwrites the oldest
+> (a defined, bounded overflow policy); cross-reaction sharing is priority-ceiling protected by the
+> existing §5.5 auto-critical (ring ops register as cell touches). **Remaining:** `pool<T,N>`,
+> `arena`, and `buffer<N>`/`bytes` are not yet built (ring proves the bounded-container + static-
+> accounting pattern); `T` must be an integer scalar; a fault-on-full/empty variant (vs
+> overwrite-oldest) is a follow-up.
+
 Handler frames for suspendable handlers (§5.2) are also statically sized and counted. The result:
 **total RAM use is a compile-time constant** — but that claim is only true if the *stack* is bounded
 too, so the model bounds it explicitly (D08):

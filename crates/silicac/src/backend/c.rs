@@ -44,6 +44,8 @@ pub struct CBackend {
     /// timeout (§3.2) inside it routes to the right Layer-2 terminal.  None
     /// outside a reaction body.
     current_disposition: Option<SirDisposition>,
+    /// Ring cell name → (element bytes, capacity), for ring op codegen (§5.3).
+    ring_info: HashMap<String, (u8, u32)>,
 }
 
 impl CBackend {
@@ -63,6 +65,7 @@ impl CBackend {
             frame_vars: HashSet::new(),
             frame_name: None,
             current_disposition: None,
+            ring_info: HashMap::new(),
         }
     }
 
@@ -95,6 +98,11 @@ impl CBackend {
                 self.device_bases.insert(dev.id, base);
                 let regs = dev.regs.iter().map(|r| (r.name.clone(), base + r.offset)).collect();
                 self.device_regs.insert(dev.id, regs);
+            }
+        }
+        for v in &module.vars {
+            if let SirType::Ring { elem_bytes, cap } = v.ty {
+                self.ring_info.insert(v.name.clone(), (elem_bytes, cap));
             }
         }
         self.global_vars = module.vars.iter().map(|v| v.name.clone()).collect();
@@ -199,6 +207,16 @@ impl CBackend {
         // cached — emit them volatile (and it keeps the boot-test observable).
         let qualifier = if self.target == Target::MetalNrf52840 { "static volatile" } else { "static" };
         for var in &module.vars {
+            // A bounded ring (§5.3): backing array + head/tail/count, counted in
+            // the static RAM budget via SirType::Ring::byte_size.
+            if let SirType::Ring { elem_bytes, cap } = var.ty {
+                let elem = SirType::ring_elem_ctype(elem_bytes);
+                self.line(&format!(
+                    "{q} {e} __ring_{n}_buf[{c}]; {q} uint32_t __ring_{n}_head = 0, __ring_{n}_tail = 0, __ring_{n}_count = 0; /* ring<{e},{c}> */",
+                    q = qualifier, e = elem, n = var.name, c = cap
+                ));
+                continue;
+            }
             let c_ty = var.ty.c_type();
             let c_init = expr_to_c_literal(&var.init);
             let comment = if var.is_cell { " /* cell */" } else { "" };
@@ -427,6 +445,7 @@ impl CBackend {
         for stmt in stmts {
             match stmt {
                 SirStmt::Assign { target: SirPlace::Var(name), .. } => self.add_temp(name, seen, out),
+                SirStmt::RingPop { dst, .. } => self.add_temp(dst, seen, out),
                 SirStmt::BusXfer { dst, .. } => self.add_temp(dst, seen, out),
                 SirStmt::If { then, .. } => self.collect_temps_in(then, seen, out),
                 SirStmt::Critical { body, .. } => self.collect_temps_in(body, seen, out),
@@ -622,6 +641,27 @@ impl CBackend {
                     }
                 }
             },
+            SirStmt::RingPush { ring, value } => {
+                let v = self.emit_expr(value);
+                let cap = self.ring_info.get(ring).map(|(_, c)| *c).unwrap_or(1).max(1);
+                // Bounded ring (§5.3): on a full ring overwrite the oldest.
+                self.line(&format!("{{ /* ring {}.push */", ring));
+                self.indent += 1;
+                self.line(&format!("if (__ring_{r}_count >= {cap}U) {{ __ring_{r}_head = (__ring_{r}_head + 1U) % {cap}U; __ring_{r}_count--; }}", r = ring, cap = cap));
+                self.line(&format!("__ring_{r}_buf[__ring_{r}_tail] = ({v});", r = ring, v = v));
+                self.line(&format!("__ring_{r}_tail = (__ring_{r}_tail + 1U) % {cap}U; __ring_{r}_count++;", r = ring, cap = cap));
+                self.indent -= 1;
+                self.line("}");
+            }
+            SirStmt::RingPop { ring, dst } => {
+                let cap = self.ring_info.get(ring).map(|(_, c)| *c).unwrap_or(1).max(1);
+                let d = self.var_ref(dst);
+                self.line(&format!("{{ /* ring {}.pop */", ring));
+                self.indent += 1;
+                self.line(&format!("if (__ring_{r}_count > 0U) {{ {d} = __ring_{r}_buf[__ring_{r}_head]; __ring_{r}_head = (__ring_{r}_head + 1U) % {cap}U; __ring_{r}_count--; }} else {{ {d} = 0; }}", r = ring, d = d, cap = cap));
+                self.indent -= 1;
+                self.line("}");
+            }
             SirStmt::If { cond, then } => {
                 let c = self.emit_expr(cond);
                 self.line(&format!("if ({}) {{", c));
@@ -902,6 +942,13 @@ impl CBackend {
                     SirBinOp::Ge => ">=",
                 };
                 format!("({} {} {})", l, op_str, r)
+            }
+            // Bounded-ring reads (§5.3).
+            SirExpr::RingLen(r) => format!("__ring_{}_count", r),
+            SirExpr::RingEmpty(r) => format!("(__ring_{}_count == 0U)", r),
+            SirExpr::RingFull(r) => {
+                let cap = self.ring_info.get(r).map(|(_, c)| *c).unwrap_or(1).max(1);
+                format!("(__ring_{}_count >= {}U)", r, cap)
             }
         }
     }

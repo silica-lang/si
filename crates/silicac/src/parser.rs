@@ -1647,6 +1647,20 @@ impl Parser {
                         span: Span::new(start, self.prev_span().end),
                     });
                 }
+                // `ring<T, N>`
+                if name == "ring" && self.peek() == Some(&Token::Lt) {
+                    self.advance();
+                    let elem = self.parse_type()?;
+                    self.eat(&Token::Comma)?;
+                    // Parse `N` below comparison precedence so the closing `>` is
+                    // not consumed as a greater-than operator.
+                    let n = self.parse_add()?;
+                    self.eat(&Token::Gt)?;
+                    return Ok(TypeExpr {
+                        kind: TypeKind::Ring(Box::new(elem), Box::new(n)),
+                        span: Span::new(start, self.prev_span().end),
+                    });
+                }
                 if name == "bytes" {
                     return Ok(TypeExpr { kind: TypeKind::Bytes, span });
                 }

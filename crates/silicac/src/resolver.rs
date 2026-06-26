@@ -1027,6 +1027,10 @@ impl Resolver {
                                 self.lower_op_call(&inst, &method.name, args, false, expr.span, scope, vars, out);
                                 return;
                             }
+                            Some(Binding::Cell(cell, ty)) if matches!(ty, SirType::Ring { .. }) => {
+                                self.lower_ring_stmt(&cell, &method.name, args, expr.span, scope, vars, out);
+                                return;
+                            }
                             None => {
                                 self.err(dev_expr.span, format!("undefined device '{}'", device_name));
                                 return;
@@ -1067,8 +1071,14 @@ impl Resolver {
             ExprKind::Call { callee, args, .. } => {
                 if let ExprKind::Field(dev_expr, method) = &callee.kind {
                     if let Some(root) = expr_root_ident(dev_expr) {
-                        if let Some(Binding::Device(inst)) = scope.lookup(root).cloned() {
-                            return self.lower_op_call(&inst, &method.name, args, false, expr.span, scope, vars, out);
+                        match scope.lookup(root).cloned() {
+                            Some(Binding::Device(inst)) => {
+                                return self.lower_op_call(&inst, &method.name, args, false, expr.span, scope, vars, out);
+                            }
+                            Some(Binding::Cell(cell, ty)) if matches!(ty, SirType::Ring { .. }) => {
+                                return self.lower_ring_value(&cell, &method.name, args, expr.span, scope, vars, out);
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -1081,6 +1091,49 @@ impl Resolver {
             }
             ExprKind::Not(inner) => SirExpr::Not(Box::new(self.lower_expr_emit(inner, scope, vars, out))),
             _ => self.lower_expr(expr, scope),
+        }
+    }
+
+    /// Lower a ring op used as a **statement** (§5.3): `r.push(v)` enqueues;
+    /// `r.pop()` discards the dequeued value.
+    fn lower_ring_stmt(&mut self, cell: &str, method: &str, args: &[Expr], span: Span, scope: &mut Scope, vars: &[SirVar], out: &mut Vec<SirStmt>) {
+        match method {
+            "push" => {
+                if args.len() != 1 {
+                    self.err(span, "ring `push` takes exactly one argument");
+                    return;
+                }
+                let value = self.lower_expr_emit(&args[0], scope, vars, out);
+                out.push(SirStmt::RingPush { ring: cell.to_string(), value });
+            }
+            "pop" => {
+                let dst = self.fresh("ringpop");
+                out.push(SirStmt::RingPop { ring: cell.to_string(), dst });
+            }
+            other => self.err(span, format!("ring has no op '{other}' (expected push/pop/len/is_empty/is_full)")),
+        }
+    }
+
+    /// Lower a ring op used as a **value** (§5.3): `r.pop()` dequeues into a temp;
+    /// `r.len()/is_empty()/is_full()` are pure reads.
+    fn lower_ring_value(&mut self, cell: &str, method: &str, _args: &[Expr], span: Span, _scope: &mut Scope, _vars: &[SirVar], out: &mut Vec<SirStmt>) -> SirExpr {
+        match method {
+            "pop" => {
+                let dst = self.fresh("ringpop");
+                out.push(SirStmt::RingPop { ring: cell.to_string(), dst: dst.clone() });
+                SirExpr::Load(dst)
+            }
+            "len" => SirExpr::RingLen(cell.to_string()),
+            "is_empty" => SirExpr::RingEmpty(cell.to_string()),
+            "is_full" => SirExpr::RingFull(cell.to_string()),
+            "push" => {
+                self.err(span, "ring `push` returns nothing — use it as a statement");
+                SirExpr::U64(0)
+            }
+            other => {
+                self.err(span, format!("ring has no op '{other}' (expected push/pop/len/is_empty/is_full)"));
+                SirExpr::U64(0)
+            }
         }
     }
 
@@ -1702,6 +1755,8 @@ fn stmt_touches_cell(stmt: &SirStmt, cell: &str) -> bool {
         },
         SirStmt::DeviceOp { args, .. } => args.iter().any(|a| expr_touches_cell(a, cell)),
         SirStmt::BusXfer { args, .. } => args.iter().any(|a| expr_touches_cell(a, cell)),
+        SirStmt::RingPush { ring, value } => ring == cell || expr_touches_cell(value, cell),
+        SirStmt::RingPop { ring, .. } => ring == cell,
     }
 }
 
@@ -1753,6 +1808,7 @@ fn expr_touches_cell(expr: &SirExpr, cell: &str) -> bool {
         SirExpr::Load(n) => n == cell,
         SirExpr::Not(inner) => expr_touches_cell(inner, cell),
         SirExpr::BinOp(_, l, r) => expr_touches_cell(l, cell) || expr_touches_cell(r, cell),
+        SirExpr::RingLen(r) | SirExpr::RingEmpty(r) | SirExpr::RingFull(r) => r == cell,
         _ => false,
     }
 }
@@ -1794,6 +1850,15 @@ fn resolve_type_expr(ty: &TypeExpr) -> SirType {
         },
         TypeKind::Unit => SirType::U8,
         TypeKind::Bytes => SirType::Bytes,
+        // `ring<T, N>` — element size from `T`, capacity from the const `N`.
+        TypeKind::Ring(elem, n) => {
+            let elem_bytes = resolve_type_expr(elem).byte_size().clamp(1, 8) as u8;
+            let cap = match const_eval(n, &HashMap::new()) {
+                Some(ConstVal::Int(c)) => c as u32,
+                _ => 0,
+            };
+            SirType::Ring { elem_bytes, cap }
+        }
         _ => SirType::U32,
     }
 }

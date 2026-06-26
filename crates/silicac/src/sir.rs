@@ -232,6 +232,11 @@ pub enum SirStmt {
     Intrinsic(SirIntrinsic),
     /// Assign `target = value`.
     Assign { target: SirPlace, value: SirExpr },
+    /// `ring.push(v)` (§5.3): enqueue `value`; on a full ring the oldest element
+    /// is overwritten (a defined, bounded overflow policy).
+    RingPush { ring: String, value: SirExpr },
+    /// `let x = ring.pop()` (§5.3): dequeue the oldest into `dst` (0 if empty).
+    RingPop { ring: String, dst: String },
     /// `if <cond> { <then> }` — no else for now.
     If { cond: SirExpr, then: Vec<SirStmt> },
     /// `exit(code)` — terminate the process (host only).
@@ -330,6 +335,12 @@ pub enum SirExpr {
     Not(Box<SirExpr>),
     /// Binary arithmetic / comparison.
     BinOp(SirBinOp, Box<SirExpr>, Box<SirExpr>),
+    /// `ring.len()` — current element count (§5.3).
+    RingLen(String),
+    /// `ring.is_empty()` — count == 0.
+    RingEmpty(String),
+    /// `ring.is_full()` — count == cap.
+    RingFull(String),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -373,6 +384,9 @@ pub enum SirType {
     S32,
     S64,
     Bytes,
+    /// `ring<T, N>` — a bounded ring buffer (§5.3): `cap` elements each of
+    /// `elem_bytes` bytes, plus head/tail/count indices.  Statically counted.
+    Ring { elem_bytes: u8, cap: u32 },
 }
 
 impl SirType {
@@ -388,6 +402,19 @@ impl SirType {
             SirType::S32 => "int32_t",
             SirType::S64 => "int64_t",
             SirType::Bytes => "const uint8_t *",
+            // Rings are not scalar values; they are emitted as a named struct,
+            // never via `c_type` in expression position.
+            SirType::Ring { .. } => "struct __ring",
+        }
+    }
+
+    /// The element C type for a ring (`uint8_t`/`uint16_t`/`uint32_t`/`uint64_t`).
+    pub fn ring_elem_ctype(elem_bytes: u8) -> &'static str {
+        match elem_bytes {
+            1 => "uint8_t",
+            2 => "uint16_t",
+            8 => "uint64_t",
+            _ => "uint32_t",
         }
     }
 
@@ -398,6 +425,10 @@ impl SirType {
             SirType::U16 | SirType::S16 => 2,
             SirType::U32 | SirType::S32 | SirType::Bytes => 4,
             SirType::U64 | SirType::S64 => 8,
+            // cap elements + head/tail/count (3 × u32).
+            SirType::Ring { elem_bytes, cap } => {
+                (*cap as u64) * (*elem_bytes as u64) + 12
+            }
         }
     }
 }

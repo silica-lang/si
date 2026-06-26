@@ -53,7 +53,14 @@ pick the spec-consistent default and note it in the PR.
       `atomic { stmts }`, lower to ONE Critical whose ceiling is fixed up in analyze_cells
       (reuses the priority-ceiling machinery); reject a yield inside. Distinct from the
       per-access auto-critical. examples/atomic.si + tests/atomic.rs.
-- [ ] C2 Bounded types `pool`/`arena`/`ring`/`buffer`/`bytes` (§5.3/§4.3)
+- [x] C2 Bounded type `ring<T, N>` (§5.3) — PR #26. The canonical producer/consumer queue: a
+      `ring<T,N>` cell (TypeKind/SirType::Ring) with push/pop/len/is_empty/is_full, dispatched on a
+      cell binding. Sim models a VecDeque per ring; metal lowers to backing array + head/tail/count,
+      summed into the static RAM budget (ring<u32,16>=76B via c::ram_budget). Full ring → push
+      overwrites oldest (defined bounded policy); cross-reaction sharing protected by the §5.5
+      auto-critical (ring ops are cell touches). examples/ring.si + tests/ring.rs (4). Sim gate +
+      metal compiles. NOTE: pool/arena/buffer/bytes deferred (ring proves the pattern); T is an
+      integer scalar; fault-on-full/empty variant is a follow-up.
 - [ ] C3 Typed overlays — language construct only (§3.6)
 
 ### Cluster D — Phase-1 yields keystone
