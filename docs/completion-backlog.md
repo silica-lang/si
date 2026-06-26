@@ -281,8 +281,10 @@ gate, and `every` on real timer hardware instead of a 1ms SysTick grid. Plan:
       `MSR BASEPRI` raise (not `__DMB`); `__DSB` after interrupt-source clear before ISR return
       (GPIOTE/bus) + `__DSB;__ISB` after NVIC ISER enable; collapse the redundant double-`__DMB` per
       MMIO store to the architecturally-required Normal↔Device boundaries only.
-- [ ] P1-2 Default `-Os` + `--opt <level>` override `[metal]` — flip metal `-O1`→`-Os` in `cc_flags`,
-      add a CLI opt-level override injected in `run()`; keep `-fstack-usage`/`-fcallgraph-info`.
+- [x] P1-2 Default `-Os` + `--opt <level>` override `[metal]` — PR #49. Metal `cc_flags` now `-Os`;
+      `backend::opt_override_flag` + a `--opt` CLI flag drop the default `-O…` and append the override
+      in `run()` (keeps cc_flags `&'static`). backend::tests (default -Os; flag forming). Blink text
+      512B (-Os) vs 552B (-O2) proves it reaches cc; metal_vs_sim Renode gate PASS at -Os.
 - [ ] P1-3 Flash / code-size budget gate `[metal]` — `flash_budget()`/`enforce_flash()` symmetric to
       the RAM gate; measure `.text+.rodata+.data` via `arm-none-eabi-size` on the linked ELF vs the
       flash region, hard-error + delete ELF on overflow; `harness/flash_budget.sh`. (After P1-2.)
