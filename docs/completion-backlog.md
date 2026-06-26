@@ -302,5 +302,28 @@ gate, and `every` on real timer hardware instead of a 1ms SysTick grid. Plan:
       examples/every_timer_nrf52840.si. metal_vs_sim/bus_parity/deadline_reset/watchdog_reset PASS.
       **Completes Cluster P1.** NOTE (deferred): re-base now()/deadlines onto the TIMER + retire SysTick.
 
+### Cluster P2 — prove the thesis & reduce foreclosure (audit #35)
+From the deep audit (issue #35), the strategic items: prove SIR is genuinely target-neutral (an LLVM
+canary), measure the agentic-native thesis (an escape-hatch corpus metric), and make the type system
+more expressive (persistent typestate + match-over-fault-codes). Plan:
+`~/.claude/plans/as-an-embedded-firmware-functional-pebble.md`. Each item is its own branch
+(`feat/p2-<id>`, **independent off `main`**) + PR targeting `main` (not auto-merged).
+
+- [ ] P2-2 Escape-hatch / idiom-corpus metric (audit #9) — AST-based counter over std+examples
+      (`ExprKind::Cast` + wrap/sat BinOps; `.raw`/`.le`/`.be` future-proofed at 0); report per-file +
+      totals; gate std-lib escape-hatch count below a threshold. tests/escape_hatch.rs +
+      harness/escape_hatch_audit.sh. Validates risk #4. (baseline: 11 total, std=1.)
+- [ ] P2-3 Persistent cross-reaction typestate for single-owner devices (audit #10a) — device-ownership
+      pre-pass (analog of analyze_cells, keyed by device id; single_owner = touched by 1 reaction);
+      carry a single-owner device's end-state across reactions instead of clearing it. tests/typestate.rs.
+- [ ] P2-1 Thin SIR→LLVM-IR canary (audit #8) `[llvm]` — `brew install llvm`; backend/llvm.rs emits
+      textual LLVM IR for a SIR subset (sys.start, cell assigns, integer Arith via
+      `llvm.*.with.overflow`+`llvm.trap`, exit, host-io) with NO libc/`__builtin`; `--emit-llvm` flag;
+      hermetic test + harness/llvm_canary.sh (`llvm-as`/`opt -verify` + run). Validates risk #2.
+- [ ] P2-4 `match` over an op's fault codes (audit #10b, full sim+metal) `[metal]` — `MatchPat::Ok/Fault`,
+      parse `ok`/`fault <code>` arms; new SIR fault-or-value result; exhaustiveness vs
+      `op.ret.fault_codes`; sim + metal (yields state machine). Largest/riskiest. tests/match_stmt.rs +
+      Renode. (PAUSE & report if metal can't be validated.)
+
 ## Completed log
 _(append `item — PR #NN — date` here as items land)_
