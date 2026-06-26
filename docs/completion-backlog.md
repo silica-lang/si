@@ -277,10 +277,13 @@ gate, and `every` on real timer hardware instead of a 1ms SysTick grid. Plan:
 `~/.claude/plans/as-an-embedded-firmware-functional-pebble.md`. Each item is its own branch
 (`feat/p1-<id>`, **independent off `main`**) + PR targeting `main` (not auto-merged). All `[metal]`.
 
-- [ ] P1-1 Barrier model: ARM-conformant + de-duplicated `[metal]` — define `__ISB`; `__ISB` after
-      `MSR BASEPRI` raise (not `__DMB`); `__DSB` after interrupt-source clear before ISR return
-      (GPIOTE/bus) + `__DSB;__ISB` after NVIC ISER enable; collapse the redundant double-`__DMB` per
-      MMIO store to the architecturally-required Normal↔Device boundaries only.
+- [x] P1-1 Barrier model: ARM-conformant + de-duplicated `[metal]` — PR #48. Defined `__ISB`; `__ISB`
+      after `MSR BASEPRI` raise (replaces `__DMB`); `__DSB` after the GPIOTE event clear before ISR
+      return + `__DSB;__ISB` after the bus NVIC-disable; `__DSB` before the bus completion-IRQ enable;
+      `__ISB` after `cpsie i`. Collapsed the double-`__DMB` per MMIO store to a single trailing one
+      (Device memory is architecturally ordered). tests/metal_codegen.rs (single-DMB, ISB-after-BASEPRI,
+      DSB-at-event-clear); metal_vs_sim + bus_parity Renode gates PASS. NOTE: fully dropping the
+      trailing `__DMB` for runs with no Normal↔Device dependency is a deferred follow-up.
 - [x] P1-2 Default `-Os` + `--opt <level>` override `[metal]` — PR #49. Metal `cc_flags` now `-Os`;
       `backend::opt_override_flag` + a `--opt` CLI flag drop the default `-O…` and append the override
       in `run()` (keeps cc_flags `&'static`). backend::tests (default -Os; flag forming). Blink text
