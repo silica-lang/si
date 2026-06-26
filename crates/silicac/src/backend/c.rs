@@ -40,6 +40,10 @@ pub struct CBackend {
     /// returning between segments).  Empty/None otherwise.
     frame_vars: HashSet<String>,
     frame_name: Option<String>,
+    /// The disposition of the reaction currently being emitted, so a `poll`
+    /// timeout (§3.2) inside it routes to the right Layer-2 terminal.  None
+    /// outside a reaction body.
+    current_disposition: Option<SirDisposition>,
 }
 
 impl CBackend {
@@ -58,6 +62,7 @@ impl CBackend {
             max_priority: 0,
             frame_vars: HashSet::new(),
             frame_name: None,
+            current_disposition: None,
         }
     }
 
@@ -234,8 +239,32 @@ impl CBackend {
                 self.line(&format!("uint32_t {} = 0U;", name));
             }
         }
-        for stmt in &reaction.body {
-            self.emit_stmt(stmt);
+        // A non-yielding reaction can still fault via a `poll` timeout (§3.2); if
+        // so, give it the fault flag + Layer-2 disposition (a `retry` disposition
+        // wraps the body in a bounded loop, as the yielding path does).
+        let has_poll = self.target == Target::MetalNrf52840 && body_has_poll(&reaction.body);
+        if has_poll {
+            self.line("uint8_t __faulted = 0U;");
+            self.current_disposition = Some(reaction.disposition);
+            let is_retry = matches!(reaction.disposition, SirDisposition::Retry { .. });
+            if is_retry {
+                self.line("for (uint32_t __retry = 0U; ; __retry++) {");
+                self.indent += 1;
+                self.line("__faulted = 0U;");
+            }
+            for stmt in &reaction.body {
+                self.emit_stmt(stmt);
+            }
+            if is_retry {
+                self.line("return; /* clean completion exits the retry loop */");
+                self.indent -= 1;
+                self.line("}");
+            }
+            self.current_disposition = None;
+        } else {
+            for stmt in &reaction.body {
+                self.emit_stmt(stmt);
+            }
         }
         self.indent -= 1;
         self.line("}");
@@ -542,6 +571,33 @@ impl CBackend {
     fn emit_stmt(&mut self, stmt: &SirStmt) {
         match stmt {
             SirStmt::Intrinsic(intr) => self.emit_intrinsic(intr),
+            SirStmt::Poll { cond, fault_code, within_ns } => match self.target {
+                Target::MetalNrf52840 => {
+                    // Bounded busy-wait (§3.2): spin until `cond` holds; on the
+                    // bound elapsing, set `__faulted` and route to the reaction's
+                    // Layer-2 disposition.  Does not yield.
+                    let c = self.emit_expr(cond);
+                    let bound = (*within_ns).max(1);
+                    self.line(&format!("{{ /* poll `{}` within {}ns: bounded busy-wait (§3.2) */", fault_code, within_ns));
+                    self.indent += 1;
+                    self.line("uint32_t __spins = 0U;");
+                    self.line(&format!("while (!({})) {{", c));
+                    self.indent += 1;
+                    self.line(&format!("if (++__spins > {}UL) {{ __faulted = 1U; break; }}", bound));
+                    self.indent -= 1;
+                    self.line("}");
+                    self.indent -= 1;
+                    self.line("}");
+                    if let Some(disp) = self.current_disposition {
+                        self.line("if (__faulted) {");
+                        self.indent += 1;
+                        self.emit_disposition_terminal(disp);
+                        self.indent -= 1;
+                        self.line("}");
+                    }
+                }
+                Target::Host => self.line(&format!("/* host: sim services poll `{}` */", fault_code)),
+            },
             SirStmt::Assign { target, value } => match target {
                 SirPlace::Var(name) => {
                     let val = self.emit_expr(value);
@@ -1339,6 +1395,17 @@ fn module_has_bus_xfer(module: &SirModule) -> bool {
         .reactions
         .iter()
         .any(|r| r.body.iter().any(|s| matches!(s, SirStmt::BusXfer { .. })))
+}
+
+/// True if any statement in `stmts` (recursively, through `if`/critical bodies)
+/// is a `poll` — i.e. the reaction can fault via a poll timeout (§3.2).
+fn body_has_poll(stmts: &[SirStmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        SirStmt::Poll { .. } => true,
+        SirStmt::If { then, .. } => body_has_poll(then),
+        SirStmt::Critical { body, .. } => body_has_poll(body),
+        _ => false,
+    })
 }
 
 fn expr_to_c_literal(expr: &SirExpr) -> String {

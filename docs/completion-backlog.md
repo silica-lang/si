@@ -71,7 +71,13 @@ pick the spec-consistent default and note it in the PR.
       check (cells are only touched inside criticals). 3 codegen tests rewritten to assert
       the state machine; all metal examples link; baseline blink/button Renode gate still
       PASS. **Interleaving on Renode** (vs just in sim) lands with E1's mock controller.
-- [ ] D3 `await <cond> within <d>` (§3.2/§5.2) `[metal]`  (dep: D2) — NEEDS A DESIGN CALL,
+- [x] D3a `poll <cond> within <d> else fault <code>` (§3.2) `[metal]` — PR #17. Non-suspending
+      bounded busy-wait. Lex/parse, SirStmt::Poll, sim (deterministic check → pending_fault →
+      dispose), metal (bounded spin → __faulted → reaction disposition; non-yielding poll-
+      bearing reactions get the fault/retry wrapper). examples/poll_usart.si + tests/poll.rs.
+      Both Renode gates still PASS (no metal regression). Builds the `<cond> within <d>`
+      parsing await will reuse.
+- [ ] D3b `await <cond> within <d>` (§3.2/§5.2) `[metal]`  (dep: D2) — DEFERRED, NEEDS A DESIGN CALL,
       not autonomous-default-able. Findings: `await`/`poll`/`within`/`else` all lex but none
       parse; `await` suspends on a *condition* but the spec doesn't pin the wakeup trigger
       (re-check cadence? event-driven dep-tracking?); and the sim doesn't model hardware-

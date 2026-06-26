@@ -951,6 +951,17 @@ impl Resolver {
                 }
                 out.push(SirStmt::Critical { ceiling: 0, body });
             }
+            Stmt::Poll { cond, within, fault_code, .. } => {
+                // Bounded busy-wait, no suspension.  Lower the condition; the
+                // metal backend turns `within` into a spin bound, the sim checks
+                // it deterministically.
+                let cond = self.lower_expr_emit(cond, scope, vars, out);
+                out.push(SirStmt::Poll {
+                    cond,
+                    fault_code: fault_code.name.clone(),
+                    within_ns: within.to_ns(),
+                });
+            }
             Stmt::Become(_, _) => {} // typestate transition — later
             Stmt::Return(expr, _) => {
                 // Inside an inlined op body, `return X` binds the op's result
@@ -1677,6 +1688,7 @@ fn stmt_touches_cell(stmt: &SirStmt, cell: &str) -> bool {
             place_touches_cell(target, cell) || expr_touches_cell(value, cell)
         }
         SirStmt::If { cond, then } => expr_touches_cell(cond, cell) || stmts_touch_cell(then, cell),
+        SirStmt::Poll { cond, .. } => expr_touches_cell(cond, cell),
         SirStmt::Critical { body, .. } => stmts_touch_cell(body, cell),
         SirStmt::Exit(e) => expr_touches_cell(e, cell),
         SirStmt::Intrinsic(intr) => match intr {

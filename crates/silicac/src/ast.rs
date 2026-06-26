@@ -518,6 +518,10 @@ pub enum Stmt {
     Let(LetDecl),
     /// An expression used as a statement (typically a call or assignment).
     Expr(Expr),
+    /// `poll <cond> within <d> else fault <code>` — a bounded *busy-wait* that
+    /// does **not** yield (§3.2/§5.2): spin until `cond` holds, or raise fault
+    /// `code` once the bound elapses.  (Its suspending sibling is `await`.)
+    Poll { cond: Expr, within: Duration, fault_code: Ident, span: Span },
     /// `atomic { <stmts> }` — an explicit multi-statement critical section
     /// (§5.5/D03): the whole block runs at the priority ceiling of every cell it
     /// touches, so a group of cell updates is indivisible w.r.t. other reactions.

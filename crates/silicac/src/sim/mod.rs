@@ -42,6 +42,9 @@ pub enum TraceKind {
     /// A decoded Layer-3 hardware fault (§5.4): the faulting address and the
     /// language-level diagnosis from the address-ownership map.
     Fault { address: u64, diagnosis: String },
+    /// A `poll <cond> within <d>` was evaluated (§3.2): `satisfied` = the
+    /// condition held; otherwise the bound elapsed and `code` was raised.
+    Poll { code: String, satisfied: bool },
     /// A reaction suspended on a bus transaction (§5.2/§3.5).
     BusStart { device: usize, op: String },
     /// A bus transaction completed: `code` = None on success, Some on fault.
@@ -103,6 +106,10 @@ impl SimResult {
                 TraceKind::Fault { address, diagnosis } => {
                     format!("[{:>8.3}ms] FAULT (layer 3): {} (addr 0x{:08x})", ms, diagnosis, address)
                 }
+                TraceKind::Poll { code, satisfied } => match satisfied {
+                    true => format!("[{:>8.3}ms]   poll — satisfied", ms),
+                    false => format!("[{:>8.3}ms]   poll — timeout, FAULT {}", ms, code),
+                },
                 TraceKind::BusStart { device, op } => {
                     format!("[{:>8.3}ms]   bus {}.{}() — suspend (yields)", ms, name_of(*device), op)
                 }
@@ -213,6 +220,9 @@ struct Sim<'m> {
     trace: Vec<TraceRecord>,
     stdout: String,
     stop: bool,
+    /// A `poll` raised a fault this step; the activation loop disposes of it
+    /// (§3.2).  `None` between checks.
+    pending_fault: Option<String>,
 }
 
 /// Run the program in `module` under the deterministic host simulator.
@@ -236,6 +246,7 @@ pub fn run(module: &SirModule) -> SimResult {
         trace: Vec::new(),
         stdout: String::new(),
         stop: false,
+        pending_fault: None,
     };
     sim.run();
     SimResult { trace: sim.trace, stdout: sim.stdout }
@@ -466,6 +477,12 @@ impl<'m> Sim<'m> {
                 }
                 stmt => {
                     self.eval_stmt(stmt, &mut act.locals);
+                    // A `poll` inside this statement may have raised a fault
+                    // (§3.2); short-circuit to the reaction's disposition.
+                    if let Some(code) = self.pending_fault.take() {
+                        self.dispose(act, code);
+                        return;
+                    }
                     act.pc += 1;
                 }
             }
@@ -613,6 +630,20 @@ impl<'m> Sim<'m> {
                 });
                 self.eval_stmts(body, frame);
                 self.trace.push(TraceRecord { at_ns: self.now, kind: TraceKind::CriticalExit });
+            }
+            SirStmt::Poll { cond, fault_code, .. } => {
+                // Bounded busy-wait: nothing changes during a non-yielding wait,
+                // so the condition is checked once.  If it does not hold, the
+                // bound elapses and the fault is raised (the activation loop
+                // disposes of it — §3.2/§4.4).
+                let ok = self.eval_expr(cond, frame) != 0;
+                self.trace.push(TraceRecord {
+                    at_ns: self.now,
+                    kind: TraceKind::Poll { code: fault_code.clone(), satisfied: ok },
+                });
+                if !ok {
+                    self.pending_fault = Some(fault_code.clone());
+                }
             }
             SirStmt::DeviceOp { .. } => { /* Phase-1 composed-device hook */ }
             SirStmt::BusXfer { dst, .. } => {

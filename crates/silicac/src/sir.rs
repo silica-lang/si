@@ -234,6 +234,12 @@ pub enum SirStmt {
     /// is recorded so the analysis is observable; a metal backend lowers
     /// `ceiling` to a BASEPRI raise/restore.
     Critical { ceiling: u8, body: Vec<SirStmt> },
+    /// `poll <cond> within <d> else fault <code>` (§3.2): a bounded busy-wait
+    /// that does **not** yield.  If `cond` does not hold within the bound it
+    /// raises `fault_code`, which propagates to the reaction's disposition like a
+    /// failed transaction.  On the host the check is deterministic (nothing
+    /// changes during a non-yielding wait); on metal it is a bounded spin loop.
+    Poll { cond: SirExpr, fault_code: String, within_ns: u64 },
     /// A device op call over a substrate (§3.5).  Defined now as the Phase-1
     /// hook for composed devices; the slice lowers GPIO set/get directly to a
     /// register access instead (leaf MMIO, §6.5).
