@@ -309,10 +309,11 @@ more expressive (persistent typestate + match-over-fault-codes). Plan:
 `~/.claude/plans/as-an-embedded-firmware-functional-pebble.md`. Each item is its own branch
 (`feat/p2-<id>`, **independent off `main`**) + PR targeting `main` (not auto-merged).
 
-- [ ] P2-2 Escape-hatch / idiom-corpus metric (audit #9) — AST-based counter over std+examples
-      (`ExprKind::Cast` + wrap/sat BinOps; `.raw`/`.le`/`.be` future-proofed at 0); report per-file +
-      totals; gate std-lib escape-hatch count below a threshold. tests/escape_hatch.rs +
-      harness/escape_hatch_audit.sh. Validates risk #4. (baseline: 11 total, std=1.)
+- [x] P2-2 Escape-hatch / idiom-corpus metric (audit #9) — PR #54. `metrics::count_escape_hatches`
+      (token-based, comment-safe) counts `as <type>` casts + wrap/sat ops (`.raw`/`.le`/`.be` at 0);
+      `escape_audit` bin + harness/escape_hatch_audit.sh report per-file; tests/escape_hatch.rs gates
+      the std lib at ≤3 and locks the baseline. Corpus total 11 (9 casts, 2 wrap/sat), std=1. cargo
+      test green (35 binaries). Validates risk #4; a live agent eval (risk #5) is future work.
 - [ ] P2-3 Persistent cross-reaction typestate for single-owner devices (audit #10a) — device-ownership
       pre-pass (analog of analyze_cells, keyed by device id; single_owner = touched by 1 reaction);
       carry a single-owner device's end-state across reactions instead of clearing it. tests/typestate.rs.
