@@ -171,6 +171,17 @@ pub struct Resolver {
     /// to (§4.4/D14).  `lower_op_call` `take()`s it onto the emitted `BusXfer`'s
     /// `code_dst`, so the match reuses all of `lower_op_call`'s checks.
     pending_match_code: Option<String>,
+    /// §4.1/D07 runtime typestate (audit P3-3): device id → (generated state-cell
+    /// name, the device's declared states in index order).  Present only for
+    /// stateful devices with a `when`-guarded op; every `become` writes the cell,
+    /// and a `when S` call that isn't statically provable guards on it at runtime.
+    device_state_cells: HashMap<usize, (String, Vec<String>)>,
+    /// §4.1/D07 (audit P3-3): the set of `(device id, state)` that some op **call**
+    /// in the program can establish (a called op whose `become` targets it).  A
+    /// non-provable `when S` becomes a runtime guard only when `S` is establishable
+    /// (could be set by another reaction at runtime); otherwise it stays a compile
+    /// error (the op would be provably uncallable).
+    established_states: std::collections::HashSet<(usize, String)>,
 
     // ── output accumulators ──
     devices: Vec<SirDevice>,
@@ -228,6 +239,8 @@ impl Resolver {
             persistent_states: HashMap::new(),
             inlining: Vec::new(),
             pending_match_code: None,
+            device_state_cells: HashMap::new(),
+            established_states: std::collections::HashSet::new(),
             devices: Vec::new(),
             events: Vec::new(),
             cells: Vec::new(),
@@ -393,6 +406,21 @@ impl Resolver {
                     vars.push(SirVar { name: c.name.name.clone(), ty, init, is_cell: true });
                 }
                 ProgramItem::Reaction(_) => {}
+            }
+        }
+
+        // P3-3: generate a runtime typestate cell per stateful device with a
+        // `when`-guarded op, so a `when S` call that can't be statically proven
+        // guards on the device's live state at runtime (→ safe state) instead of
+        // being a conservative compile error (§4.1/D07).
+        self.build_state_cells(&scope, &mut vars);
+
+        // P3-3 pre-pass: collect the `(device, state)` pairs some op *call* can
+        // establish, so a non-provable `when S` becomes a runtime guard only when
+        // `S` is actually establishable at runtime (else it stays a compile error).
+        for item in &prog.items {
+            if let ProgramItem::Reaction(r) = item {
+                self.collect_established(&r.body, &scope);
             }
         }
 
@@ -936,6 +964,119 @@ impl Resolver {
             .and_then(|d| d.sections.states.as_ref())
             .and_then(|s| s.states.first())
             .map(|i| i.name.clone())
+    }
+
+    /// §4.1/D07 runtime typestate (audit P3-3): generate one `u32` state cell per
+    /// stateful device with a `when`-guarded op, initialised to the initial state
+    /// (index 0).  Recorded in `device_state_cells` for `become` writes + `when`
+    /// guards during reaction lowering.
+    fn build_state_cells(&mut self, scope: &Scope, vars: &mut Vec<SirVar>) {
+        let mut seen = std::collections::HashSet::new();
+        let mut insts: Vec<InstanceRef> = Vec::new();
+        for b in scope.bindings.values() {
+            if let Binding::Device(i) = b {
+                if seen.insert(i.device) {
+                    insts.push(i.clone());
+                }
+            }
+        }
+        insts.sort_by_key(|i| i.device); // deterministic cell order
+        for inst in insts {
+            let Some(def) = self.device_defs.get(&inst.ty) else { continue };
+            let states: Vec<String> = def
+                .sections
+                .states
+                .as_ref()
+                .map(|s| s.states.iter().map(|i| i.name.clone()).collect())
+                .unwrap_or_default();
+            if states.is_empty() {
+                continue;
+            }
+            let has_when = def.sections.ops.as_ref().is_some_and(|ops| {
+                ops.items.iter().any(|it| {
+                    let OpsItem::Op(o) = it;
+                    o.when.is_some()
+                })
+            });
+            if !has_when {
+                continue;
+            }
+            let name = format!("__dev{}_state", inst.device);
+            vars.push(SirVar {
+                name: name.clone(),
+                ty: SirType::U32,
+                init: SirExpr::U64(0),
+                is_cell: true,
+            });
+            self.device_state_cells.insert(inst.device, (name, states));
+        }
+    }
+
+    /// §4.1/D07 (audit P3-3): record every `(device, state)` a device-op *call* in
+    /// `block` can establish (a called op whose top-level `become` targets it),
+    /// into `established_states`.  Recurses through nested statements/expressions.
+    fn collect_established(&mut self, block: &Block, scope: &Scope) {
+        for stmt in &block.stmts {
+            self.collect_established_stmt(stmt, scope);
+        }
+    }
+
+    fn collect_established_stmt(&mut self, stmt: &Stmt, scope: &Scope) {
+        match stmt {
+            Stmt::Let(l) => self.collect_established_expr(&l.init, scope),
+            Stmt::Expr(e) => self.collect_established_expr(e, scope),
+            Stmt::Poll { cond, .. } | Stmt::Await { cond, .. } => self.collect_established_expr(cond, scope),
+            Stmt::Atomic(b, _) => self.collect_established(b, scope),
+            Stmt::Return(Some(e), _) => self.collect_established_expr(e, scope),
+            Stmt::Exit(e, _) => self.collect_established_expr(e, scope),
+            Stmt::Match { scrutinee, arms, .. } => {
+                self.collect_established_expr(scrutinee, scope);
+                for arm in arms {
+                    self.collect_established(&arm.body, scope);
+                }
+            }
+            Stmt::RegWrite { writes, .. } => {
+                for (_, v) in writes {
+                    self.collect_established_expr(v, scope);
+                }
+            }
+            Stmt::Become(_, _) | Stmt::Return(None, _) => {}
+        }
+    }
+
+    fn collect_established_expr(&mut self, expr: &Expr, scope: &Scope) {
+        match &expr.kind {
+            ExprKind::Call { callee, args, named } => {
+                if let ExprKind::Field(dev_expr, method) = &callee.kind {
+                    if let Some(root) = expr_root_ident(dev_expr) {
+                        if let Some(Binding::Device(inst)) = scope.lookup(root).cloned() {
+                            if let Some(op) = self.find_op(&inst.ty, &method.name) {
+                                if let Some(target) = op_become_target(op) {
+                                    self.established_states.insert((inst.device, target));
+                                }
+                            }
+                        }
+                    }
+                }
+                self.collect_established_expr(callee, scope);
+                for a in args {
+                    self.collect_established_expr(a, scope);
+                }
+                for (_, v) in named {
+                    self.collect_established_expr(v, scope);
+                }
+            }
+            ExprKind::Field(inner, _) | ExprKind::Not(inner) | ExprKind::Cast(inner, _) | ExprKind::Try(inner) => {
+                self.collect_established_expr(inner, scope)
+            }
+            ExprKind::BinOp { lhs, rhs, .. }
+            | ExprKind::Assign(lhs, rhs)
+            | ExprKind::CompoundAssign(_, lhs, rhs) => {
+                self.collect_established_expr(lhs, scope);
+                self.collect_established_expr(rhs, scope);
+            }
+            _ => {}
+        }
     }
 
     /// §4.1/§4.3 — `float`/`f64` is allowed only on a board whose SoC declares an
@@ -2221,23 +2362,61 @@ impl Resolver {
         // reaction's straight-line flow).  Otherwise it is a compile error.
         if let Some(required) = &op.when {
             let current = self.current_device_state(inst.device, &inst.ty);
-            if current.as_deref() != Some(required.name.as_str()) {
-                self.err(
-                    span,
-                    format!(
-                        "op '{}' requires device type '{}' to be in state '{}', but it is in state '{}' here — add a `become {}` before the call (§4.1/D07)",
-                        op_name,
-                        inst.ty,
-                        required.name,
-                        current.as_deref().unwrap_or("<unknown>"),
-                        required.name,
+            let provable = current.as_deref() == Some(required.name.as_str());
+            if !provable {
+                // Not statically proven in this reaction's straight-line flow
+                // (e.g. the state is established in *another* reaction).  If the
+                // state is one the device can actually reach, lower a RUNTIME
+                // precondition guard on the device's live state cell — a mismatch
+                // drives the safe state (§5.6) — instead of a compile error
+                // (§4.1/D07, audit P3-3).  A state no op can establish is still a
+                // compile error (the op would be uncallable).
+                let establishable = self
+                    .established_states
+                    .contains(&(inst.device, required.name.clone()));
+                match self.device_state_cells.get(&inst.device).cloned() {
+                    Some((cell, states)) if establishable => {
+                        let idx = states.iter().position(|s| s == &required.name).unwrap_or(0) as u64;
+                        out.push(SirStmt::If {
+                            cond: SirExpr::BinOp(
+                                SirBinOp::NotEq,
+                                Box::new(SirExpr::Load(cell)),
+                                Box::new(SirExpr::U64(idx)),
+                            ),
+                            then: vec![SirStmt::DriveSafe],
+                        });
+                    }
+                    // Not provable here and no reaction establishes the state →
+                    // the op is provably uncallable: a compile error (§4.1/D07).
+                    _ => self.err(
+                        span,
+                        format!(
+                            "op '{}' requires device type '{}' to be in state '{}', but it is in state '{}' here and no reaction establishes '{}' — add a `become {}` before the call (§4.1/D07)",
+                            op_name,
+                            inst.ty,
+                            required.name,
+                            current.as_deref().unwrap_or("<unknown>"),
+                            required.name,
+                            required.name,
+                        ),
                     ),
-                );
+                }
             }
         }
-        // Apply this op's typestate transition, if it ends by `become`-ing a state.
+        // Apply this op's typestate transition, if it ends by `become`-ing a
+        // state — both statically (for the in-reaction proof) and, when the
+        // device has a runtime state cell, as a live write (so a later reaction's
+        // guard sees the established state).  §4.1/D07, audit P3-3.
         if let Some(target) = op_become_target(&op) {
-            self.device_states.insert(inst.device, target);
+            self.device_states.insert(inst.device, target.clone());
+            if let Some((cell, states)) = self.device_state_cells.get(&inst.device).cloned() {
+                if let Some(idx) = states.iter().position(|s| s == &target) {
+                    out.push(SirStmt::Assign {
+                        target: SirPlace::Var(cell),
+                        value: SirExpr::U64(idx as u64),
+                    });
+                }
+            }
         }
         if args.len() != op.params.len() {
             self.err(span, format!("op '{}' takes {} arg(s), got {}", op_name, op.params.len(), args.len()));
@@ -2902,6 +3081,8 @@ fn stmt_touches_cell(stmt: &SirStmt, cell: &str) -> bool {
         SirStmt::BusXfer { args, .. } => args.iter().any(|a| expr_touches_cell(a, cell)),
         SirStmt::RingPush { ring, value } => ring == cell || expr_touches_cell(value, cell),
         SirStmt::RingPop { ring, .. } => ring == cell,
+        // A safe-state drive touches no cell (it halts the system).
+        SirStmt::DriveSafe => false,
     }
 }
 

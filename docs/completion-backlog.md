@@ -346,5 +346,47 @@ more expressive (persistent typestate + match-over-fault-codes). Plan:
       the decode on each reaction's first fire; multi-fire re-arm + match over a composed op are
       follow-ups.
 
+### Cluster P3 — P2 follow-ups
+The deferred `NOTE:`/`Remaining` items from Cluster P2 (PRs #54–#57). Plan:
+`~/.claude/plans/as-an-embedded-firmware-functional-pebble.md`. Each item is its own branch
+(`feat/p3-<id>`, **independent off `main`**) + PR targeting `main` (not auto-merged). Order:
+smallest/highest-value → largest. (The first feature PR also introduces this section.)
+
+- [x] P3-1 Multi-fire re-arm of a yielding `every` reaction (P2-4 follow-up) `[metal]` — PR #59.
+      Root cause (Renode access log): the completion IRQ line is **level** (held asserted until the next
+      transaction); after `__BUS_IRQHandler` disabled NVIC#8 a stale **pending** survived, and the next
+      kick's `__bus_irq_enable()` re-took it spuriously — resuming before the new transfer completed, so
+      the reaction fired only ONCE. Fix: each kick clears the bus IRQ pending (`__bus_irq_clear_pending`
+      → NVIC ICPR) before arming (`emit_bus_kick_metal`). Also added `default-run = "silicac"` so
+      `cargo run` in the harnesses isn't ambiguous after P2-2's `escape_audit` bin. New
+      harness/bus_refire.sh (3 fires/one boot → reads==3); harness/fault_match.sh tightened to **true
+      multi-fire** (nak→timeout→arblost→ok in one boot, all PASS); tests/match_stmt.rs
+      (clear-before-enable). **Renode: PASS**; bus_parity.sh still PASS.
+- [x] P3-2 `match` over a composed (inlined) op (P2-4 follow-up) — PR #60. Lifted the primitive-bus-op
+      restriction in `resolver.rs` lower_result_match: the match's outcome rides the *single* bus
+      transaction reached through inlining — a composed op like std bme280 `read_temp` = `return
+      bus.read_reg(...)?` — so `ok v`/`fault <code>` work one composition hop up, unaware of the bus.
+      Fault codes + exhaustiveness come from that transaction (the leaf controller's runtime codes); a
+      multi-transaction composed op is rejected with a clear error. No backend change — the sim/metal
+      `code_dst` path already services an inlined BusXfer. examples/fault_match_composed.si +
+      tests/match_stmt.rs (composed); harness/fault_match.sh parametrized (runs on both examples).
+      sim + **Renode PASS**.
+- [x] P3-3 Broader typestate: runtime-precondition lowering (P2-3 follow-up) `[metal]` — PR #61. A
+      `when <state>` op call NOT proven by a dominating `become <state>` in the same reaction (e.g. the
+      state is configured in another reaction) now lowers a RUNTIME guard → safe state on mismatch,
+      instead of a conservative compile error; a state no op can establish stays a compile error. A
+      generated per-device state cell tracks the runtime state (every `become` writes it); new
+      `SirStmt::DriveSafe`. tests/typestate.rs + examples/typestate_runtime.si; sim + **Renode** (guard
+      fires -> ticks freeze; with the config reaction it runs clean). NOTE: across-yield preemption of a
+      shared device's proven state + the rich Layer-3 site map remain follow-ups.
+- [ ] P3-4a Fuller LLVM backend — extended scalar subset (P2-1 follow-up) `[llvm]` — add `Now`/`RegLoad`/
+      signed saturate/full `BinOp`/`Not`, `If` control flow, and non-`sys.start` reaction bodies as
+      functions (no scheduler yet). tests/llvm_canary.rs + `opt -verify`.
+- [ ] P3-4b Fuller LLVM backend — MMIO register access (P2-1 follow-up) `[llvm]` — `SirPlace::Reg` store +
+      `RegLoad` -> `volatile` load/store at the absolute MMIO address. `opt -verify` + `llc` to object.
+- [ ] P3-4c Fuller LLVM backend — yields state machine + metal startup/linker (P2-1 follow-up) `[metal]` —
+      a real program links via the LLVM backend and runs on Renode (the genuine second-backend proof).
+      Largest; re-implements much of the C metal backend in LLVM IR; PAUSE & report if Renode can't validate.
+
 ## Completed log
 _(append `item — PR #NN — date` here as items land)_
