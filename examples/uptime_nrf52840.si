@@ -1,0 +1,35 @@
+// SysTick-driven `now()` uptime on the nRF52840-DK — isolates the metal LLVM
+// time base (audit P5-1, DESIGN §6.3/§4.5).  No GPIO, no bus: just `now()`.
+//
+//   silicac --sim                                   examples/uptime_nrf52840.si
+//   silicac --target metal-nrf52840 --emit-llvm     examples/uptime_nrf52840.si -o uptime
+//   ./harness/now_uptime.sh                          # metal `now()` ≈ elapsed time
+//
+// The LLVM backend now programs SysTick (1 ms base) + a SysTick_Handler that
+// advances `@__uptime_ns`, and lowers `now()` to a load of it (not the host
+// `llvm.readcyclecounter`).  Each 100ms tick stamps the absolute uptime into a
+// readable cell; on metal the cell should read ≈ the elapsed wall time (±1 ms).
+
+board nrf52840_dk {
+  soc nrf52840 {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+}
+
+program uptime {
+  use board nrf52840_dk as dev
+
+  cell stamp : instant = 0     // absolute now() at the most recent tick
+
+  every 100ms {
+    stamp = now()              // instant ← instant; SysTick-driven on metal
+  }
+}
+
+sim uptime_demo for uptime {
+  run until 350ms              // ticks at 100/200/300ms; stamp settles ≈300ms
+}

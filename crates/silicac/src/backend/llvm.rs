@@ -242,10 +242,25 @@ impl LlvmBackend {
         };
         // Metal `on <pin>.falling` → GPIOTE channels (P4-2).
         let events = if metal { self.events_of(module) } else { Vec::new() };
+        // Metal SysTick (P5-1): a 1 ms base tick backing `now()` uptime (and,
+        // from P5-4, `within` deadline bookkeeping + the watchdog wake cadence).
+        // Mirrors `c.rs` `needs_systick` — true for now() OR a watchdog.
+        let uses_now = metal && crate::backend::c::module_uses_now(module);
+        let needs_systick = metal && (uses_now || module.watchdog_device.is_some());
+        let systick_rvr = if needs_systick {
+            crate::backend::c::systick_reload(module).ok()
+        } else {
+            None
+        };
+        // `now()` reads this SysTick-driven uptime (ns, 1 ms resolution) on metal,
+        // mirroring the C `__uptime_ns` (host keeps `llvm.readcyclecounter`).
+        if uses_now {
+            self.globals.push_str("@__uptime_ns = global i64 0\n");
+        }
         if metal {
             // Metal: `Reset_Handler` does real startup (.data/.bss/pins + GPIOTE)
-            // + runs `sys.start` + programs TIMER1, then idles.  No `@main`/syscalls.
-            self.lower_reset_handler(module, &sys, timer.as_ref(), &events);
+            // + runs `sys.start` + programs SysTick/TIMER1, then idles.  No `@main`.
+            self.lower_reset_handler(module, &sys, timer.as_ref(), &events, systick_rvr);
         } else {
             // Host: `@main` runs every `on sys.start` body, in order.
             self.lower_function("i32 @main()", true, &sys);
@@ -279,6 +294,9 @@ impl LlvmBackend {
             if has_bus {
                 self.emit_bus_irq_handler(&bus_reactions);
             }
+            if needs_systick {
+                self.emit_systick_handler(uses_now);
+            }
             self.emit_default_handlers();
         }
 
@@ -301,7 +319,7 @@ impl LlvmBackend {
             }
             out.push('\n');
             // The Cortex-M vector table (placed at flash base by the linker).
-            out.push_str(&self.emit_vector_table(timer.is_some(), !events.is_empty(), has_bus));
+            out.push_str(&self.emit_vector_table(timer.is_some(), !events.is_empty(), has_bus, needs_systick));
             out.push('\n');
         }
         if !self.globals.is_empty() {
@@ -425,6 +443,7 @@ impl LlvmBackend {
         bodies: &[&[SirStmt]],
         plan: Option<&crate::backend::c::TimerPlan>,
         events: &[(usize, u64, u8, u8, Vec<usize>)],
+        systick_rvr: Option<u64>,
     ) {
         self.body.clear();
         self.allocas.clear();
@@ -466,6 +485,16 @@ impl LlvmBackend {
                 }
                 self.emit_stmt(stmt);
             }
+        }
+
+        // Program SysTick (SCS architectural timer, §4.5 P5-1): a 1 ms base tick
+        // for now()/deadline bookkeeping, at the lowest urgency (touches no cells).
+        if let Some(rvr) = systick_rvr {
+            self.m_store32(0xE000_E014, &rvr.to_string(), "SYST_RVR");
+            self.m_store32(0xE000_E018, "0", "SYST_CVR");
+            self.m_asm("dsb 0xf", "ordering");
+            self.m_store32(0xE000_E010, "7", "SYST_CSR: ENABLE|TICKINT|CLKSOURCE");
+            self.m_store8(0xE000_ED23, 0xE0, "SysTick priority: lowest");
         }
 
         // Program TIMER1 for `every` (§4.5 P1-4) + enable its NVIC line.
@@ -984,6 +1013,26 @@ impl LlvmBackend {
         self.functions.push_str("}\n\n");
     }
 
+    /// `@SysTick_Handler` (P5-1): the 1 ms base tick.  When `now()` is used it
+    /// advances `@__uptime_ns` by 1 ms; P5-4 extends it with `within`-deadline
+    /// countdowns.  Mirrors the C `SysTick_Handler`.
+    fn emit_systick_handler(&mut self, uses_now: bool) {
+        self.body.clear();
+        self.allocas.clear();
+        if uses_now {
+            let cur = self.fresh();
+            self.inst(&format!("{} = load volatile i64, ptr @__uptime_ns", cur));
+            let next = self.fresh();
+            self.inst(&format!("{} = add i64 {}, 1000000", next, cur));
+            self.inst(&format!("store volatile i64 {}, ptr @__uptime_ns ; +1ms uptime", next));
+        }
+        self.inst("ret void");
+        self.functions.push_str("define void @SysTick_Handler() {\nentry:\n");
+        self.functions.push_str(&self.allocas);
+        self.functions.push_str(&self.body);
+        self.functions.push_str("}\n\n");
+    }
+
     /// `@__default_handler` + `@HardFault_Handler`: bare infinite-loop stubs for
     /// the vector table.
     fn emit_default_handlers(&mut self) {
@@ -997,7 +1046,7 @@ impl LlvmBackend {
 
     /// The Cortex-M vector table (P4-1): system slots + external IRQ slots up to
     /// the highest used line (index `16 + irq`).  Mirrors the C vector emission.
-    fn emit_vector_table(&self, has_timer: bool, has_gpiote: bool, has_bus: bool) -> String {
+    fn emit_vector_table(&self, has_timer: bool, has_gpiote: bool, has_bus: bool, needs_systick: bool) -> String {
         let mut e: Vec<String> = vec![
             "ptr @_estack".into(),         // 0 SP
             "ptr @Reset_Handler".into(),   // 1 reset
@@ -1011,7 +1060,11 @@ impl LlvmBackend {
         e.push("ptr null".into()); // 12
         e.push("ptr null".into()); // 13
         e.push("ptr @__default_handler".into()); // 14 PendSV
-        e.push("ptr @__default_handler".into()); // 15 SysTick (no now()/SysTick in P4)
+        e.push(if needs_systick {
+            "ptr @SysTick_Handler".into() // 15 SysTick (P5-1: now()/deadline tick)
+        } else {
+            "ptr @__default_handler".into() // 15 SysTick (unused)
+        });
         let max_irq = [
             has_gpiote.then_some(GPIOTE_IRQN),
             has_bus.then_some(BUS_IRQN),
@@ -1320,13 +1373,20 @@ impl LlvmBackend {
                     }
                 }
             }
-            // `now()` — a monotonic counter.  Lowers to the LLVM cycle-counter
-            // intrinsic (i64), never a libc `clock_gettime` (§4.5).
+            // `now()` — a monotonic counter (§4.5).  Metal (P5-1) reads the
+            // SysTick-driven `@__uptime_ns` (ns, 1 ms resolution); host lowers to
+            // the LLVM cycle-counter intrinsic (i64), never a libc `clock_gettime`.
             SirExpr::Now => {
-                self.declare("declare i64 @llvm.readcyclecounter()");
-                let t = self.fresh();
-                self.inst(&format!("{} = call i64 @llvm.readcyclecounter()", t));
-                self.convert(&t, 64, want, false)
+                if self.target == Target::MetalNrf52840 {
+                    let t = self.fresh();
+                    self.inst(&format!("{} = load volatile i64, ptr @__uptime_ns", t));
+                    self.convert(&t, 64, want, false)
+                } else {
+                    self.declare("declare i64 @llvm.readcyclecounter()");
+                    let t = self.fresh();
+                    self.inst(&format!("{} = call i64 @llvm.readcyclecounter()", t));
+                    self.convert(&t, 64, want, false)
+                }
             }
             other => {
                 self.inst(&format!("; unsupported expr in llvm canary: {}", expr_kind(other)));

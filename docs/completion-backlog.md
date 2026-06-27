@@ -422,5 +422,37 @@ p4-2 off p4-1, p4-3 off p4-2); PRs target `main` (not auto-merged).
       entry coalesces in-flight re-fires. Reuses c::i2c_fault_bit. tests/llvm_canary.rs (18) +
       harness/bus_parity.sh gains BUILD=llvm. **Renode PASS** — button interleaves during the LLVM
       firmware's bus suspension (mid hits=1,samples=0; end both 1), sim ≡ metal(LLVM). C path unchanged.
+
+### Cluster P5 — metal LLVM runtime (finish)
+Bring the LLVM metal backend (`backend/llvm.rs`) to full parity with the C backend (`backend/c.rs`) for
+the remaining runtime features still stubbed/divergent after P4 — closing the metal LLVM runtime. Plan:
+`~/.claude/plans/as-an-embedded-firmware-functional-pebble.md`. Stacked branches (feat/p5-1 off main,
+p5-2 off p5-1, p5-3 off p5-2, p5-4 off p5-3); PRs target `main` (not auto-merged). The simulator
+implements every feature, so each gate is `sim ≡ metal(LLVM)` on Renode, the same bar the C path meets.
+
+- [x] P5-1 SysTick subsystem + `now()` uptime (P4 follow-up) `[metal]` — PR #68.
+      Metal `now()` now reads a SysTick-driven uptime instead of the host `llvm.readcyclecounter`:
+      `lower_reset_handler` programs SysTick (SYST_RVR/CVR/CSR at the SCS, 1 ms base via
+      `c::systick_reload`) when `needs_systick` (now() ∥ watchdog, mirroring c.rs); a new
+      `@SysTick_Handler` advances `@__uptime_ns` by 1 ms; vector slot 15 → SysTick; `SirExpr::Now`
+      lowers to `load i64 @__uptime_ns` on metal (host unchanged). Made `c::{module_uses_now,
+      body_has_poll,any_stmt}` pub for reuse. examples/uptime_nrf52840.si + tests/llvm_canary.rs (20,
+      incl. host-unchanged guard) + new harness/now_uptime.sh. **Renode PASS** — the now()-stamped cell
+      reads 300_000_000 ns @350ms = sim, sim ≡ metal(LLVM). C path unchanged.
+- [ ] P5-2 `@__drive_safe` + overflow-trap safe-state + `Safe` disposition (P4 follow-up) `[metal]`.
+      Emit `@__drive_safe` (runs module.safe_seqs register writes) + a `drive_safe_and_halt` IR helper;
+      route `SirStmt::DriveSafe`, the overflow `Trap` path, and the `Safe` disposition through it
+      (mirroring c.rs `emit_drive_safe`/`__silica_overflow_trap`). Reuse examples/overflow_nrf52840.si;
+      add `BUILD=llvm` to harness/overflow_trap.sh + a canary.
+- [ ] P5-3 `poll`/`await` + non-yielding fault flow (P4 follow-up) `[metal]`. PAUSE candidate.
+      Add `__faulted`/`current_disposition` + retry wrapper to the non-yielding reaction path; lower
+      `SirStmt::Poll` (bounded busy-wait) and `SirStmt::Await` (bounded recheck + wfi) with a terminal
+      disposition (mirror c.rs). Metal-observable example + new harness/poll_await.sh; PAUSE & report if
+      no metal oracle can be built.
+- [ ] P5-4 `within`-deadline + watchdog (P4 follow-up) `[metal]`. Extends P5-1's SysTick handler.
+      `@__deadline_N`/`@__deadline_missed` globals; arm on the yielding trigger entry; decrement+latch
+      in the SysTick handler; configure the watchdog (CR/RLR/KR, feed 0xAAAA) in reset; gate the idle
+      feed on `!__deadline_missed && all-idle` (mirror c.rs). Reuse examples/{deadline,bus_watchdog}_
+      nrf52840.si; add `BUILD=llvm` to harness/{deadline_reset,watchdog_reset}.sh + a canary.
 ## Completed log
 _(append `item — PR #NN — date` here as items land)_

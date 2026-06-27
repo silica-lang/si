@@ -517,3 +517,48 @@ fn metal_yielding_reaction_emits_segment_machine_and_bus_irq() {
     assert!(ll.contains("ptr @__BUS_IRQHandler"), "bus IRQ not vectored:\n{}", ll);
     assert_no_c_isms(&ll);
 }
+
+// ─── P5-1: metal SysTick + now() uptime ───────────────────────────────────────
+
+#[test]
+fn metal_now_reads_systick_uptime_not_cycle_counter() {
+    // On metal, `now()` reads a SysTick-driven `@__uptime_ns` (1 ms base), NOT the
+    // host `llvm.readcyclecounter`: Reset_Handler programs SysTick, a
+    // SysTick_Handler advances the uptime, and vector slot 15 points at it.
+    let body = vec![SirStmt::Assign {
+        target: SirPlace::Var("stamp".into()),
+        value: SirExpr::Now,
+    }];
+    let mut m = module(vec![cell("stamp", SirType::Instant, 0)], vec![]);
+    let mut rx = reaction(body);
+    rx.id = 1;
+    rx.trigger = SirTrigger::EveryNs(100_000_000);
+    m.reactions.push(rx);
+    let ll = LlvmBackend::with_target(Target::MetalNrf52840).emit(&m);
+
+    // The uptime global + handler that advances it by 1 ms.
+    assert!(ll.contains("@__uptime_ns = global i64 0"), "no uptime global:\n{}", ll);
+    assert!(ll.contains("define void @SysTick_Handler()"), "no SysTick handler:\n{}", ll);
+    assert!(ll.contains("add i64") && ll.contains("1000000"), "handler must add 1ms:\n{}", ll);
+    // SysTick programmed in the reset (RVR/CSR at the SCS).
+    assert!(ll.contains("; SYST_RVR") && ll.contains("; SYST_CSR: ENABLE|TICKINT|CLKSOURCE"), "SysTick not programmed:\n{}", ll);
+    // now() reads the uptime, never the cycle counter, on metal.
+    assert!(ll.contains("load volatile i64, ptr @__uptime_ns"), "now() must read uptime:\n{}", ll);
+    assert!(!ll.contains("readcyclecounter"), "metal now() must not use the cycle counter:\n{}", ll);
+    // Vector slot 15 = SysTick.
+    assert!(ll.contains("ptr @SysTick_Handler"), "SysTick not vectored:\n{}", ll);
+    assert_no_c_isms(&ll);
+}
+
+#[test]
+fn host_now_still_uses_cycle_counter() {
+    // The host path is unchanged: now() stays the LLVM cycle-counter intrinsic
+    // (the P5-1 SysTick lowering is metal-only).
+    let body = vec![SirStmt::Assign {
+        target: SirPlace::Var("stamp".into()),
+        value: SirExpr::Now,
+    }];
+    let ll = LlvmBackend::new().emit(&module(vec![cell("stamp", SirType::Instant, 0)], body));
+    assert!(ll.contains("call i64 @llvm.readcyclecounter()"), "host now() must keep the cycle counter:\n{}", ll);
+    assert!(!ll.contains("@__uptime_ns"), "host must not emit the metal uptime global:\n{}", ll);
+}
