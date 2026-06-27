@@ -21,6 +21,15 @@ RENODE="${RENODE:-renode}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
+# BUILD=llvm (audit P5-2): build the firmware ENTIRELY through the LLVM backend
+# (--emit-llvm → llc → link) instead of the C backend, to prove the overflow trap
+# drives safe + halts on the LLVM path too.  Requires LLVM + the ARM toolchain.
+if [[ "${BUILD:-c}" == "llvm" ]]; then
+  if [[ -d /opt/homebrew/opt/llvm/bin ]]; then PATH="/opt/homebrew/opt/llvm/bin:$PATH"; fi
+  if [[ -d "$HOME/arm-gnu-toolchain-15.2/Payload/bin" ]]; then PATH="$HOME/arm-gnu-toolchain-15.2/Payload/bin:$PATH"; fi
+  for t in llc arm-none-eabi-gcc; do command -v "$t" >/dev/null 2>&1 || { echo "SKIP: '$t' not found (need LLVM + ARM toolchain for BUILD=llvm)"; exit 0; }; done
+fi
+
 # Wrapping control: same program with `+` → `+%` on the accumulator.
 CTRL="$WORK/overflow_wrap.si"
 sed 's/acc   = acc + 85/acc   = acc +% 85/' "$EX" > "$CTRL"
@@ -36,7 +45,13 @@ run_ticks() {
   local src="$1"
   local elf="$WORK/$(basename "$src" .si).elf"
   local resc="$WORK/run.resc"
-  (cd "$REPO" && cargo run -q -- --target metal-nrf52840 "$src" -o "$elf")
+  if [[ "${BUILD:-c}" == "llvm" ]]; then
+    (cd "$REPO" && cargo run -q --bin silicac -- --target metal-nrf52840 --emit-llvm "$src" -o "$WORK/$(basename "$src" .si)")
+    llc "$WORK/$(basename "$src" .si).ll" -filetype=obj -o "$WORK/$(basename "$src" .si).o" || { echo "FAIL: llc" >&2; exit 1; }
+    arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -nostdlib -nostartfiles -T "$WORK/$(basename "$src" .si).ld" "$WORK/$(basename "$src" .si).o" -o "$elf" || { echo "FAIL: link" >&2; exit 1; }
+  else
+    (cd "$REPO" && cargo run -q -- --target metal-nrf52840 "$src" -o "$elf")
+  fi
   local ticks_addr; ticks_addr="$(addr "$elf" ticks)"
   if [[ -z "$ticks_addr" ]]; then
     echo "FAIL: no ticks symbol in $elf" >&2

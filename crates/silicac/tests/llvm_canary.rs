@@ -562,3 +562,94 @@ fn host_now_still_uses_cycle_counter() {
     assert!(ll.contains("call i64 @llvm.readcyclecounter()"), "host now() must keep the cycle counter:\n{}", ll);
     assert!(!ll.contains("@__uptime_ns"), "host must not emit the metal uptime global:\n{}", ll);
 }
+
+// ─── P5-2: drive_safe + overflow-trap safe-state + Safe disposition ────────────
+
+#[test]
+fn metal_overflow_trap_drives_safe_then_halts() {
+    // On metal a trapping `+` routes to `@__silica_overflow_trap` → `@__drive_safe`
+    // + halt (NOT the bare `llvm.trap` of the host path).
+    let body = vec![SirStmt::Assign {
+        target: SirPlace::Var("acc".into()),
+        value: SirExpr::Arith {
+            op: SirArithOp::Add,
+            mode: OverflowMode::Trap,
+            width: 8,
+            signed: false,
+            lhs: Box::new(SirExpr::Load("acc".into())),
+            rhs: Box::new(SirExpr::U64(85)),
+        },
+    }];
+    let mut m = module(vec![cell("acc", SirType::U8, 0)], vec![]);
+    let mut rx = reaction(body);
+    rx.id = 1;
+    rx.trigger = SirTrigger::EveryNs(100_000_000);
+    m.reactions.push(rx);
+    let ll = LlvmBackend::with_target(Target::MetalNrf52840).emit(&m);
+
+    assert!(ll.contains("define void @__silica_overflow_trap()"), "no overflow-trap fn:\n{}", ll);
+    assert!(ll.contains("define void @__drive_safe()"), "no drive_safe fn:\n{}", ll);
+    assert!(ll.contains("call void @__silica_overflow_trap()"), "trap must call the trap fn:\n{}", ll);
+    assert!(ll.contains("call void @__drive_safe()"), "trap fn must drive safe:\n{}", ll);
+    // The overflow intrinsic still detects overflow; only the *trap target* changed.
+    assert!(ll.contains("@llvm.uadd.with.overflow.i8"), "overflow not detected via intrinsic:\n{}", ll);
+    assert!(!ll.contains("call void @llvm.trap()"), "metal trap must drive safe, not llvm.trap:\n{}", ll);
+    assert_no_c_isms(&ll);
+}
+
+#[test]
+fn host_overflow_trap_stays_llvm_trap() {
+    // The host path is unchanged: a trapping `+` lowers to the `llvm.trap`
+    // intrinsic (the P5-2 safe-state routing is metal-only).
+    let body = vec![SirStmt::Assign {
+        target: SirPlace::Var("acc".into()),
+        value: SirExpr::Arith {
+            op: SirArithOp::Add,
+            mode: OverflowMode::Trap,
+            width: 8,
+            signed: false,
+            lhs: Box::new(SirExpr::Load("acc".into())),
+            rhs: Box::new(SirExpr::U64(85)),
+        },
+    }];
+    let ll = LlvmBackend::new().emit(&module(vec![cell("acc", SirType::U8, 0)], body));
+    assert!(ll.contains("call void @llvm.trap()"), "host trap must stay llvm.trap:\n{}", ll);
+    assert!(!ll.contains("@__silica_overflow_trap"), "host must not emit the metal trap fn:\n{}", ll);
+}
+
+#[test]
+fn metal_drive_safe_runs_the_safe_sequence_and_halts() {
+    // A `DriveSafe` guard → `@__drive_safe` (which runs each device's safe-sequence
+    // register writes) then mask-and-hold.
+    let mut m = module(vec![], vec![]);
+    let mut rx = reaction(vec![SirStmt::DriveSafe]);
+    rx.id = 1;
+    rx.trigger = SirTrigger::EveryNs(100_000_000);
+    m.reactions.push(rx);
+    m.devices.push(SirDevice {
+        id: 0,
+        name: "motor".into(),
+        base_addr: Some(0x5001_0000),
+        kind: SirDeviceKind::Generic,
+        regs: vec![],
+    });
+    // safe sequence: de-energize (clear enable bit 0 of the rw control reg).
+    m.safe_seqs.push(SafeSeq {
+        device: 0,
+        state: "off".into(),
+        body: vec![SirStmt::RegWrite {
+            device: 0,
+            reg_offset: 0,
+            width: 32,
+            writes: vec![(1, 0, SirRegAccess::Rw, SirExpr::U64(0))],
+        }],
+    });
+    let ll = LlvmBackend::with_target(Target::MetalNrf52840).emit(&m);
+
+    assert!(ll.contains("define void @__drive_safe()"), "no drive_safe fn:\n{}", ll);
+    assert!(ll.contains("safe state 'off'"), "drive_safe must label the safe state:\n{}", ll);
+    assert!(ll.contains("store volatile i32"), "safe sequence must write the register:\n{}", ll);
+    assert!(ll.contains("call void @__drive_safe()"), "DriveSafe must call drive_safe:\n{}", ll);
+    assert!(ll.contains("cpsid i"), "must mask interrupts before driving safe:\n{}", ll);
+    assert_no_c_isms(&ll);
+}

@@ -439,11 +439,14 @@ implements every feature, so each gate is `sim ≡ metal(LLVM)` on Renode, the s
       body_has_poll,any_stmt}` pub for reuse. examples/uptime_nrf52840.si + tests/llvm_canary.rs (20,
       incl. host-unchanged guard) + new harness/now_uptime.sh. **Renode PASS** — the now()-stamped cell
       reads 300_000_000 ns @350ms = sim, sim ≡ metal(LLVM). C path unchanged.
-- [ ] P5-2 `@__drive_safe` + overflow-trap safe-state + `Safe` disposition (P4 follow-up) `[metal]`.
-      Emit `@__drive_safe` (runs module.safe_seqs register writes) + a `drive_safe_and_halt` IR helper;
-      route `SirStmt::DriveSafe`, the overflow `Trap` path, and the `Safe` disposition through it
-      (mirroring c.rs `emit_drive_safe`/`__silica_overflow_trap`). Reuse examples/overflow_nrf52840.si;
-      add `BUILD=llvm` to harness/overflow_trap.sh + a canary.
+- [x] P5-2 `@__drive_safe` + overflow-trap safe-state + `Safe` disposition (P4 follow-up) `[metal]` —
+      PR #69. Emit `@__drive_safe` (runs module.safe_seqs via a newly-lowered single-store `RegWrite`) +
+      a shared drive-safe-then-hold sequence (cpsid → call → wfi loop); route `SirStmt::DriveSafe`, the
+      overflow `Trap` path (→ `@__silica_overflow_trap`, not bare `llvm.trap`), and the `Safe`
+      disposition through it (mirrors c.rs `emit_drive_safe`/`__silica_overflow_trap`). Host unchanged
+      (trap stays `llvm.trap`). tests/llvm_canary.rs (22, incl. host-unchanged guards) + harness/
+      overflow_trap.sh gains `BUILD=llvm`. **Renode PASS** — LLVM-built `+` traps & halts (ticks froze
+      at 4), `+%` wraps & runs (10); sim ≡ metal(LLVM). C path unchanged.
 - [ ] P5-3 `poll`/`await` + non-yielding fault flow (P4 follow-up) `[metal]`. PAUSE candidate.
       Add `__faulted`/`current_disposition` + retry wrapper to the non-yielding reaction path; lower
       `SirStmt::Poll` (bounded busy-wait) and `SirStmt::Await` (bounded recheck + wfi) with a terminal

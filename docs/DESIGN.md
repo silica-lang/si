@@ -1304,6 +1304,17 @@ checked in §10's foreclosure audit (LLVM, FFI, multicore all remain reachable).
 > boots the LLVM firmware on Renode and confirms the `now()`-stamped cell reads ≈ the elapsed wall time
 > (300 ms ± 1 tick) — `sim ≡ metal(LLVM)`. This is the time base the `within`-deadline bookkeeping (P5-4)
 > builds on.
+>
+> **Safe state — `drive_safe` / overflow trap (audit P5-2).** The safe-state primitive is now real:
+> `@__drive_safe` runs each device's safe sequence (the `SafeSeq` register writes, via a single ordered
+> `RegWrite` store — also newly lowered), and a shared `drive-safe-then-hold` sequence (`cpsid i` → call
+> → `wfi` loop) backs all three entry points — `SirStmt::DriveSafe` (typestate guard, §4.1/D07), the
+> `Safe` disposition (§5.6), and the **overflow trap**: on metal a trapping `+` now calls
+> `@__silica_overflow_trap` (→ `@__drive_safe`) instead of bare `llvm.trap`, so §4.3's "overflow drives
+> the system to its safe state and holds" is honoured rather than reduced to a HardFault hang. The host
+> path is unchanged (`now()` = cycle counter, trap = `llvm.trap`). `BUILD=llvm harness/overflow_trap.sh`
+> boots the LLVM firmware on Renode: the default `+` halts at the overflow (ticks froze at 4) while `+%`
+> wraps and runs every tick (10) — `sim ≡ metal(LLVM)`.
 
 ### 6.4 Generated linker script, vector table, startup, `.data`/`.bss`
 
