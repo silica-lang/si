@@ -413,3 +413,43 @@ fn metal_every_emits_a_timer_handler_and_full_vector_table() {
     assert!(ll.contains("define void @__default_handler()"), "no default handler:\n{}", ll);
     assert_no_c_isms(&ll);
 }
+
+// ─── P4-2: metal events (GPIOTE) + BASEPRI critical sections ──────────────────
+
+#[test]
+fn metal_event_emits_gpiote_handler_and_basepri_critical() {
+    // An `on <pin>.falling` reaction → a GPIOTE handler that calls it; a shared
+    // cell access (Critical) → a BASEPRI raise/restore around the body.
+    let mut m = module(
+        vec![cell("lit", SirType::Bool, 0)],
+        vec![SirStmt::Assign { target: SirPlace::Var("lit".into()), value: SirExpr::Bool(false) }],
+    );
+    let mut rx = reaction(vec![SirStmt::Critical {
+        // ceiling ≤ max_priority (both reactions are priority 0 here).
+        ceiling: 0,
+        body: vec![SirStmt::Assign {
+            target: SirPlace::Var("lit".into()),
+            value: SirExpr::Not(Box::new(SirExpr::Load("lit".into()))),
+        }],
+    }]);
+    rx.id = 1;
+    rx.trigger = SirTrigger::Event(0);
+    m.reactions.push(rx);
+    m.events.push(SirEvent { id: 0, name: "falling".into(), device: 0, pin_index: Some(11) });
+    m.devices.push(SirDevice {
+        id: 0,
+        name: "gpio0".into(),
+        base_addr: Some(0x5000_0000),
+        kind: SirDeviceKind::Gpio,
+        regs: vec![],
+    });
+    let ll = LlvmBackend::with_target(Target::MetalNrf52840).emit(&m);
+
+    assert!(ll.contains("define void @GPIOTE_IRQHandler()"), "no GPIOTE handler:\n{}", ll);
+    assert!(ll.contains("call void @__reaction_1()"), "GPIOTE must call the event reaction:\n{}", ll);
+    assert!(ll.contains("ptr @GPIOTE_IRQHandler"), "GPIOTE not vectored:\n{}", ll);
+    // BASEPRI raise + restore around the shared-cell access.
+    assert!(ll.contains("msr basepri"), "no BASEPRI critical:\n{}", ll);
+    assert!(ll.contains("mrs $0, basepri"), "BASEPRI not saved:\n{}", ll);
+    assert_no_c_isms(&ll);
+}

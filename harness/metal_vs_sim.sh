@@ -28,8 +28,20 @@ mapfile -t SIM < <(
 )
 echo "sim LED sequence: ${SIM[*]}"
 
-echo "== build metal firmware =="
-(cd "$REPO" && cargo run -q -- --target metal-nrf52840 "$EX" -o "$ELF")
+echo "== build metal firmware (${BUILD:-c} backend) =="
+if [[ "${BUILD:-c}" == "llvm" ]]; then
+  # Build ENTIRELY through the LLVM backend (audit P4): emit metal LLVM IR +
+  # the generated linker script, then `llc` → object → link.  No C backend.
+  if [[ -d /opt/homebrew/opt/llvm/bin ]]; then PATH="/opt/homebrew/opt/llvm/bin:$PATH"; fi
+  if [[ -d "$HOME/arm-gnu-toolchain-15.2/Payload/bin" ]]; then PATH="$HOME/arm-gnu-toolchain-15.2/Payload/bin:$PATH"; fi
+  for t in llc arm-none-eabi-gcc; do command -v "$t" >/dev/null 2>&1 || { echo "SKIP: '$t' not found (need LLVM + ARM toolchain for BUILD=llvm)"; exit 0; }; done
+  (cd "$REPO" && cargo run -q --bin silicac -- --target metal-nrf52840 --emit-llvm "$EX" -o "$ELFDIR/m")
+  llc "$ELFDIR/m.ll" -filetype=obj -o "$ELFDIR/m.o" || { echo "FAIL: llc"; exit 1; }
+  arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -nostdlib -nostartfiles -T "$ELFDIR/m.ld" "$ELFDIR/m.o" -o "$ELF" \
+    || { echo "FAIL: link"; exit 1; }
+else
+  (cd "$REPO" && cargo run -q -- --target metal-nrf52840 "$EX" -o "$ELF")
+fi
 
 echo "== run on metal (Renode, SysTick pinned to 64MHz) =="
 # Checkpoints are sampled just after each expected toggle (500/1000/1200/1500/

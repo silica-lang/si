@@ -126,6 +126,9 @@ pub struct LlvmBackend {
     /// and a `Reset_Handler` that runs `sys.start` then idles (links against the
     /// generated linker script and boots on Renode).
     target: Target,
+    /// Max reaction priority in the module (audit P4-2): the `basepri_byte`
+    /// reference for NVIC/BASEPRI priority-ceiling mapping (§5.5).
+    max_priority: u8,
 }
 
 impl LlvmBackend {
@@ -149,6 +152,7 @@ impl LlvmBackend {
             terminated: false,
             device_bases: HashMap::new(),
             target,
+            max_priority: 0,
         }
     }
 
@@ -188,12 +192,13 @@ impl LlvmBackend {
 
     /// Lower a `SirModule` to a textual LLVM-IR translation unit.
     pub fn emit(mut self, module: &SirModule) -> String {
-        // 0. Device MMIO bases (P3-4b): for `Reg`/`RegLoad` volatile addressing.
+        // 0. Device MMIO bases (P3-4b) + the priority-ceiling reference (P4-2).
         for dev in &module.devices {
             if let Some(base) = dev.base_addr {
                 self.device_bases.insert(dev.id, base);
             }
         }
+        self.max_priority = module.reactions.iter().map(|r| r.priority).max().unwrap_or(0);
         // 1. Cells → module globals.
         for v in &module.vars {
             let bits = store_bits(sir_bits(&v.ty));
@@ -219,10 +224,12 @@ impl LlvmBackend {
         } else {
             None
         };
+        // Metal `on <pin>.falling` → GPIOTE channels (P4-2).
+        let events = if metal { self.events_of(module) } else { Vec::new() };
         if metal {
-            // Metal: `Reset_Handler` does real startup (.data/.bss/pins) + runs
-            // `sys.start` + programs TIMER1, then idles.  No `@main`/syscalls.
-            self.lower_reset_handler(module, &sys, timer.as_ref());
+            // Metal: `Reset_Handler` does real startup (.data/.bss/pins + GPIOTE)
+            // + runs `sys.start` + programs TIMER1, then idles.  No `@main`/syscalls.
+            self.lower_reset_handler(module, &sys, timer.as_ref(), &events);
         } else {
             // Host: `@main` runs every `on sys.start` body, in order.
             self.lower_function("i32 @main()", true, &sys);
@@ -241,6 +248,9 @@ impl LlvmBackend {
             if let Some(plan) = &timer {
                 self.emit_timer_handler(plan);
             }
+            if !events.is_empty() {
+                self.emit_gpiote_handler(&events);
+            }
             self.emit_default_handlers();
         }
 
@@ -258,7 +268,7 @@ impl LlvmBackend {
             }
             out.push('\n');
             // The Cortex-M vector table (placed at flash base by the linker).
-            out.push_str(&self.emit_vector_table(timer.is_some(), false, false));
+            out.push_str(&self.emit_vector_table(timer.is_some(), !events.is_empty(), false));
             out.push('\n');
         }
         if !self.globals.is_empty() {
@@ -375,7 +385,14 @@ impl LlvmBackend {
     /// copy, `.bss` zero, output-pin directions + input pull-ups, the `sys.start`
     /// bodies, then programs TIMER1 (`every`), enables interrupts, and idles
     /// (`wfi`).  A bare-metal reset handler never returns.
-    fn lower_reset_handler(&mut self, module: &SirModule, bodies: &[&[SirStmt]], plan: Option<&crate::backend::c::TimerPlan>) {
+    #[allow(clippy::type_complexity)]
+    fn lower_reset_handler(
+        &mut self,
+        module: &SirModule,
+        bodies: &[&[SirStmt]],
+        plan: Option<&crate::backend::c::TimerPlan>,
+        events: &[(usize, u64, u8, u8, Vec<usize>)],
+    ) {
         self.body.clear();
         self.allocas.clear();
         self.terminated = false;
@@ -437,6 +454,20 @@ impl LlvmBackend {
             self.m_store32(crate::backend::c::TIMER_BASE, "1", "TASKS_START");
         }
 
+        // Configure GPIOTE channels (falling edge) + NVIC for `on` events (P4-2).
+        if !events.is_empty() {
+            for (ch, base, pin, prio, _rs) in events {
+                let cfg = GPIOTE_BASE + 0x510 + 4 * *ch as u64;
+                let port = if *base == 0x5000_0300 { 1u64 } else { 0u64 };
+                // CONFIG: MODE=event(1) | PSEL(pin)<<8 | PORT<<13 | POLARITY=HiToLo(2)<<16.
+                let config = 1u64 | ((*pin as u64) << 8) | (port << 13) | (2u64 << 16);
+                self.m_store32(cfg, &config.to_string(), "GPIOTE CONFIG[ch]");
+                self.m_store32(GPIOTE_BASE + 0x304, &(1u64 << ch).to_string(), "GPIOTE INTENSET IN[ch]");
+                self.m_store8(NVIC_IPR0 + GPIOTE_IRQN as u64, *prio, "NVIC IPR GPIOTE");
+            }
+            self.m_store32(NVIC_ISER0, &(1u64 << GPIOTE_IRQN).to_string(), "NVIC ISER enable GPIOTE");
+        }
+
         // Enable interrupts, then idle forever.
         self.m_asm("cpsie i", "enable IRQs");
         let idle = self.fresh_label("idle");
@@ -486,6 +517,69 @@ impl LlvmBackend {
         }
         self.inst("ret void");
         self.functions.push_str("define void @TIMER1_IRQHandler() {\nentry:\n");
+        self.functions.push_str(&self.allocas);
+        self.functions.push_str(&self.body);
+        self.functions.push_str("}\n\n");
+    }
+
+    /// Collect `on <pin>.falling` bindings → one GPIOTE channel each (P4-2),
+    /// mirroring the C event collection: `(channel, port_base, pin, BASEPRI byte,
+    /// [reaction ids])`.
+    #[allow(clippy::type_complexity)]
+    fn events_of(&self, module: &SirModule) -> Vec<(usize, u64, u8, u8, Vec<usize>)> {
+        let mut events = Vec::new();
+        for ev in &module.events {
+            let rs: Vec<usize> = module
+                .reactions
+                .iter()
+                .filter(|r| matches!(r.trigger, SirTrigger::Event(e) if e == ev.id))
+                .map(|r| r.id)
+                .collect();
+            if rs.is_empty() {
+                continue;
+            }
+            let prio = module
+                .reactions
+                .iter()
+                .filter(|r| rs.contains(&r.id))
+                .map(|r| r.priority)
+                .max()
+                .unwrap_or(self.max_priority);
+            let base = self.device_bases.get(&ev.device).copied().unwrap_or(0);
+            let ch = events.len();
+            events.push((ch, base, ev.pin_index.unwrap_or(0), basepri_byte(prio, self.max_priority), rs));
+        }
+        events
+    }
+
+    /// `@GPIOTE_IRQHandler` (P4-2): per channel, if its `EVENTS_IN` fired, clear
+    /// it and call the bound reaction fns — mirrors the C `GPIOTE_IRQHandler`.
+    #[allow(clippy::type_complexity)]
+    fn emit_gpiote_handler(&mut self, events: &[(usize, u64, u8, u8, Vec<usize>)]) {
+        self.body.clear();
+        self.allocas.clear();
+        for (ch, _base, _pin, _prio, rs) in events {
+            let evin = GPIOTE_BASE + 0x100 + 4 * *ch as u64;
+            let ep = self.fresh();
+            self.inst(&format!("{} = inttoptr i64 {} to ptr", ep, evin));
+            let e = self.fresh();
+            self.inst(&format!("{} = load volatile i32, ptr {}", e, ep));
+            let nz = self.fresh();
+            self.inst(&format!("{} = icmp ne i32 {}, 0", nz, e));
+            let fire = self.fresh_label("gfire");
+            let skip = self.fresh_label("gskip");
+            self.inst(&format!("br i1 {}, label %{}, label %{}", nz, fire, skip));
+            self.label(&fire);
+            self.inst(&format!("store volatile i32 0, ptr {} ; clear EVENTS_IN[{}]", ep, ch));
+            self.m_asm("dsb 0xf", "ordering");
+            for id in rs {
+                self.inst(&format!("call void @__reaction_{}()", id));
+            }
+            self.inst(&format!("br label %{}", skip));
+            self.label(&skip);
+        }
+        self.inst("ret void");
+        self.functions.push_str("define void @GPIOTE_IRQHandler() {\nentry:\n");
         self.functions.push_str(&self.allocas);
         self.functions.push_str(&self.body);
         self.functions.push_str("}\n\n");
@@ -617,14 +711,30 @@ impl LlvmBackend {
                 self.terminated = false;
             }
             SirStmt::Intrinsic(intr) => self.emit_intrinsic(intr),
-            // A critical section is invisible to a single-threaded `@main` — its
-            // body lowers inline (the priority-ceiling raise is metal-only, §5.5).
-            SirStmt::Critical { body, .. } => {
+            // Priority-ceiling critical section (§5.5).  On metal (P4-2): raise
+            // BASEPRI to the ceiling so no cell-sharing reaction can preempt the
+            // access, then restore.  On host it is a single thread — inline.
+            SirStmt::Critical { ceiling, body } => {
+                let metal = self.target == Target::MetalNrf52840;
+                let saved = if metal {
+                    let bp = basepri_byte(*ceiling, self.max_priority);
+                    let s = self.fresh();
+                    self.inst(&format!("{} = call i32 asm sideeffect \"mrs $0, basepri\", \"=r\"()", s));
+                    self.inst(&format!("call void asm sideeffect \"msr basepri, $0\", \"r,~{{memory}}\"(i32 {})", bp));
+                    self.m_asm("isb 0xf", "ceiling live before access (§5.5)");
+                    Some(s)
+                } else {
+                    None
+                };
                 for s in body {
                     if self.terminated {
                         break;
                     }
                     self.emit_stmt(s);
+                }
+                if let Some(s) = saved {
+                    self.m_asm("dmb 0xf", "order protected writes before lowering the mask");
+                    self.inst(&format!("call void asm sideeffect \"msr basepri, $0\", \"r,~{{memory}}\"(i32 {})", s));
                 }
             }
             other => {

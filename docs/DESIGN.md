@@ -1273,9 +1273,15 @@ checked in §10's foreclosure audit (LLVM, FFI, multicore all remain reachable).
 > clears the COMPARE event, re-arms `CC += period`, and calls the periodic `@__reaction_N`. The full
 > Cortex-M **vector table** (system slots + external IRQ slots to `16+IRQn`) + `@__default_handler`/
 > `@HardFault_Handler` stubs are emitted. `harness/llvm_metal_sched.sh` boots an LLVM-built blink on
-> Renode and confirms the LED toggles on its TIMER period — `sim ≡ metal(LLVM)`. **Remaining:**
-> `on <pin>.falling` → GPIOTE/NVIC + BASEPRI critical sections (P4-2), and the yields state machine +
-> bus IRQ (P4-3) — the event/bus runtime.
+> Renode and confirms the LED toggles on its TIMER period — `sim ≡ metal(LLVM)`.
+>
+> **Events + criticals — `on <pin>.falling` (audit P4-2).** The reset configures GPIOTE channels (from
+> `module.events`) + input pull-ups + NVIC; a `@GPIOTE_IRQHandler` clears `EVENTS_IN[ch]` and calls the
+> bound `@__reaction_N`s; the GPIOTE slot (`16+6`) joins the vector table. `SirStmt::Critical` lowers to
+> a **BASEPRI** raise/restore (`msr/mrs basepri` + ISB/DMB, ceiling via `basepri_byte`) so a shared cell
+> stays consistent. `BUILD=llvm harness/metal_vs_sim.sh` boots an LLVM-built blink+button on Renode and
+> matches the sim LED sequence (including button-triggered toggles) — `sim ≡ metal(LLVM)`. **Remaining:**
+> the yields state machine + bus IRQ (P4-3) — the bus runtime.
 
 ### 6.4 Generated linker script, vector table, startup, `.data`/`.bss`
 
