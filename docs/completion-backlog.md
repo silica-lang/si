@@ -413,11 +413,14 @@ p4-2 off p4-1, p4-3 off p4-2); PRs target `main` (not auto-merged).
       slot 16+6. `SirStmt::Critical` → BASEPRI raise/restore (msr/mrs basepri + ISB/DMB, ceiling via
       basepri_byte). tests/llvm_canary.rs (16) + harness/metal_vs_sim.sh gains a `BUILD=llvm` mode.
       **Renode PASS** — LLVM-built blink_button LED sequence ≡ sim (button + timer); C path unchanged.
-- [ ] P4-3 Metal LLVM yields state machine + bus IRQ (P3-4c follow-up) `[metal]` — segment state
-      machine (split at BusXfer; cross-yield temps + state as globals; `@__react_N_run` switch into
-      per-segment blocks), bus kick/resume/`@__BUS_IRQHandler`, dispositions. Gate: BUILD=llvm
-      harness/bus_parity.sh — button interleaves during the LLVM firmware's bus suspension ≡ sim.
-      Largest; PAUSE & report if Renode can't validate.
-
+- [x] P4-3 Metal LLVM yields state machine + bus IRQ (P3-4c follow-up) `[metal]` — PR #67.
+      A yielding reaction → an IRQ-driven segment state machine mirroring the C path: body split at
+      each BusXfer; cross-yield temps + __state/__retry/__faulted as module globals (@__rf_N_*);
+      `@__react_N_run` = switch on @__rf_N_state into per-segment blocks; resume-decode (SR → temp /
+      __faulted → disposition, Retry = back-edge to seg-0); bus kick (CR/SA/RA/DR + @__bus_owner +
+      NVIC clear-pending/enable) + `@__BUS_IRQHandler` (resume owner) + bus vector slot 16+8; trigger
+      entry coalesces in-flight re-fires. Reuses c::i2c_fault_bit. tests/llvm_canary.rs (18) +
+      harness/bus_parity.sh gains BUILD=llvm. **Renode PASS** — button interleaves during the LLVM
+      firmware's bus suspension (mid hits=1,samples=0; end both 1), sim ≡ metal(LLVM). C path unchanged.
 ## Completed log
 _(append `item — PR #NN — date` here as items land)_

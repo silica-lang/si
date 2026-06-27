@@ -453,3 +453,67 @@ fn metal_event_emits_gpiote_handler_and_basepri_critical() {
     assert!(ll.contains("mrs $0, basepri"), "BASEPRI not saved:\n{}", ll);
     assert_no_c_isms(&ll);
 }
+
+// ─── P4-3: metal yields state machine + bus IRQ ───────────────────────────────
+
+#[test]
+fn metal_yielding_reaction_emits_segment_machine_and_bus_irq() {
+    // A bus transaction → an IRQ-driven segment state machine: a `@__react_N_run`
+    // dispatcher (switch on a state global), a `@__BUS_IRQHandler` that resumes
+    // the owner, and frame globals that survive the IRQ return.
+    let mut m = module(vec![cell("samples", SirType::U32, 0)], vec![]);
+    let mut rx = reaction(vec![
+        SirStmt::BusXfer {
+            device: 0,
+            op: "read_reg".into(),
+            args: vec![SirExpr::U64(0x76), SirExpr::U64(0xFA)],
+            dst: "__bus".into(),
+            propagate: true,
+            fault_codes: vec!["nak".into()],
+            code_dst: None,
+        },
+        SirStmt::Assign {
+            target: SirPlace::Var("samples".into()),
+            value: SirExpr::BinOp(
+                SirBinOp::Add,
+                Box::new(SirExpr::Load("samples".into())),
+                Box::new(SirExpr::U64(1)),
+            ),
+        },
+    ]);
+    rx.id = 1;
+    rx.trigger = SirTrigger::EveryNs(1_000_000_000);
+    rx.yields = true;
+    m.reactions.push(rx);
+    let reg = |name: &str, off: u64| SirReg {
+        name: name.into(),
+        offset: off,
+        width: 32,
+        access: SirRegAccess::Rw,
+        reset: 0,
+    };
+    m.devices.push(SirDevice {
+        id: 0,
+        name: "i2c0".into(),
+        base_addr: Some(0x4000_3000),
+        kind: SirDeviceKind::Generic,
+        regs: vec![reg("CR", 0x0), reg("SR", 0x4), reg("SA", 0x8), reg("RA", 0xC), reg("DR", 0x10)],
+    });
+    let ll = LlvmBackend::with_target(Target::MetalNrf52840).emit(&m);
+
+    // Segment dispatcher + frame globals.
+    assert!(ll.contains("define void @__react_1_run()"), "no dispatcher:\n{}", ll);
+    assert!(ll.contains("switch i32") && ll.contains("@__rf_1_state"), "no state switch:\n{}", ll);
+    assert!(ll.contains("@__rf_1_state = global i32 0"), "no frame state global:\n{}", ll);
+    assert!(ll.contains("@__bus_owner = global i32 -1"), "no bus-owner global:\n{}", ll);
+    // Bus kick (CR start) + resume (SR decode) + IRQ handler that resumes the owner.
+    assert!(ll.contains("; CR kick"), "no bus kick:\n{}", ll);
+    assert!(ll.contains("; SR"), "no SR resume decode:\n{}", ll);
+    assert!(ll.contains("define void @__BUS_IRQHandler()"), "no bus IRQ handler:\n{}", ll);
+    assert!(ll.contains("call void @__react_1_run()"), "IRQ must resume the owner:\n{}", ll);
+    // The trigger entry coalesces a re-fire while in flight.
+    assert!(ll.contains("define void @__reaction_1()"), "no trigger entry:\n{}", ll);
+    // Bus IRQ is vectored (line 8 → index 24).
+    assert!(ll.contains("ptr @__BUS_IRQHandler"), "bus IRQ not vectored:\n{}", ll);
+    assert_no_c_isms(&ll);
+}
