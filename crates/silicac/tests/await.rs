@@ -85,11 +85,19 @@ fn await_inside_atomic_is_rejected() {
 }
 
 #[test]
-fn metal_emits_the_bounded_recheck_loop() {
+fn metal_emits_the_await_suspend_state_machine() {
+    // P6-5: await is now a TRUE frame suspend — an IRQ-driven segment state
+    // machine (`__react_N_run` switch on `__rf_N.__state`), suspended via the
+    // `__await` flag + `__await_deadline` and resumed by the SysTick re-check.
     let sir = compile(&format!(
         "{BOARD}\nprogram app {{\n  use board demo as b\n  cell ready : u32 = 0\n  every 100ms on fault skip {{ await ready == 1 within 50ms else fault timeout  ready = ready }}\n}}\nsim s for app {{ run until 150ms }}\n"
     ));
     let out = c::CBackend::with_target(Target::MetalNrf52840).emit(&sir);
-    assert!(out.contains("bounded re-check"), "await re-check loop:\n{}", out);
-    assert!(out.contains("__faulted = 1U"), "times out into the fault path:\n{}", out);
+    assert!(out.contains("__react_0_run"), "await must lower to the segment dispatcher:\n{}", out);
+    assert!(out.contains("__rf_0.__await = 1U") && out.contains("__rf_0.__await_deadline"), "no await suspend state:\n{}", out);
+    assert!(out.contains("suspend on await"), "await must suspend (return to scheduler):\n{}", out);
+    // SysTick re-checks the suspended await and counts its budget down.
+    assert!(out.contains("__rf_0.__await != 0U") && out.contains("--__rf_0.__await_deadline"), "no SysTick await re-check:\n{}", out);
+    // It is no longer the old bounded busy-recheck.
+    assert!(!out.contains("bounded re-check"), "await should not be the old busy-recheck:\n{}", out);
 }

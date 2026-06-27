@@ -1373,6 +1373,20 @@ checked in §10's foreclosure audit (LLVM, FFI, multicore all remain reachable).
 > sim formats with `to_string`; the C backend emits an equivalent inline itoa. `harness/print_value.sh`
 > confirms the LLVM host binary and the sim both print `42` for `host_io.print(40+2)`. Host-only — there
 > is no metal `host_io` target until semihosting (P6-7).
+>
+> **`await` true frame suspend (audit P6-5).** `await` was a bounded `wfi`-recheck that blocked the
+> reaction's IRQ context (an equal/lower-priority reaction that would set the condition could never run).
+> It is now a **true frame suspend**, reusing the bus state machine in both backends: the body is
+> segmented at each top-level `await`, and the await terminator arms a `within` countdown
+> (`__rf_N.__await`/`__await_deadline`, 1 ms ticks) and **returns** to the scheduler. The **SysTick**
+> handler re-checks each suspended await (resume on the condition, fault on the elapsed budget → the
+> frame disposition, else stay suspended) — distinct from a bus suspend, which the bus IRQ resumes; the
+> `__await` flag keeps the two resume paths from crossing, so the bus path is untouched (and an
+> await-suspended reaction does **not** gate the watchdog feed). `harness/await_interleave.sh` (the await
+> analogue of `bus_parity.sh`) proves on Renode — C **and** `BUILD=llvm` — that a peer reaction runs
+> *during* the suspension and sets the awaited condition, so the worker resumes (`done`=3 = sim) where
+> the old busy-wait would have deadlocked. `poll` stays a non-yielding busy-wait; a priority-preserving
+> resume (PendSV instead of SysTick-context) is a further follow-up.
 
 ### 6.4 Generated linker script, vector table, startup, `.data`/`.bss`
 

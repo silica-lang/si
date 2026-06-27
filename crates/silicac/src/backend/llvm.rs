@@ -311,7 +311,21 @@ impl LlvmBackend {
         // from P5-4, `within` deadline bookkeeping + the watchdog wake cadence).
         // Mirrors `c.rs` `needs_systick` — true for now() OR a watchdog.
         let uses_now = metal && crate::backend::c::module_uses_now(module);
-        let needs_systick = metal && (uses_now || module.watchdog_device.is_some());
+        // P6-5: reactions that suspend on an `await` are resumed by SysTick.
+        let await_ids: Vec<usize> = if metal {
+            let mut v: Vec<usize> = module
+                .reactions
+                .iter()
+                .filter(|r| crate::backend::c::body_has_await(&r.body))
+                .map(|r| r.id)
+                .collect();
+            v.sort_unstable();
+            v
+        } else {
+            Vec::new()
+        };
+        let needs_systick =
+            metal && (uses_now || module.watchdog_device.is_some() || !await_ids.is_empty());
         let systick_rvr = if needs_systick {
             crate::backend::c::systick_reload(module).ok()
         } else {
@@ -360,7 +374,8 @@ impl LlvmBackend {
             if matches!(r.trigger, SirTrigger::SysStart) {
                 continue;
             }
-            if metal && r.yields {
+            // A bus transaction OR an `await` (P6-5) suspends → segment state machine.
+            if metal && (r.yields || crate::backend::c::body_has_await(&r.body)) {
                 self.emit_yielding_metal(r);
             } else {
                 self.lower_reaction_fn(r);
@@ -379,7 +394,7 @@ impl LlvmBackend {
                 self.emit_bus_irq_handler(&bus_reactions);
             }
             if needs_systick {
-                self.emit_systick_handler(uses_now);
+                self.emit_systick_handler(uses_now, &await_ids);
             }
             // Safe-state runtime (P5-2): emit `@__drive_safe` whenever something
             // references it (a `Safe` disposition, an overflow trap, or a
@@ -950,11 +965,12 @@ impl LlvmBackend {
         let n = reaction.id;
         let prefix = format!("__rf_{}_", n);
 
-        // Segment the body at each top-level BusXfer.
+        // Segment the body at each top-level suspend point — a BusXfer (resumed by
+        // the bus IRQ) or an `await` (resumed by SysTick, P6-5).
         let mut segs: Vec<(Vec<&SirStmt>, Option<&SirStmt>)> = Vec::new();
         let mut cur: Vec<&SirStmt> = Vec::new();
         for stmt in &reaction.body {
-            if matches!(stmt, SirStmt::BusXfer { .. }) {
+            if matches!(stmt, SirStmt::BusXfer { .. } | SirStmt::Await { .. }) {
                 segs.push((std::mem::take(&mut cur), Some(stmt)));
             } else {
                 cur.push(stmt);
@@ -962,9 +978,16 @@ impl LlvmBackend {
         }
         segs.push((cur, None));
 
+        let has_await = crate::backend::c::body_has_await(&reaction.body);
+
         // Frame globals: dispatcher state + retry/fault + every cross-yield temp.
+        // `@__rf_N_await`/`_await_deadline` (P6-5): an await-suspended frame is
+        // resumed by SysTick (not the bus IRQ) and counts its `within` down.
         let temps = self.collect_frame_temps(reaction);
         self.globals.push_str(&format!("@{p}state = global i32 0\n@{p}retry = global i32 0\n@{p}faulted = global i32 0\n", p = prefix));
+        if has_await {
+            self.globals.push_str(&format!("@{p}await = global i32 0\n@{p}await_deadline = global i32 0\n", p = prefix));
+        }
         for t in &temps {
             self.globals.push_str(&format!("@{}{} = global i32 0\n", prefix, t));
             self.vars.insert(t.clone(), (32, false, true));
@@ -998,8 +1021,34 @@ impl LlvmBackend {
         for (i, (pre, xfer)) in segs.iter().enumerate() {
             self.label(&body_labels[i]);
             self.terminated = false;
-            // Resume the prior transaction (segments after the first).
+            // Resume an `await` (P6-5): re-evaluate the condition — resume on
+            // success, fault on the elapsed `within`, else stay suspended.
             if i >= 1 {
+                if let Some(SirStmt::Await { cond, .. }) = segs[i - 1].1 {
+                    let c = self.emit_expr(cond, 1);
+                    let resolved = self.fresh_label("awok");
+                    let notyet = self.fresh_label("awwait");
+                    let timeout = self.fresh_label("awto");
+                    let still = self.fresh_label("awstill");
+                    let bodyl = self.fresh_label("awbody");
+                    self.inst(&format!("br i1 {}, label %{}, label %{}", c, resolved, notyet));
+                    self.label(&resolved);
+                    self.inst(&format!("store i32 0, ptr @{}await", prefix));
+                    self.inst(&format!("br label %{}", bodyl));
+                    self.label(&notyet);
+                    let dl = self.fresh();
+                    self.inst(&format!("{} = load i32, ptr @{}await_deadline", dl, prefix));
+                    let z = self.fresh();
+                    self.inst(&format!("{} = icmp eq i32 {}, 0", z, dl));
+                    self.inst(&format!("br i1 {}, label %{}, label %{}", z, timeout, still));
+                    self.label(&timeout);
+                    self.inst(&format!("store i32 1, ptr @{}faulted", prefix));
+                    self.inst(&format!("store i32 0, ptr @{}await", prefix));
+                    self.emit_disposition(reaction.disposition, &prefix, &body_labels[0]);
+                    self.label(&still);
+                    self.inst("ret void");
+                    self.label(&bodyl);
+                }
                 if let Some(SirStmt::BusXfer { device, op, dst, propagate, code_dst, fault_codes, .. }) = segs[i - 1].1 {
                     let dref = self.var_ptr(dst, true);
                     if let Some(code) = code_dst {
@@ -1028,9 +1077,16 @@ impl LlvmBackend {
                 }
                 self.emit_stmt(stmt);
             }
-            // Terminate: kick the next transaction (suspend), or complete (tail).
+            // Terminate: kick the next transaction (suspend on bus), arm the await
+            // (suspend until SysTick), or complete (tail).
             if let Some(SirStmt::BusXfer { device, op, args, .. }) = xfer {
                 self.emit_bus_kick(*device, op, args, n);
+                self.inst(&format!("store i32 {}, ptr @{}state", i + 1, prefix));
+                self.inst("ret void");
+            } else if let Some(SirStmt::Await { within_ns, .. }) = xfer {
+                let ticks = within_ns.div_ceil(1_000_000).max(1);
+                self.inst(&format!("store i32 1, ptr @{}await", prefix));
+                self.inst(&format!("store i32 {}, ptr @{}await_deadline", ticks, prefix));
                 self.inst(&format!("store i32 {}, ptr @{}state", i + 1, prefix));
                 self.inst("ret void");
             } else {
@@ -1273,7 +1329,7 @@ impl LlvmBackend {
     /// `@SysTick_Handler` (P5-1): the 1 ms base tick.  When `now()` is used it
     /// advances `@__uptime_ns` by 1 ms; P5-4 extends it with `within`-deadline
     /// countdowns.  Mirrors the C `SysTick_Handler`.
-    fn emit_systick_handler(&mut self, uses_now: bool) {
+    fn emit_systick_handler(&mut self, uses_now: bool, await_ids: &[usize]) {
         self.body.clear();
         self.allocas.clear();
         if uses_now {
@@ -1319,6 +1375,35 @@ impl LlvmBackend {
             self.inst("store i32 1, ptr @__deadline_missed ; `within` overrun → stop the feed");
             self.inst(&format!("br label %{}", cont));
             self.label(&cont);
+        }
+        // §5.2 (P6-5) — re-check each await suspended on this 1ms tick: count its
+        // `within` budget down, then re-enter the dispatcher (resume / fault / wait).
+        for id in await_ids {
+            let aw = self.fresh();
+            self.inst(&format!("{} = load i32, ptr @__rf_{}_await", aw, id));
+            let susp = self.fresh();
+            self.inst(&format!("{} = icmp ne i32 {}, 0", susp, aw));
+            let chk = self.fresh_label("awchk");
+            let acont = self.fresh_label("awcont");
+            self.inst(&format!("br i1 {}, label %{}, label %{}", susp, chk, acont));
+            self.label(&chk);
+            // Decrement the await deadline (saturating at 0), then re-enter.
+            let d = self.fresh();
+            self.inst(&format!("{} = load i32, ptr @__rf_{}_await_deadline", d, id));
+            let nz = self.fresh();
+            self.inst(&format!("{} = icmp ne i32 {}, 0", nz, d));
+            let dec = self.fresh_label("awdec");
+            let run = self.fresh_label("awrun");
+            self.inst(&format!("br i1 {}, label %{}, label %{}", nz, dec, run));
+            self.label(&dec);
+            let d1 = self.fresh();
+            self.inst(&format!("{} = sub i32 {}, 1", d1, d));
+            self.inst(&format!("store i32 {}, ptr @__rf_{}_await_deadline", d1, id));
+            self.inst(&format!("br label %{}", run));
+            self.label(&run);
+            self.inst(&format!("call void @__react_{}_run()", id));
+            self.inst(&format!("br label %{}", acont));
+            self.label(&acont);
         }
         self.inst("ret void");
         self.functions.push_str("define void @SysTick_Handler() {\nentry:\n");

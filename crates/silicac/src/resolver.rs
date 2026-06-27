@@ -454,6 +454,11 @@ impl Resolver {
             if if_contains_yield(&r.body) {
                 self.err(prog.span, "a yielding op inside `if` is not supported in this slice (§5.2: yields must be at the reaction top level)");
             }
+            // §5.2 (P6-5): `await` is a suspend point too — it must sit at the
+            // reaction top level (the segmenter splits there).
+            if await_nested_in_block(&r.body) {
+                self.err(prog.span, "`await` inside `if`/`atomic` is not supported in this slice (§5.2: a suspend point must be at the reaction top level)");
+            }
         }
 
         module_vars.extend(vars);
@@ -3132,6 +3137,26 @@ fn body_yields(stmts: &[SirStmt]) -> bool {
         SirStmt::BusXfer { .. } => true,
         SirStmt::Critical { body, .. } => body_yields(body),
         SirStmt::If { then, .. } => body_yields(then),
+        _ => false,
+    })
+}
+
+/// True if an `await` (a suspend point, P6-5) is nested inside an `if`/`critical`
+/// rather than at the reaction top level — the metal segmenter splits suspend
+/// points at the top level only, so a nested `await` is rejected (as a nested
+/// yield is).
+fn await_nested_in_block(stmts: &[SirStmt]) -> bool {
+    fn has_await(stmts: &[SirStmt]) -> bool {
+        stmts.iter().any(|s| match s {
+            SirStmt::Await { .. } => true,
+            SirStmt::If { then, .. } => has_await(then),
+            SirStmt::Critical { body, .. } => has_await(body),
+            _ => false,
+        })
+    }
+    stmts.iter().any(|s| match s {
+        SirStmt::If { then, .. } => has_await(then),
+        SirStmt::Critical { body, .. } => has_await(body),
         _ => false,
     })
 }

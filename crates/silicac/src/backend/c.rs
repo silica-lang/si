@@ -353,7 +353,10 @@ impl CBackend {
         // machine (§5.2): it suspends on each bus transaction so the scheduler
         // runs other work, and the bus-completion IRQ resumes it.  This replaces
         // the earlier bounded busy-wait, which could not interleave.
-        if self.target == Target::MetalNrf52840 && reaction.yields {
+        // A bus transaction OR an `await` (P6-5) makes the reaction suspend, so it
+        // lowers to the IRQ-driven segment state machine: bus segments resume on
+        // the bus IRQ, await segments on SysTick.
+        if self.target == Target::MetalNrf52840 && (reaction.yields || body_has_await(&reaction.body)) {
             self.emit_yielding_reaction_metal(reaction, &fn_name, &comment);
             return;
         }
@@ -413,12 +416,13 @@ impl CBackend {
         let n = reaction.id;
         let frame = format!("__rf_{}", n);
 
-        // Segment the body at each top-level BusXfer (yields are hoisted to the
-        // top level by the resolver, and a critical cannot span one).
+        // Segment the body at each top-level suspend point — a BusXfer (resumed by
+        // the bus IRQ) or an `await` (resumed by SysTick, P6-5).  Both are hoisted
+        // to the top level by the resolver; a critical cannot span one.
         let mut segs: Vec<(Vec<&SirStmt>, Option<&SirStmt>)> = Vec::new();
         let mut cur: Vec<&SirStmt> = Vec::new();
         for stmt in &reaction.body {
-            if matches!(stmt, SirStmt::BusXfer { .. }) {
+            if matches!(stmt, SirStmt::BusXfer { .. } | SirStmt::Await { .. }) {
                 segs.push((std::mem::take(&mut cur), Some(stmt)));
             } else {
                 cur.push(stmt);
@@ -426,7 +430,12 @@ impl CBackend {
         }
         segs.push((cur, None));
 
+        let has_await = body_has_await(&reaction.body);
+
         // Frame struct: dispatcher state + retry/fault + every cross-yield temp.
+        // An await-suspending reaction also carries `__await` (1 = currently
+        // suspended on an await, so SysTick — not the bus IRQ — resumes it) and
+        // `__await_deadline` (its `within` countdown, separate from the watchdog).
         let temps = self.collect_reaction_temps(reaction);
         self.line(&format!("/* {} — IRQ-driven yielding reaction (§5.2) */", comment));
         self.line("static volatile struct {");
@@ -434,6 +443,10 @@ impl CBackend {
         self.line("uint32_t __state;   /* 0 = idle/ready; s = awaiting segment s's resume */");
         self.line("uint32_t __retry;");
         self.line("uint8_t  __faulted;");
+        if has_await {
+            self.line("uint8_t  __await;          /* 1 = suspended on an await (SysTick resumes) */");
+            self.line("uint32_t __await_deadline; /* await `within` countdown (SysTick ticks) */");
+        }
         for t in &temps {
             self.line(&format!("uint32_t {};", t));
         }
@@ -461,9 +474,20 @@ impl CBackend {
             self.indent -= 1;
             self.line(&format!("__seg_{}_{}:", n, i));
             self.indent += 1;
-            // A resumed segment first reads the prior transaction's result and,
-            // on a propagated fault, applies the Layer-2 disposition.
+            // A resumed segment first reads the prior suspend point's result.
+            // For an `await` (P6-5): re-evaluate the condition — resume on success,
+            // fault on the elapsed `within` budget, else stay suspended.
             if i >= 1 {
+                if let Some(SirStmt::Await { cond, .. }) = segs[i - 1].1 {
+                    let c = self.emit_expr(cond);
+                    self.line(&format!("if ({}) {{ {f}.__await = 0U; }} /* await resolved → resume (§5.2) */", c, f = frame));
+                    self.line(&format!("else if ({f}.__await_deadline == 0U) {{ {f}.__faulted = 1U; {f}.__await = 0U;", f = frame));
+                    self.indent += 1;
+                    self.emit_disposition_frame(reaction.disposition, &frame, n);
+                    self.indent -= 1;
+                    self.line("}");
+                    self.line("else { return; /* await still pending — wait for the next tick (§5.2) */ }");
+                }
                 if let Some(SirStmt::BusXfer { device, op, dst, propagate, code_dst, fault_codes, .. }) = segs[i - 1].1 {
                     let dref = self.var_ref(dst);
                     if let Some(code) = code_dst {
@@ -492,14 +516,21 @@ impl CBackend {
             for &stmt in pre.iter() {
                 self.emit_stmt(stmt);
             }
-            // Terminate the segment: kick the next transaction (suspend) or, on
-            // the tail segment, complete and become ready to fire again.
+            // Terminate the segment: kick the next transaction (suspend on the
+            // bus), arm the await (suspend until SysTick), or, on the tail segment,
+            // complete and become ready to fire again.
             if let Some(SirStmt::BusXfer { device, op, args, .. }) = xfer {
                 for l in self.emit_bus_kick_metal(*device, op, args, n) {
                     self.line(&l);
                 }
                 self.line(&format!("{}.__state = {}U;", frame, i + 1));
                 self.line("return; /* suspend on the bus (§5.2) */");
+            } else if let Some(SirStmt::Await { within_ns, .. }) = xfer {
+                // §5.2 (P6-5) — arm the `within` countdown (1ms SysTick ticks) and
+                // suspend; SysTick re-enters the dispatcher to re-check the cond.
+                let ticks = within_ns.div_ceil(1_000_000).max(1);
+                self.line(&format!("{f}.__await = 1U; {f}.__await_deadline = {t}U; {f}.__state = {s}U;", f = frame, t = ticks, s = i + 1));
+                self.line("return; /* suspend on await (§5.2) */");
             } else {
                 self.line(&format!("{}.__state = 0U; /* complete; ready to fire again */", frame));
                 self.line("return;");
@@ -1500,9 +1531,20 @@ impl CBackend {
         // watchdog exists — the 1 ms wake cadence the idle-loop feed relies on
         // (without it the CPU could sleep past the watchdog timeout between
         // `every` fires).  `every` itself now runs on a hardware TIMER (P1-4).
+        let await_ids: Vec<usize> = {
+            let mut v: Vec<usize> = module
+                .reactions
+                .iter()
+                .filter(|r| body_has_await(&r.body))
+                .map(|r| r.id)
+                .collect();
+            v.sort_unstable();
+            v
+        };
         let needs_systick = module_uses_now(module)
             || !self.deadline_ticks.is_empty()
-            || module.watchdog_device.is_some();
+            || module.watchdog_device.is_some()
+            || !await_ids.is_empty(); // P6-5: SysTick re-checks suspended awaits
         let systick_rvr = if needs_systick {
             match systick_reload(module) {
                 Ok(r) => Some(r),
@@ -1574,6 +1616,14 @@ impl CBackend {
                         "if (__rf_{id}.__state == 0U) {{ __deadline_{id} = 0U; }} else if (__deadline_{id} != 0U && --__deadline_{id} == 0U) {{ __deadline_missed = 1U; }}",
                     ));
                 }
+            }
+            // §5.2 (P6-5) — re-check each await suspended on this 1ms tick: count
+            // its `within` budget down, then re-enter the dispatcher (which resumes
+            // on success, faults on a zero budget, or stays suspended).
+            for id in &await_ids {
+                self.line(&format!(
+                    "if (__rf_{id}.__await != 0U) {{ if (__rf_{id}.__await_deadline != 0U) {{ --__rf_{id}.__await_deadline; }} __react_{id}_run(); }}",
+                ));
             }
             self.indent -= 1;
             self.line("}");
@@ -2260,13 +2310,29 @@ fn module_has_bus_xfer(module: &SirModule) -> bool {
 /// True if any statement in `stmts` (recursively, through `if`/critical bodies)
 /// is a `poll` — i.e. the reaction can fault via a poll timeout (§3.2).
 pub fn body_has_poll(stmts: &[SirStmt]) -> bool {
-    // `await` shares the bounded-fault wrapper (`__faulted` → disposition).
+    // `await` shares the bounded-fault wrapper (`__faulted` → disposition) on the
+    // *host* / non-yielding path; on metal an await is a suspend segment instead.
     stmts.iter().any(|s| match s {
         SirStmt::Poll { .. } | SirStmt::Await { .. } => true,
         SirStmt::If { then, .. } => body_has_poll(then),
         SirStmt::Critical { body, .. } => body_has_poll(body),
         _ => false,
     })
+}
+
+/// True if the reaction body contains an `await` (a suspend point, P6-5).  On
+/// metal such a reaction is lowered as a yielding segment state machine (resumed
+/// by SysTick), not the bounded busy-recheck.  The resolver hoists await to the
+/// top level, so a flat scan suffices.
+pub fn body_has_await(stmts: &[SirStmt]) -> bool {
+    stmts.iter().any(|s| matches!(s, SirStmt::Await { .. }))
+}
+
+/// True if the reaction body contains a yielding bus transfer (a bus segment) —
+/// distinguishes bus-suspending reactions (resumed by the bus IRQ) from
+/// await-suspending ones (resumed by SysTick).
+pub fn body_has_bus(stmts: &[SirStmt]) -> bool {
+    stmts.iter().any(|s| matches!(s, SirStmt::BusXfer { .. }))
 }
 
 fn expr_to_c_literal(expr: &SirExpr) -> String {
