@@ -653,3 +653,109 @@ fn metal_drive_safe_runs_the_safe_sequence_and_halts() {
     assert!(ll.contains("cpsid i"), "must mask interrupts before driving safe:\n{}", ll);
     assert_no_c_isms(&ll);
 }
+
+// ─── P5-3: poll / await + non-yielding fault flow ─────────────────────────────
+
+fn poll_reaction(stmt: SirStmt, disp: SirDisposition) -> SirReaction {
+    let mut rx = reaction(vec![
+        stmt,
+        SirStmt::Assign {
+            target: SirPlace::Var("done".into()),
+            value: SirExpr::Arith {
+                op: SirArithOp::Add,
+                mode: OverflowMode::Wrap,
+                width: 32,
+                signed: false,
+                lhs: Box::new(SirExpr::Load("done".into())),
+                rhs: Box::new(SirExpr::U64(1)),
+            },
+        },
+    ]);
+    rx.id = 1;
+    rx.trigger = SirTrigger::EveryNs(100_000_000);
+    rx.disposition = disp;
+    rx
+}
+
+#[test]
+fn metal_poll_lowers_to_a_bounded_spin_with_fault_disposition() {
+    let poll = SirStmt::Poll {
+        cond: SirExpr::BinOp(
+            SirBinOp::EqEq,
+            Box::new(SirExpr::Load("ready".into())),
+            Box::new(SirExpr::U64(1)),
+        ),
+        fault_code: "timeout".into(),
+        within_ns: 200_000,
+    };
+    let mut m = module(
+        vec![cell("ready", SirType::U32, 1), cell("done", SirType::U32, 0)],
+        vec![],
+    );
+    m.reactions.push(poll_reaction(poll, SirDisposition::Skip));
+    let ll = LlvmBackend::with_target(Target::MetalNrf52840).emit(&m);
+
+    assert!(!ll.contains("; unsupported in llvm canary: Poll"), "poll still unsupported:\n{}", ll);
+    assert!(ll.contains("%__faulted = alloca i8"), "no fault flag:\n{}", ll);
+    assert!(ll.contains("icmp ugt i32"), "no bound check:\n{}", ll);
+    assert!(ll.contains("store i8 1, ptr %__faulted"), "bound elapse must set faulted:\n{}", ll);
+    // Skip disposition: the timeout returns without doing the post-poll work.
+    assert!(ll.contains("ret void ; skip/escalate this activation"), "no skip disposition:\n{}", ll);
+    // A busy-wait does NOT yield: no wfi in the poll reaction function itself.
+    let from = ll.find("define void @__reaction_1()").unwrap();
+    let react = &ll[from..from + ll[from..].find("\n}").unwrap()];
+    assert!(!react.contains("wfi"), "poll must not wfi (it is a busy-wait):\n{}", react);
+    assert_no_c_isms(&ll);
+}
+
+#[test]
+fn metal_await_lowers_to_a_recheck_loop_with_wfi() {
+    let await_s = SirStmt::Await {
+        cond: SirExpr::BinOp(
+            SirBinOp::EqEq,
+            Box::new(SirExpr::Load("ready".into())),
+            Box::new(SirExpr::U64(1)),
+        ),
+        fault_code: "not_ready".into(),
+        within_ns: 50_000_000,
+        recheck_ns: 6_250_000,
+    };
+    let mut m = module(
+        vec![cell("ready", SirType::U32, 1), cell("done", SirType::U32, 0)],
+        vec![],
+    );
+    m.reactions.push(poll_reaction(await_s, SirDisposition::Skip));
+    let ll = LlvmBackend::with_target(Target::MetalNrf52840).emit(&m);
+
+    assert!(!ll.contains("; unsupported in llvm canary: Await"), "await still unsupported:\n{}", ll);
+    assert!(ll.contains("%__faulted = alloca i8"), "no fault flag:\n{}", ll);
+    // await yields to ISRs between re-checks: a wfi inside the wait loop.
+    assert!(ll.contains("wfi") && ll.contains("re-checks"), "await must wfi between checks:\n{}", ll);
+    assert!(ll.contains("store i8 1, ptr %__faulted"), "bound elapse must set faulted:\n{}", ll);
+    assert_no_c_isms(&ll);
+}
+
+#[test]
+fn metal_poll_retry_disposition_wraps_the_body_in_a_retry_loop() {
+    let poll = SirStmt::Poll {
+        cond: SirExpr::BinOp(
+            SirBinOp::EqEq,
+            Box::new(SirExpr::Load("ready".into())),
+            Box::new(SirExpr::U64(1)),
+        ),
+        fault_code: "timeout".into(),
+        within_ns: 200_000,
+    };
+    let mut m = module(
+        vec![cell("ready", SirType::U32, 1), cell("done", SirType::U32, 0)],
+        vec![],
+    );
+    m.reactions.push(poll_reaction(poll, SirDisposition::Retry { max: 3 }));
+    let ll = LlvmBackend::with_target(Target::MetalNrf52840).emit(&m);
+
+    // A retry disposition: bounded re-run loop with a counter compared to max.
+    assert!(ll.contains("%__retry = alloca i32"), "no retry counter:\n{}", ll);
+    assert!(ll.contains("icmp ult i32") && ll.contains(", 3"), "retry must compare against max:\n{}", ll);
+    assert!(ll.contains("retryloop"), "no retry back-edge:\n{}", ll);
+    assert_no_c_isms(&ll);
+}

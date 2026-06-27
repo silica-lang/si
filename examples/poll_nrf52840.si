@@ -1,0 +1,38 @@
+// `poll <cond> within <d> else fault <code>` on the nRF52840-DK — isolates the
+// metal LLVM bounded busy-wait + fault disposition (audit P5-3, §3.2).
+//
+//   silicac --sim                                   examples/poll_nrf52840.si
+//   silicac --target metal-nrf52840 --emit-llvm     examples/poll_nrf52840.si -o poll
+//   ./harness/poll_await.sh                          # success vs timeout on Renode
+//
+// `ready` is preset true here, so the poll is satisfied immediately and `done`
+// advances each tick.  The harness derives a *timeout* control by flipping the
+// init to 0: the poll then spins to its bound, faults, and `skip` drops the
+// activation — so `done` stays 0.  (A plain busy-wait can never see a cell that
+// only another reaction would set, which is exactly why poll is bounded.)
+
+board nrf52840_dk {
+  soc nrf52840 {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+}
+
+program app {
+  use board nrf52840_dk as dev
+
+  cell ready : u32 = 1         // preset satisfied; harness flips to 0 for timeout
+  cell done  : u32 = 0
+
+  every 100ms on fault skip {
+    poll ready == 1 within 200us else fault timeout
+    done = done + 1
+  }
+}
+
+sim app_sim for app {
+  run until 350ms              // ticks at 100/200/300ms → done settles at 3
+}

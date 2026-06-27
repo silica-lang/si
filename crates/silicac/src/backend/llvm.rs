@@ -164,6 +164,13 @@ pub struct LlvmBackend {
     /// Module cell names (P4-3): distinguishes a cell (real global) from a
     /// reaction-local temp when collecting a yielding reaction's frame.
     cells: std::collections::HashSet<String>,
+    /// While lowering a non-yielding reaction that can fault via a `poll`/`await`
+    /// timeout (P5-3): the reaction's Layer-2 disposition, routed when `__faulted`
+    /// is set.  `None` outside such a reaction.
+    current_disposition: Option<SirDisposition>,
+    /// While lowering a `Retry`-disposition reaction (P5-3): the back-edge label
+    /// to re-run the body on a retry.  `None` otherwise.
+    retry_loop: Option<String>,
 }
 
 impl LlvmBackend {
@@ -191,6 +198,8 @@ impl LlvmBackend {
             device_regs: HashMap::new(),
             frame: None,
             cells: std::collections::HashSet::new(),
+            current_disposition: None,
+            retry_loop: None,
         }
     }
 
@@ -303,8 +312,7 @@ impl LlvmBackend {
             if metal && r.yields {
                 self.emit_yielding_metal(r);
             } else {
-                let sig = format!("void @__reaction_{}()", r.id);
-                self.lower_function(&sig, false, &[r.body.as_slice()]);
+                self.lower_reaction_fn(r);
             }
         }
 
@@ -410,6 +418,91 @@ impl LlvmBackend {
         self.functions.push_str(&self.allocas);
         self.functions.push_str(&self.body);
         self.functions.push_str("}\n\n");
+    }
+
+    /// Lower a non-`sys.start`, non-yielding reaction to its `@__reaction_N` fn.
+    /// A reaction that can fault via a `poll`/`await` timeout (P5-3) gets a
+    /// `%__faulted` flag + the Layer-2 disposition routing — a `Retry` disposition
+    /// wraps the body in a bounded re-run loop, as the yielding path does.
+    /// Mirrors the C `emit_reaction_fn` fault wrapper.
+    fn lower_reaction_fn(&mut self, r: &SirReaction) {
+        let sig = format!("void @__reaction_{}()", r.id);
+        let metal = self.target == Target::MetalNrf52840;
+        let has_poll = metal && crate::backend::c::body_has_poll(&r.body);
+        if !has_poll {
+            self.lower_function(&sig, false, &[r.body.as_slice()]);
+            return;
+        }
+        self.body.clear();
+        self.allocas.clear();
+        self.terminated = false;
+        self.ret_i32 = false;
+        self.vars.retain(|_, v| v.2);
+        self.collect_locals(&r.body);
+        self.allocas.push_str("  %__faulted = alloca i8\n");
+        self.inst("store i8 0, ptr %__faulted");
+        self.current_disposition = Some(r.disposition);
+        let is_retry = matches!(r.disposition, SirDisposition::Retry { .. });
+        if is_retry {
+            self.allocas.push_str("  %__retry = alloca i32\n");
+            self.inst("store i32 0, ptr %__retry");
+            let loop_l = self.fresh_label("retryloop");
+            self.inst(&format!("br label %{}", loop_l));
+            self.label(&loop_l);
+            self.inst("store i8 0, ptr %__faulted ; clear before this attempt");
+            self.retry_loop = Some(loop_l);
+        }
+        for stmt in &r.body {
+            if self.terminated {
+                break;
+            }
+            self.emit_stmt(stmt);
+        }
+        self.retry_loop = None;
+        self.current_disposition = None;
+        if !self.terminated {
+            self.inst("ret void");
+        }
+        self.functions.push_str(&format!("define {} {{\nentry:\n", sig));
+        self.functions.push_str(&self.allocas);
+        self.functions.push_str(&self.body);
+        self.functions.push_str("}\n\n");
+    }
+
+    /// A poll/await timeout's Layer-2 disposition in a non-yielding reaction
+    /// (terminal form, P5-3): retry (back-edge to the body), skip/escalate
+    /// (return), or safe (drive safe + halt).  Emitted inside an `if(__faulted)`
+    /// block, so it ends that block in a terminator without ending the caller's
+    /// statement stream.  Mirrors the C `emit_disposition_terminal`.
+    fn emit_terminal_disposition(&mut self, disp: SirDisposition) {
+        match disp {
+            SirDisposition::Retry { max } => {
+                if let Some(loop_l) = self.retry_loop.clone() {
+                    let r = self.fresh();
+                    self.inst(&format!("{} = load i32, ptr %__retry", r));
+                    let lt = self.fresh();
+                    self.inst(&format!("{} = icmp ult i32 {}, {}", lt, r, max));
+                    let again = self.fresh_label("again");
+                    let giveup = self.fresh_label("giveup");
+                    self.inst(&format!("br i1 {}, label %{}, label %{}", lt, again, giveup));
+                    self.label(&again);
+                    let r1 = self.fresh();
+                    self.inst(&format!("{} = add i32 {}, 1", r1, r));
+                    self.inst(&format!("store i32 {}, ptr %__retry", r1));
+                    self.inst(&format!("br label %{}", loop_l));
+                    self.label(&giveup);
+                    self.inst("ret void ; retries exhausted → escalate");
+                } else {
+                    self.inst("ret void");
+                }
+            }
+            SirDisposition::Skip | SirDisposition::Escalate => {
+                self.inst("ret void ; skip/escalate this activation");
+            }
+            SirDisposition::Safe => {
+                self.emit_drive_safe_and_halt("poll/await fault → safe (§5.6)");
+            }
+        }
     }
 
     // ── Metal helpers (P3-4c/P4) ──────────────────────────────────────────────
@@ -1245,9 +1338,80 @@ impl LlvmBackend {
                     self.inst(&format!("call void asm sideeffect \"msr basepri, $0\", \"r,~{{memory}}\"(i32 {})", s));
                 }
             }
+            // Bounded busy-wait (§3.2, P5-3): spin until `cond`, else fault.  Does
+            // NOT yield the scheduler.
+            SirStmt::Poll { cond, within_ns, .. } => {
+                self.emit_bounded_wait(cond, (*within_ns).max(1), false);
+            }
+            // Bounded re-check (§5.2, P5-3): like poll but `wfi` between checks so
+            // ISRs can run (a full D2-style frame suspend is a follow-up, as on the
+            // C path); else fault.
+            SirStmt::Await { cond, within_ns, recheck_ns, .. } => {
+                let bound = (*within_ns / (*recheck_ns).max(1)).max(1);
+                self.emit_bounded_wait(cond, bound, true);
+            }
             other => {
                 self.inst(&format!("; unsupported in llvm canary: {}", stmt_kind(other)));
             }
+        }
+    }
+
+    /// Lower a `poll`/`await` to a bounded wait loop (P5-3): spin (`poll`) or
+    /// `wfi`-between-checks (`await`) until `cond` holds; on the bound elapsing set
+    /// `%__faulted` and route to the reaction's Layer-2 disposition.  Mirrors the C
+    /// `Poll`/`Await` emission + `if(__faulted) <disposition>`.
+    fn emit_bounded_wait(&mut self, cond: &SirExpr, bound: u64, is_await: bool) {
+        if self.target != Target::MetalNrf52840 {
+            // On the host the simulator services the wait (matches the C host path).
+            self.inst("; poll/await serviced by the host simulator");
+            return;
+        }
+        let tag = self.fresh_label("wait");
+        let spins = format!("%{}.n", tag);
+        self.allocas.push_str(&format!("  {} = alloca i32\n", spins));
+        self.inst(&format!("store i32 0, ptr {}", spins));
+        let cond_l = format!("{}.cond", tag);
+        let spin_l = format!("{}.spin", tag);
+        let again_l = format!("{}.again", tag);
+        let fault_l = format!("{}.fault", tag);
+        let done_l = format!("{}.done", tag);
+        self.inst(&format!("br label %{}", cond_l));
+        self.label(&cond_l);
+        let c = self.emit_expr(cond, 1);
+        // cond true → proceed; false → spin (bump the counter, check the bound).
+        self.inst(&format!("br i1 {}, label %{}, label %{}", c, done_l, spin_l));
+        self.label(&spin_l);
+        let s = self.fresh();
+        self.inst(&format!("{} = load i32, ptr {}", s, spins));
+        let s1 = self.fresh();
+        self.inst(&format!("{} = add i32 {}, 1", s1, s));
+        self.inst(&format!("store i32 {}, ptr {}", s1, spins));
+        let over = self.fresh();
+        self.inst(&format!("{} = icmp ugt i32 {}, {}", over, s1, bound));
+        self.inst(&format!("br i1 {}, label %{}, label %{}", over, fault_l, again_l));
+        self.label(&again_l);
+        if is_await {
+            self.m_asm("wfi", "await: yield to ISRs between re-checks (§5.2)");
+        }
+        self.inst(&format!("br label %{}", cond_l));
+        self.label(&fault_l);
+        if self.current_disposition.is_some() {
+            self.inst("store i8 1, ptr %__faulted");
+        }
+        self.inst(&format!("br label %{}", done_l));
+        self.label(&done_l);
+        // Route the timeout to the reaction's Layer-2 disposition.
+        if let Some(disp) = self.current_disposition {
+            let f = self.fresh();
+            self.inst(&format!("{} = load i8, ptr %__faulted", f));
+            let nz = self.fresh();
+            self.inst(&format!("{} = icmp ne i8 {}, 0", nz, f));
+            let on_l = self.fresh_label("onfault");
+            let no_l = self.fresh_label("nofault");
+            self.inst(&format!("br i1 {}, label %{}, label %{}", nz, on_l, no_l));
+            self.label(&on_l);
+            self.emit_terminal_disposition(disp);
+            self.label(&no_l);
         }
     }
 
