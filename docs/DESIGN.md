@@ -789,9 +789,15 @@ disposition validation, while the value stays one regular shape to handle.
 > arm; **metal** decodes the controller's named SR error bits (nak/arblost/timeout) into the same arm
 > — `harness/fault_match.sh` is the Renode parity gate. Since the P3-1 multi-fire fix it drives all
 > four outcomes across four consecutive fires in **one boot** (nak→timeout→arblost→ok), each to its own
-> arm. examples/fault_match.si, tests/match_stmt.rs. **Remaining:** value patterns are integer/bool
-> only; `match` over a *composed* (inlined, multi-transaction) op's result builds on the single-BusXfer
-> case here.
+> arm. examples/fault_match.si, tests/match_stmt.rs.
+>
+> **Composed-op match (P3-2).** `match` now also works one composition hop up: a `match
+> sensor.read_temp()` where `read_temp` is a **composed** op whose body wraps a single bus transaction
+> (`return bus.read_reg(...)?`, §3.5) — the outcome rides the inner transaction reached through
+> inlining, so no backend change is needed (the `code_dst` path already services an inlined `BusXfer`).
+> Fault codes + exhaustiveness come from that transaction (the leaf controller's runtime codes); a
+> *multi-transaction* composed op is rejected with a clear error. examples/fault_match_composed.si.
+> **Remaining:** value patterns are integer/bool only; `match` over a multi-transaction composed op.
 >
 > **Status (P3-1 — yielding reactions re-fire on metal).** A yielding `every` reaction now fires
 > repeatedly on metal. The bus completion line is *level* (held asserted until the next transaction),

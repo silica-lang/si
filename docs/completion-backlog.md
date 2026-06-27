@@ -362,10 +362,15 @@ smallest/highest-value → largest. (The first feature PR also introduces this s
       harness/bus_refire.sh (3 fires/one boot → reads==3); harness/fault_match.sh tightened to **true
       multi-fire** (nak→timeout→arblost→ok in one boot, all PASS); tests/match_stmt.rs
       (clear-before-enable). **Renode: PASS**; bus_parity.sh still PASS.
-- [ ] P3-2 `match` over a composed (inlined) op (P2-4 follow-up) — lift the primitive-bus-op restriction
-      (`resolver.rs` lower_result_match): inline a composed op's body in a "catch" context so an inner
-      fault sets the match `code_dst` (mapped to the composed op's declared fault codes). + richer value
-      patterns if cheap. tests/match_stmt.rs (composed device) + sim/metal.
+- [x] P3-2 `match` over a composed (inlined) op (P2-4 follow-up) — PR #60. Lifted the primitive-bus-op
+      restriction in `resolver.rs` lower_result_match: the match's outcome rides the *single* bus
+      transaction reached through inlining — a composed op like std bme280 `read_temp` = `return
+      bus.read_reg(...)?` — so `ok v`/`fault <code>` work one composition hop up, unaware of the bus.
+      Fault codes + exhaustiveness come from that transaction (the leaf controller's runtime codes); a
+      multi-transaction composed op is rejected with a clear error. No backend change — the sim/metal
+      `code_dst` path already services an inlined BusXfer. examples/fault_match_composed.si +
+      tests/match_stmt.rs (composed); harness/fault_match.sh parametrized (runs on both examples).
+      sim + **Renode PASS**.
 - [ ] P3-3 Broader typestate: runtime-precondition lowering (P2-3 follow-up) `[metal]` — the unprovable
       `when <state>` case (across a `yields`/dynamic ref) becomes a runtime Layer-3 fault instead of a
       conservative compile error; + single-owner-firing persistence + Layer-3 site map. tests/typestate.rs
