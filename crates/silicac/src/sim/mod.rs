@@ -48,6 +48,10 @@ pub enum TraceKind {
     /// A suspending `await <cond> within <d>` resolved (§5.2): `resolved` = the
     /// condition held; otherwise the budget elapsed and `code` was raised.
     Await { code: String, resolved: bool },
+    /// A reaction blocked on a busy bus and joined its waiter queue (§5.2, P6-9).
+    BusBlocked { device: usize, reaction: usize },
+    /// A waiting reaction was granted a freed bus (highest-priority-first, P6-9).
+    BusGranted { device: usize, reaction: usize },
     /// A reaction suspended on a bus transaction (§5.2/§3.5).
     BusStart { device: usize, op: String },
     /// A bus transaction completed: `code` = None on success, Some on fault.
@@ -128,6 +132,12 @@ impl SimResult {
                     true => format!("[{:>8.3}ms]   await — condition met, resume (§5.2)", ms),
                     false => format!("[{:>8.3}ms]   await — timeout, FAULT {}", ms, code),
                 },
+                TraceKind::BusBlocked { device, reaction } => {
+                    format!("[{:>8.3}ms]   bus {} BLOCKED reaction#{} (queued, §5.2)", ms, name_of(*device), reaction)
+                }
+                TraceKind::BusGranted { device, reaction } => {
+                    format!("[{:>8.3}ms]   bus {} GRANTED reaction#{} (priority, §5.2)", ms, name_of(*device), reaction)
+                }
                 TraceKind::BusStart { device, op } => {
                     format!("[{:>8.3}ms]   bus {}.{}() — suspend (yields)", ms, name_of(*device), op)
                 }
@@ -260,6 +270,13 @@ struct Sim<'m> {
     bus_fault_idx: usize,
     /// Bus transactions left to hang (wedged bus, §5.6 watchdog demo).
     bus_hangs_left: u32,
+    /// Per-controller busy flag (§5.2, P6-9): a bus serves one transaction at a
+    /// time, keyed by the controller device id (`BusXfer.device`).
+    bus_busy: HashMap<usize, bool>,
+    /// Per-controller waiter queue (P6-9): activations blocked on a busy bus,
+    /// granted highest-priority-first when it frees.  Bounded by construction —
+    /// with §5.1 coalescing each reaction has ≤1 in-flight activation.
+    bus_waiters: HashMap<usize, Vec<Activation>>,
     /// Watchdog (§5.6/SIL-006): the active arming generation (None = fed/idle),
     /// and a monotonic generation so stale timeout events are ignored.
     wdt_active: Option<u64>,
@@ -291,6 +308,8 @@ pub fn run(module: &SirModule) -> SimResult {
         cells: HashMap::new(),
         cell_names,
         rings: HashMap::new(),
+        bus_busy: HashMap::new(),
+        bus_waiters: HashMap::new(),
         in_flight: vec![false; module.reactions.len()],
         react_gen: vec![0; module.reactions.len()],
         bus_fault_idx: 0,
@@ -578,6 +597,25 @@ impl<'m> Sim<'m> {
             }
             match &body[act.pc] {
                 SirStmt::BusXfer { device, op, args, dst, propagate, code_dst, fault_codes } => {
+                    // §5.2 (P6-9) — a bus serves one transaction at a time.  Claim
+                    // it only if free AND no strictly-higher-priority reaction is
+                    // already waiting; otherwise join the waiter queue and suspend
+                    // (pc stays on the BusXfer, so a grant re-runs the claim).
+                    let self_pri = module.reactions[act.reaction].priority;
+                    let busy = self.bus_busy.get(device).copied().unwrap_or(false);
+                    let higher_waiting = self
+                        .bus_waiters
+                        .get(device)
+                        .is_some_and(|w| w.iter().any(|a| module.reactions[a.reaction].priority > self_pri));
+                    if busy || higher_waiting {
+                        self.trace.push(TraceRecord {
+                            at_ns: self.now,
+                            kind: TraceKind::BusBlocked { device: *device, reaction: act.reaction },
+                        });
+                        self.bus_waiters.entry(*device).or_default().push(act);
+                        return;
+                    }
+                    self.bus_busy.insert(*device, true);
                     let argvals: Vec<u64> = args.iter().map(|a| self.eval_expr(a, &act.locals)).collect();
                     let _ = argvals; // args drive a real controller on metal; the mock is value-fixed
                     self.trace.push(TraceRecord {
@@ -673,6 +711,10 @@ impl<'m> Sim<'m> {
     /// Resume a suspended activation when its bus transaction completes.
     #[allow(clippy::too_many_arguments)] // mirrors the BusXfer / Resume payload
     fn resume(&mut self, mut act: Activation, device: usize, op: String, dst: String, propagate: bool, outcome: Result<u64, String>, code_dst: Option<String>, fault_codes: Vec<String>) {
+        // §5.2 (P6-9) — this transaction is done, so the bus is free.  The owner's
+        // continuation (below) may immediately re-claim it; afterwards `grant_bus`
+        // hands a still-free bus to the highest-priority waiter.
+        self.bus_busy.insert(device, false);
         let code = outcome.as_ref().err().cloned();
         self.trace.push(TraceRecord {
             at_ns: self.now,
@@ -693,19 +735,53 @@ impl<'m> Sim<'m> {
             act.locals.insert(code_var, idx);
             act.locals.insert(dst, val);
             self.run_activation(act);
-            return;
-        }
-        match outcome {
-            Ok(v) => {
-                act.locals.insert(dst, v);
-                self.run_activation(act);
+        } else {
+            match outcome {
+                Ok(v) => {
+                    act.locals.insert(dst, v);
+                    self.run_activation(act);
+                }
+                Err(c) if propagate => self.dispose(act, c),
+                Err(_) => {
+                    act.locals.insert(dst, 0);
+                    self.run_activation(act);
+                }
             }
-            Err(c) if propagate => self.dispose(act, c),
-            Err(_) => {
-                act.locals.insert(dst, 0);
-                self.run_activation(act);
-            }
         }
+        self.grant_bus(device);
+    }
+
+    /// Grant a freed bus to its highest-priority waiter (§5.2, P6-9; ties → earliest
+    /// enqueue).  Re-runs that activation, which re-hits its `BusXfer` (now free) and
+    /// claims + services it.  No-op if the owner re-claimed the bus or none waits.
+    fn grant_bus(&mut self, device: usize) {
+        if self.bus_busy.get(&device).copied().unwrap_or(false) {
+            return; // the resumed owner re-claimed it
+        }
+        let pick = {
+            let module = self.module;
+            match self.bus_waiters.get(&device) {
+                Some(w) if !w.is_empty() => {
+                    let mut best = 0usize;
+                    let mut best_pri = module.reactions[w[0].reaction].priority;
+                    for (i, a) in w.iter().enumerate().skip(1) {
+                        let p = module.reactions[a.reaction].priority;
+                        if p > best_pri {
+                            best = i;
+                            best_pri = p;
+                        }
+                    }
+                    best
+                }
+                _ => return,
+            }
+        };
+        let act = self.bus_waiters.get_mut(&device).unwrap().remove(pick);
+        self.trace.push(TraceRecord {
+            at_ns: self.now,
+            kind: TraceKind::BusGranted { device, reaction: act.reaction },
+        });
+        self.run_activation(act);
     }
 
     /// Apply the reaction's Layer-2 fault disposition (§4.4/§5.4).

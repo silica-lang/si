@@ -54,6 +54,11 @@ pub struct CBackend {
     /// (§4.5/§5.6).  Populated only when a watchdog exists (the reset mechanism);
     /// an overrun sets `__deadline_missed`, which stops the watchdog feed.
     deadline_ticks: HashMap<usize, u32>,
+    /// Per-controller contender list (P6-9): reaction ids sharing a bus, sorted by
+    /// priority desc.  Populated (entries with ≥2) only when the bus is contended;
+    /// then the arbitration (waiter flag + priority grant) is emitted.  A
+    /// single-consumer bus keeps the simpler single-owner path byte-for-byte.
+    bus_contenders: HashMap<usize, Vec<(usize, u8)>>,
 }
 
 impl CBackend {
@@ -77,6 +82,7 @@ impl CBackend {
             fixed_combos: HashSet::new(),
             ring_info: HashMap::new(),
             deadline_ticks: HashMap::new(),
+            bus_contenders: HashMap::new(),
         }
     }
 
@@ -118,6 +124,13 @@ impl CBackend {
         }
         self.global_vars = module.vars.iter().map(|v| v.name.clone()).collect();
         self.max_priority = module.reactions.iter().map(|r| r.priority).max().unwrap_or(0);
+        // P6-9: per-controller contenders, recorded only for contended buses.
+        for d in &module.devices {
+            let c = bus_contenders(module, d.id);
+            if c.len() >= 2 {
+                self.bus_contenders.insert(d.id, c);
+            }
+        }
         self.arith_combos = collect_arith(module);
         self.fixed_combos = collect_fixed(module);
         match self.target {
@@ -152,6 +165,15 @@ impl CBackend {
                 self.emit_globals(module);
                 self.emit_now_helper(module);
                 self.emit_deadline_state();
+                // P6-9: bus-contention waiter flags as standalone globals, declared
+                // before the reaction fns so each reaction's claim-check can see the
+                // others' flags (a frame-struct field would be a forward reference).
+                if !self.bus_contenders.is_empty() {
+                    self.line("/* §5.2 (P6-9) bus-contention waiter flags */");
+                    for id in self.bus_grant_order() {
+                        self.line(&format!("static volatile uint8_t __bus_waiting_{} = 0U;", id));
+                    }
+                }
                 self.emit_newline();
                 self.emit_drive_safe(module);
                 self.emit_arith_helpers();
@@ -489,6 +511,15 @@ impl CBackend {
                     self.line("else { return; /* await still pending — wait for the next tick (§5.2) */ }");
                 }
                 if let Some(SirStmt::BusXfer { device, op, dst, propagate, code_dst, fault_codes, .. }) = segs[i - 1].1 {
+                    // P6-9: a granted waiter re-enters here — if it was waiting
+                    // (never kicked), retry the kick of the prior segment now that
+                    // the bus is free, instead of decoding a result that never came.
+                    if self.bus_contenders.contains_key(device) {
+                        self.line(&format!(
+                            "if (__bus_waiting_{n}) {{ __bus_waiting_{n} = 0U; goto __kick_{n}_{p}; }} /* bus granted → retry kick (§5.2/P6-9) */",
+                            n = n, p = i - 1
+                        ));
+                    }
                     let dref = self.var_ref(dst);
                     if let Some(code) = code_dst {
                         // `match` over the result (§4.4/D14): decode the outcome
@@ -520,11 +551,35 @@ impl CBackend {
             // bus), arm the await (suspend until SysTick), or, on the tail segment,
             // complete and become ready to fire again.
             if let Some(SirStmt::BusXfer { device, op, args, .. }) = xfer {
-                for l in self.emit_bus_kick_metal(*device, op, args, n) {
-                    self.line(&l);
+                if self.bus_contenders.contains_key(device) {
+                    // P6-9 contended bus: claim only if free + no higher-priority
+                    // waiter; else record as a waiter and suspend.  The `__kick`
+                    // label is the re-entry point a grant jumps back to.
+                    let claim = self.bus_claim_cond(*device, n);
+                    self.line(&format!("__kick_{}_{}: ;", n, i));
+                    self.line(&format!("if ({}) {{", claim));
+                    self.indent += 1;
+                    for l in self.emit_bus_kick_metal(*device, op, args, n) {
+                        self.line(&l);
+                    }
+                    self.line(&format!("__bus_waiting_{} = 0U;", n));
+                    self.line(&format!("{}.__state = {}U;", frame, i + 1));
+                    self.line("return; /* claimed the bus (§5.2/P6-9) */");
+                    self.indent -= 1;
+                    self.line("} else {");
+                    self.indent += 1;
+                    self.line(&format!("__bus_waiting_{} = 1U;", n));
+                    self.line(&format!("{}.__state = {}U;", frame, i + 1));
+                    self.line("return; /* bus busy — wait for a grant (§5.2/P6-9) */");
+                    self.indent -= 1;
+                    self.line("}");
+                } else {
+                    for l in self.emit_bus_kick_metal(*device, op, args, n) {
+                        self.line(&l);
+                    }
+                    self.line(&format!("{}.__state = {}U;", frame, i + 1));
+                    self.line("return; /* suspend on the bus (§5.2) */");
                 }
-                self.line(&format!("{}.__state = {}U;", frame, i + 1));
-                self.line("return; /* suspend on the bus (§5.2) */");
             } else if let Some(SirStmt::Await { within_ns, .. }) = xfer {
                 // §5.2 (P6-5) — arm the `within` countdown (1ms SysTick ticks) and
                 // suspend; SysTick re-enters the dispatcher to re-check the cond.
@@ -663,6 +718,36 @@ impl CBackend {
     /// registers and enable its completion IRQ; the caller then suspends (sets
     /// the next state and returns).  Mirrors the write side of the simulator's
     /// bus servicing.  `n` is the owning reaction id (recorded in `__bus_owner`).
+    /// The C condition under which reaction `n` may claim contended controller
+    /// `device` (P6-9): the bus is free AND no strictly-higher-priority contender
+    /// is already waiting (priority arbitration; ties favour the running reaction).
+    fn bus_claim_cond(&self, device: usize, n: usize) -> String {
+        let contenders = &self.bus_contenders[&device];
+        let n_pri = contenders.iter().find(|(id, _)| *id == n).map(|(_, p)| *p).unwrap_or(0);
+        let mut cond = "__bus_owner == -1".to_string();
+        for (id, p) in contenders {
+            if *id != n && *p > n_pri {
+                cond.push_str(&format!(" && !__bus_waiting_{}", id));
+            }
+        }
+        cond
+    }
+
+    /// Reaction ids that contend for any bus, highest-priority first (P6-9) — the
+    /// order the bus IRQ grants a freed bus to a waiter.
+    fn bus_grant_order(&self) -> Vec<usize> {
+        let mut all: Vec<(usize, u8)> = Vec::new();
+        for v in self.bus_contenders.values() {
+            for &(id, p) in v {
+                if !all.iter().any(|(i, _)| *i == id) {
+                    all.push((id, p));
+                }
+            }
+        }
+        all.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        all.into_iter().map(|(id, _)| id).collect()
+    }
+
     fn emit_bus_kick_metal(&self, device: usize, op: &str, args: &[SirExpr], n: usize) -> Vec<String> {
         let (cr, _sr, sa, ra, dr) = match self.bus_regs_metal(device) {
             Ok(t) => t,
@@ -1768,6 +1853,22 @@ impl CBackend {
             self.line("default: break;");
             self.indent -= 1;
             self.line("}");
+            // P6-9: the owner released the bus (didn't re-claim) → grant it to the
+            // highest-priority waiter (it re-enters its dispatcher and retries the
+            // now-free kick).  One grant per completion; the rest wait their turn.
+            let grant = self.bus_grant_order();
+            if !grant.is_empty() {
+                self.line("if (__bus_owner == -1) {");
+                self.indent += 1;
+                let mut first = true;
+                for id in &grant {
+                    let kw = if first { "if" } else { "else if" };
+                    self.line(&format!("{kw} (__bus_waiting_{id}) __react_{id}_run();", kw = kw, id = id));
+                    first = false;
+                }
+                self.indent -= 1;
+                self.line("}");
+            }
             self.indent -= 1;
             self.line("}");
         }
@@ -2405,6 +2506,30 @@ pub fn body_has_await(stmts: &[SirStmt]) -> bool {
 /// await-suspending ones (resumed by SysTick).
 pub fn body_has_bus(stmts: &[SirStmt]) -> bool {
     stmts.iter().any(|s| matches!(s, SirStmt::BusXfer { .. }))
+}
+
+/// The reactions that issue a `BusXfer` on controller `device` (P6-9), as
+/// `(reaction_id, priority)` sorted by priority descending then id ascending —
+/// the arbitration order when the bus frees.
+pub fn bus_contenders(module: &SirModule, device: usize) -> Vec<(usize, u8)> {
+    let mut v: Vec<(usize, u8)> = module
+        .reactions
+        .iter()
+        .filter(|r| r.body.iter().any(|s| matches!(s, SirStmt::BusXfer { device: d, .. } if *d == device)))
+        .map(|r| (r.id, r.priority))
+        .collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    v
+}
+
+/// True if any controller is shared by ≥2 reactions (P6-9) — only then is the
+/// per-bus arbitration (waiter flag + priority grant) emitted; a single-consumer
+/// bus keeps the simpler single-owner path byte-for-byte.
+pub fn module_has_bus_contention(module: &SirModule) -> bool {
+    module
+        .devices
+        .iter()
+        .any(|d| bus_contenders(module, d.id).len() >= 2)
 }
 
 fn expr_to_c_literal(expr: &SirExpr) -> String {
