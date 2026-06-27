@@ -261,3 +261,84 @@ fn non_sys_start_reactions_become_void_functions() {
     assert!(ll.contains("ret void"), "reaction returns void:\n{}", ll);
     assert_no_c_isms(&ll);
 }
+
+// ─── P3-4b: MMIO register access (volatile load/store) ────────────────────────
+
+/// A module with one MMIO device (`base`) plus a sys.start `body`.
+fn module_with_device(base: u64, vars: Vec<SirVar>, body: Vec<SirStmt>) -> SirModule {
+    SirModule {
+        vars,
+        reactions: vec![reaction(body)],
+        devices: vec![SirDevice {
+            id: 0,
+            name: "w".into(),
+            base_addr: Some(base),
+            kind: SirDeviceKind::Generic,
+            regs: vec![],
+        }],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn reg_store_is_a_volatile_rmw_at_the_absolute_address() {
+    // CTRL.enable = 1 on a rw field → volatile load/modify/store at base+offset.
+    let body = vec![SirStmt::Assign {
+        target: SirPlace::Reg {
+            device: 0,
+            reg_offset: 0x00,
+            width: 32,
+            field_mask: 0x1,
+            field_shift: 0,
+            access: SirRegAccess::Rw,
+        },
+        value: SirExpr::U64(1),
+    }];
+    let ll = LlvmBackend::new().emit(&module_with_device(0x4000_5000, vec![], body));
+    assert!(ll.contains("inttoptr i64 1073762304 to ptr"), "absolute address:\n{}", ll);
+    assert!(ll.contains("load volatile i32"), "RMW read:\n{}", ll);
+    assert!(ll.contains("store volatile i32"), "volatile store:\n{}", ll);
+    assert!(ll.contains("or i32"), "RMW combine:\n{}", ll);
+    assert_no_c_isms(&ll);
+}
+
+#[test]
+fn write_only_field_stores_without_a_read() {
+    // A `wo` field is written directly — no read-modify-write.
+    let body = vec![SirStmt::Assign {
+        target: SirPlace::Reg {
+            device: 0,
+            reg_offset: 0x08,
+            width: 32,
+            field_mask: 0x1,
+            field_shift: 0,
+            access: SirRegAccess::Wo,
+        },
+        value: SirExpr::U64(1),
+    }];
+    let ll = LlvmBackend::new().emit(&module_with_device(0x4000_5000, vec![], body));
+    assert!(ll.contains("store volatile i32"), "volatile store:\n{}", ll);
+    assert!(!ll.contains("load volatile"), "wo field must not read:\n{}", ll);
+}
+
+#[test]
+fn reg_load_is_a_masked_shifted_volatile_load() {
+    // last = DATA (a field at shift 4, mask 0xF0) → load volatile, and, lshr.
+    let body = vec![SirStmt::Assign {
+        target: SirPlace::Var("last".into()),
+        value: SirExpr::RegLoad {
+            device: 0,
+            reg_offset: 0x04,
+            width: 32,
+            field_mask: 0xF0,
+            field_shift: 4,
+            access: SirRegAccess::Ro,
+        },
+    }];
+    let ll = LlvmBackend::new()
+        .emit(&module_with_device(0x4000_5000, vec![cell("last", SirType::U32, 0)], body));
+    assert!(ll.contains("inttoptr i64 1073762308 to ptr"), "base+offset address:\n{}", ll);
+    assert!(ll.contains("load volatile i32"), "volatile read:\n{}", ll);
+    assert!(ll.contains("and i32") && ll.contains("lshr i32"), "mask + shift:\n{}", ll);
+    assert_no_c_isms(&ll);
+}

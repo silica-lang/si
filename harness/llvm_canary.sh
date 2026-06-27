@@ -90,4 +90,21 @@ if [[ -f "$FEAT" ]]; then
   echo "PASS: extended subset is well-formed (match→if, now()→llvm.readcyclecounter, reaction functions; no C-ism)."
 fi
 
-echo "PASS: LLVM-IR backend gate (P2-1 + P3-4a) — SIR is target-neutral; the trap is not a C-ism."
+# ── 6. MMIO register access (P3-4b): volatile load/store + llc to object ──────
+MMIO="$REPO/examples/llvm_mmio.si"
+if [[ -f "$MMIO" ]]; then
+  echo "== MMIO (P3-4b): emit + opt -verify + llc to object =="
+  cargo run -q --bin silicac -- --emit-llvm "$MMIO" -o "$WORK/mmio" 2>"$WORK/mmio.log" \
+    || { echo "FAIL: --emit-llvm errored on mmio"; cat "$WORK/mmio.log"; exit 1; }
+  MLL="$WORK/mmio.ll"
+  llvm-as "$MLL" -o "$WORK/mmio.bc" || { echo "FAIL: llvm-as rejected mmio IR"; exit 1; }
+  opt -passes=verify "$WORK/mmio.bc" -o /dev/null || { echo "FAIL: opt -verify rejected mmio IR"; exit 1; }
+  grep -q "load volatile i32"  "$MLL" || { echo "FAIL: no volatile MMIO load"; exit 1; }
+  grep -q "store volatile i32" "$MLL" || { echo "FAIL: no volatile MMIO store"; exit 1; }
+  grep -q "inttoptr i64"       "$MLL" || { echo "FAIL: no absolute-address pointer"; exit 1; }
+  llc "$MLL" -o "$WORK/mmio.o" -filetype=obj 2>"$WORK/llc.log" \
+    || { echo "FAIL: llc could not codegen the MMIO IR to an object"; cat "$WORK/llc.log"; exit 1; }
+  echo "PASS: MMIO lowers to volatile load/store at absolute addresses; llc → object OK."
+fi
+
+echo "PASS: LLVM-IR backend gate (P2-1 + P3-4a + P3-4b) — SIR is target-neutral; the trap is not a C-ism."

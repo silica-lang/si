@@ -24,9 +24,12 @@
 //! to a timer/IRQ is P3-4c).  Statements: `Assign(SirPlace::Var)`, `If`, `Exit`,
 //! the host-io intrinsics.  Expressions: `SirExpr::{Bool, U64, Load, Not, BinOp,
 //! Arith (trap/wrap/saturate, signed + unsigned), Cast, Now}` (`now()` →
-//! `llvm.readcyclecounter`).  Anything else (MMIO `RegLoad`/`Reg` store — P3-4b;
-//! rings; bus transactions) emits a `; unsupported in llvm canary` comment
-//! (harmless to IR validity) — a deliberate signpost for what is still missing.
+//! `llvm.readcyclecounter`).  MMIO is supported (P3-4b): a `SirPlace::Reg` store
+//! / `RegLoad` lowers to a `volatile` load/store at `base + offset` via
+//! `inttoptr` (a rw field is a read-modify-write).  Anything else (rings, bus
+//! transactions, the scheduler that *calls* the reaction functions — P3-4c)
+//! emits a `; unsupported in llvm canary` comment (harmless to IR validity) — a
+//! deliberate signpost for what is still missing.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -89,6 +92,9 @@ pub struct LlvmBackend {
     /// True once a terminator (`ret` from `Exit`) has been emitted into `@main`,
     /// so trailing statements are skipped rather than placed after a terminator.
     terminated: bool,
+    /// device id → MMIO base address (audit P3-4b): a `SirPlace::Reg`/`RegLoad`
+    /// lowers to a `volatile` load/store at `base + reg_offset` via `inttoptr`.
+    device_bases: HashMap<usize, u64>,
 }
 
 impl LlvmBackend {
@@ -106,6 +112,7 @@ impl LlvmBackend {
             next_str: 0,
             vars: HashMap::new(),
             terminated: false,
+            device_bases: HashMap::new(),
         }
     }
 
@@ -145,6 +152,12 @@ impl LlvmBackend {
 
     /// Lower a `SirModule` to a textual LLVM-IR translation unit.
     pub fn emit(mut self, module: &SirModule) -> String {
+        // 0. Device MMIO bases (P3-4b): for `Reg`/`RegLoad` volatile addressing.
+        for dev in &module.devices {
+            if let Some(base) = dev.base_addr {
+                self.device_bases.insert(dev.id, base);
+            }
+        }
         // 1. Cells → module globals.
         for v in &module.vars {
             let bits = store_bits(sir_bits(&v.ty));
@@ -247,6 +260,14 @@ impl LlvmBackend {
                 let v = self.emit_expr(value, bits);
                 let ptr = self.var_ptr(name, is_global);
                 self.inst(&format!("store i{} {}, ptr {}", bits, v, ptr));
+            }
+            // MMIO register field write (P3-4b) → a `volatile` store at the
+            // absolute address; a read/write field is a read-modify-write.
+            SirStmt::Assign {
+                target: SirPlace::Reg { device, reg_offset, width, field_mask, field_shift, access },
+                value,
+            } => {
+                self.emit_reg_store(*device, *reg_offset, *width, *field_mask, *field_shift, *access, value);
             }
             SirStmt::Exit(code) => {
                 if self.ret_i32 {
@@ -357,8 +378,62 @@ impl LlvmBackend {
             }
             SirExpr::Arith { width, .. } => *width as u32,
             SirExpr::Cast { to_width, .. } => *to_width as u32,
+            SirExpr::RegLoad { width, .. } => *width as u32,
             SirExpr::Now => 64,
             _ => 64,
+        }
+    }
+
+    /// A fresh `inttoptr` pointer to a device register's absolute address
+    /// (`base + offset`), or `None` if the device declares no MMIO base.
+    fn reg_ptr(&mut self, device: usize, offset: u64) -> Option<String> {
+        let base = *self.device_bases.get(&device)?;
+        let p = self.fresh();
+        self.inst(&format!("{} = inttoptr i64 {} to ptr", p, base + offset));
+        Some(p)
+    }
+
+    /// MMIO register field write (P3-4b): a `volatile` store at the absolute
+    /// address.  A read/write field is a read-modify-write (`load`; clear the
+    /// field bits; OR in `(value << shift) & mask`; `store`); a write-only /
+    /// write-1-to-clear field writes just the field with no read (mirrors the C
+    /// backend's `emit_mmio_store`).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_reg_store(
+        &mut self,
+        device: usize,
+        reg_offset: u64,
+        width: u8,
+        field_mask: u64,
+        field_shift: u8,
+        access: SirRegAccess,
+        value: &SirExpr,
+    ) {
+        let w = width as u32;
+        let v = self.emit_expr(value, w);
+        let Some(p) = self.reg_ptr(device, reg_offset) else {
+            self.inst(&format!("; unsupported: device {} has no MMIO base", device));
+            return;
+        };
+        let shifted = self.fresh();
+        self.inst(&format!("{} = shl i{} {}, {}", shifted, w, v, field_shift));
+        let field = self.fresh();
+        self.inst(&format!("{} = and i{} {}, {}", field, w, shifted, field_mask));
+        match access {
+            SirRegAccess::W1c | SirRegAccess::Wo => {
+                self.inst(&format!("store volatile i{} {}, ptr {}", w, field, p));
+            }
+            _ => {
+                let width_mask: u64 = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                let notmask = (!field_mask) & width_mask;
+                let old = self.fresh();
+                self.inst(&format!("{} = load volatile i{}, ptr {}", old, w, p));
+                let cleared = self.fresh();
+                self.inst(&format!("{} = and i{} {}, {}", cleared, w, old, notmask));
+                let newv = self.fresh();
+                self.inst(&format!("{} = or i{} {}, {}", newv, w, cleared, field));
+                self.inst(&format!("store volatile i{} {}, ptr {}", w, newv, p));
+            }
         }
     }
 
@@ -397,6 +472,26 @@ impl LlvmBackend {
                 let v = self.emit_expr(inner, nat);
                 let c = self.convert(&v, nat, *to_width as u32, *signed);
                 self.convert(&c, *to_width as u32, want, *signed)
+            }
+            // MMIO register field read (P3-4b) → a `volatile` load at the
+            // absolute address, masked + shifted to the field.
+            SirExpr::RegLoad { device, reg_offset, width, field_mask, field_shift, .. } => {
+                let w = *width as u32;
+                match self.reg_ptr(*device, *reg_offset) {
+                    Some(p) => {
+                        let raw = self.fresh();
+                        self.inst(&format!("{} = load volatile i{}, ptr {}", raw, w, p));
+                        let masked = self.fresh();
+                        self.inst(&format!("{} = and i{} {}, {}", masked, w, raw, field_mask));
+                        let val = self.fresh();
+                        self.inst(&format!("{} = lshr i{} {}, {}", val, w, masked, field_shift));
+                        self.convert(&val, w, want, false)
+                    }
+                    None => {
+                        self.inst(&format!("; unsupported: device {} has no MMIO base", device));
+                        "0".into()
+                    }
+                }
             }
             // `now()` — a monotonic counter.  Lowers to the LLVM cycle-counter
             // intrinsic (i64), never a libc `clock_gettime` (§4.5).

@@ -1228,9 +1228,15 @@ checked in §10's foreclosure audit (LLVM, FFI, multicore all remain reachable).
 > its own `void @__reaction_N` function**; statements add `If` control flow (so `match` lowers); the
 > expression set adds `Now` (→ `llvm.readcyclecounter`, never a libc clock) and signed `saturate`
 > (clamp via `ashr`). `examples/llvm_features.si` exercises `match`→`if`, `now()`, and a non-`sys.start`
-> reaction; `harness/llvm_canary.sh` `opt -verify`s it. **Remaining** for a full LLVM backend: the
-> event loop / scheduler that *calls* the reaction functions, MMIO register access (`RegLoad`/`Reg`
-> store → `volatile` — P3-4b), the yields state machine, and metal startup/linker emission (P3-4c).
+> reaction; `harness/llvm_canary.sh` `opt -verify`s it.
+>
+> **MMIO (audit P3-4b).** A `SirPlace::Reg` store / `RegLoad` lowers to a `volatile` load/store at the
+> absolute address (`base + offset`) via `inttoptr` — a rw field is a read-modify-write, a wo/w1c field
+> a direct store, a read masks + shifts the field. The same target-neutral register node the sim
+> services as a mock array and the C backend emits as a `volatile` pointer. `examples/llvm_mmio.si`;
+> `harness/llvm_canary.sh` `opt -verify`s it and `llc`s it to an object. **Remaining** for a full LLVM
+> backend: the event loop / scheduler that *calls* the reaction functions, the yields state machine,
+> and metal startup/linker emission (P3-4c).
 
 ### 6.4 Generated linker script, vector table, startup, `.data`/`.bss`
 
