@@ -1401,6 +1401,14 @@ checked in §10's foreclosure audit (LLVM, FFI, multicore all remain reachable).
 > runs `acc += 1.5; out = acc*2` on the M4F: `acc=4.5`, `out=9.0` **bit-exact** with the sim, `sim ≡
 > metal(LLVM)`. (Float comparisons, int↔float conversions, and `f64` on the single-precision M4F are
 > follow-ups; mixing int and float operands without a cast is unsupported.)
+>
+> **Metal semihosting — `host_io` (audit P6-7).** `host_io.print` now works on metal via ARM
+> semihosting: a string lowers to a NUL-terminated constant + `BKPT 0xAB` with SYS_WRITE0 (op 4 in r0,
+> the pointer in r1); a runtime value reuses the decimal itoa. Both backends emit it (LLVM as inline
+> asm, C as a `register`-pinned `bkpt 0xab`); no MMIO, no libc. `harness/semihosting.sh` captures it on
+> Renode by attaching `UART.SemihostingUart @ cpu` + `CreateFileBackend` (Renode has no
+> `EnableSemihosting` toggle — that was the earlier dead-end) and confirms the captured stream equals
+> the simulator's stdout (`n=1/n=2/n=3`), on C **and** `BUILD=llvm` — `sim ≡ metal`.
 
 ### 6.4 Generated linker script, vector table, startup, `.data`/`.bss`
 

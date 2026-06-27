@@ -1770,10 +1770,16 @@ impl LlvmBackend {
     }
 
     fn emit_intrinsic(&mut self, intr: &SirIntrinsic) {
-        // host-io is the host's macOS/arm64 syscall; on metal there is no
-        // semihosting path yet, so it is a signposted no-op (P3-4c).
+        // Metal (P6-7): host-io is ARM semihosting (BKPT 0xAB, SYS_WRITE0) — the
+        // debug console Renode captures via its SemihostingUart.  Host: the
+        // macOS/arm64 raw write syscall.
         if self.target == Target::MetalNrf52840 {
-            self.inst("; host_io unsupported on metal LLVM (no semihosting yet)");
+            match intr {
+                SirIntrinsic::HostIoPrintStr(s) => self.emit_semihost_str(s.as_bytes()),
+                SirIntrinsic::HostIoPrint(SirExpr::Bytes(b)) => self.emit_semihost_str(b),
+                SirIntrinsic::HostIoPrint(e) => self.emit_semihost_decimal(e),
+                SirIntrinsic::HostIoFlush => self.inst("; host_io.flush: semihosting writes immediately"),
+            }
             return;
         }
         match intr {
@@ -1868,6 +1874,88 @@ impl LlvmBackend {
              \"={{x0}},{{x16}},{{x0}},{{x1}},{{x2}},~{{memory}}\"(i64 4, i64 1, ptr {}, i64 {})",
             w, ptr, len
         ));
+    }
+
+    /// ARM semihosting `SYS_WRITE0` (op 0x04): write the NUL-terminated string at
+    /// `ptr` to the debug console via `BKPT 0xAB` (r0=op, r1=ptr).  No libc, no
+    /// MMIO — the host (Renode's SemihostingUart) services the breakpoint (P6-7).
+    fn emit_semihost_write0(&mut self, ptr: &str) {
+        let r = self.fresh();
+        self.inst(&format!(
+            "{} = call i32 asm sideeffect \"bkpt #0xab\", \"={{r0}},{{r0}},{{r1}},~{{memory}}\"(i32 4, ptr {})",
+            r, ptr
+        ));
+    }
+
+    /// `host_io.print("…")` on metal (P6-7): a NUL-terminated private constant +
+    /// `SYS_WRITE0` semihosting call.
+    fn emit_semihost_str(&mut self, bytes: &[u8]) {
+        let g = format!("@.shstr.{}", self.next_str);
+        self.next_str += 1;
+        let mut lit = String::new();
+        for &b in bytes {
+            write!(lit, "\\{:02X}", b).unwrap();
+        }
+        lit.push_str("\\00"); // SYS_WRITE0 needs a NUL terminator
+        self.globals.push_str(&format!(
+            "{} = private unnamed_addr constant [{} x i8] c\"{}\"\n",
+            g,
+            bytes.len() + 1,
+            lit
+        ));
+        self.emit_semihost_write0(&g);
+    }
+
+    /// `host_io.print(<value>)` on metal (P6-7): unsigned-decimal itoa into a
+    /// NUL-terminated stack buffer, then `SYS_WRITE0` — the semihosting twin of
+    /// `emit_print_decimal`, matching the sim's decimal oracle.
+    fn emit_semihost_decimal(&mut self, expr: &SirExpr) {
+        let v0 = self.emit_expr(expr, 64);
+        let tag = self.fresh_label("shdec");
+        let buf = format!("%{}.buf", tag);
+        let vslot = format!("%{}.v", tag);
+        let islot = format!("%{}.i", tag);
+        // 25 bytes: up to 20 digits + a NUL at index 24 (digits fill from index 23).
+        self.allocas.push_str(&format!("  {} = alloca [25 x i8]\n", buf));
+        self.allocas.push_str(&format!("  {} = alloca i64\n", vslot));
+        self.allocas.push_str(&format!("  {} = alloca i64\n", islot));
+        let nulp = self.fresh();
+        self.inst(&format!("{} = getelementptr [25 x i8], ptr {}, i64 0, i64 24", nulp, buf));
+        self.inst(&format!("store i8 0, ptr {}", nulp)); // NUL terminator
+        self.inst(&format!("store i64 {}, ptr {}", v0, vslot));
+        self.inst(&format!("store i64 24, ptr {}", islot));
+        let loop_l = format!("{}.loop", tag);
+        let done_l = format!("{}.done", tag);
+        self.inst(&format!("br label %{}", loop_l));
+        self.label(&loop_l);
+        let v = self.fresh();
+        self.inst(&format!("{} = load i64, ptr {}", v, vslot));
+        let i = self.fresh();
+        self.inst(&format!("{} = load i64, ptr {}", i, islot));
+        let i1 = self.fresh();
+        self.inst(&format!("{} = sub i64 {}, 1", i1, i));
+        let d = self.fresh();
+        self.inst(&format!("{} = urem i64 {}, 10", d, v));
+        let c = self.fresh();
+        self.inst(&format!("{} = add i64 {}, 48", c, d));
+        let c8 = self.fresh();
+        self.inst(&format!("{} = trunc i64 {} to i8", c8, c));
+        let slot = self.fresh();
+        self.inst(&format!("{} = getelementptr [25 x i8], ptr {}, i64 0, i64 {}", slot, buf, i1));
+        self.inst(&format!("store i8 {}, ptr {}", c8, slot));
+        let vn = self.fresh();
+        self.inst(&format!("{} = udiv i64 {}, 10", vn, v));
+        self.inst(&format!("store i64 {}, ptr {}", vn, vslot));
+        self.inst(&format!("store i64 {}, ptr {}", i1, islot));
+        let nz = self.fresh();
+        self.inst(&format!("{} = icmp ne i64 {}, 0", nz, vn));
+        self.inst(&format!("br i1 {}, label %{}, label %{}", nz, loop_l, done_l));
+        self.label(&done_l);
+        let ifin = self.fresh();
+        self.inst(&format!("{} = load i64, ptr {}", ifin, islot));
+        let ptr = self.fresh();
+        self.inst(&format!("{} = getelementptr [25 x i8], ptr {}, i64 0, i64 {}", ptr, buf, ifin));
+        self.emit_semihost_write0(&ptr);
     }
 
     // ── Expressions ─────────────────────────────────────────────────────────

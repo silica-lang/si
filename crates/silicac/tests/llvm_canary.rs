@@ -1112,3 +1112,30 @@ fn host_float_path_has_no_fpu_enable() {
     let ll = LlvmBackend::new().emit(&m);
     assert!(!ll.contains("CPACR"), "host must not emit the metal FPU enable:\n{}", ll);
 }
+
+// ─── P6-7: metal semihosting (host_io) ────────────────────────────────────────
+
+#[test]
+fn metal_host_io_uses_arm_semihosting() {
+    // On metal, host_io.print lowers to ARM semihosting: a NUL-terminated string
+    // constant + BKPT 0xAB with SYS_WRITE0 (op 4) in r0, the pointer in r1 — no
+    // MMIO, no libc.  (Renode captures it via UART.SemihostingUart, harness P6-7.)
+    let mut m = module(vec![cell("n", SirType::U32, 0)], vec![]);
+    let mut rx = reaction(vec![
+        SirStmt::Intrinsic(SirIntrinsic::HostIoPrintStr("hi".into())),
+        SirStmt::Intrinsic(SirIntrinsic::HostIoPrint(SirExpr::Load("n".into()))),
+    ]);
+    rx.id = 1;
+    rx.trigger = SirTrigger::EveryNs(100_000_000);
+    m.reactions.push(rx);
+    let ll = LlvmBackend::with_target(Target::MetalNrf52840).emit(&m);
+
+    assert!(ll.contains("bkpt #0xab"), "no semihosting breakpoint:\n{}", ll);
+    assert!(ll.contains("\"={r0},{r0},{r1},~{memory}\""), "wrong semihosting register binding:\n{}", ll);
+    // String path: NUL-terminated constant ("hi\0").
+    assert!(ll.contains("c\"\\68\\69\\00\""), "string not NUL-terminated for SYS_WRITE0:\n{}", ll);
+    // Dynamic value path reuses the decimal itoa, then SYS_WRITE0.
+    assert!(ll.contains("udiv i64") && ll.contains("urem i64"), "no decimal itoa for dynamic print:\n{}", ll);
+    assert!(!ll.contains("host_io unsupported on metal"), "metal host_io should be lowered:\n{}", ll);
+    assert_no_c_isms(&ll);
+}

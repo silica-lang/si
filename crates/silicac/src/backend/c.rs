@@ -1048,6 +1048,12 @@ impl CBackend {
     }
 
     fn emit_intrinsic(&mut self, intr: &SirIntrinsic) {
+        // Metal (P6-7): host-io is ARM semihosting (BKPT 0xAB, SYS_WRITE0) — the
+        // debug console Renode captures via its SemihostingUart.
+        if self.target == Target::MetalNrf52840 {
+            self.emit_intrinsic_metal(intr);
+            return;
+        }
         match intr {
             SirIntrinsic::HostIoPrintStr(s) => {
                 // Emit a string as a static byte array, then call __host_io_print.
@@ -1084,6 +1090,46 @@ impl CBackend {
             SirIntrinsic::HostIoFlush => {
                 self.line("fflush(stdout);");
             }
+        }
+    }
+
+    /// ARM semihosting `SYS_WRITE0` (op 0x04): write the NUL-terminated string at
+    /// `ptr_expr` via `BKPT 0xAB` (r0=op, r1=ptr).  Host (Renode's SemihostingUart)
+    /// services the breakpoint — no MMIO, no libc (P6-7).
+    fn semihost_write0(&mut self, ptr_expr: &str) {
+        self.line(&format!(
+            "{{ register int __r0 __asm__(\"r0\") = 4; register const char *__r1 __asm__(\"r1\") = (const char *)({}); __asm__ volatile(\"bkpt 0xab\" : \"+r\"(__r0) : \"r\"(__r1) : \"memory\"); }}",
+            ptr_expr
+        ));
+    }
+
+    /// Metal host-io (P6-7): `host_io.print` → semihosting.  A string/bytes literal
+    /// is a NUL-terminated C string literal; a runtime value is converted to
+    /// unsigned decimal into a NUL-terminated buffer first (matching the sim).
+    fn emit_intrinsic_metal(&mut self, intr: &SirIntrinsic) {
+        match intr {
+            SirIntrinsic::HostIoPrintStr(s) => {
+                let escaped = c_escape_bytes(s.as_bytes());
+                self.semihost_write0(&format!("\"{}\"", escaped));
+            }
+            SirIntrinsic::HostIoPrint(SirExpr::Bytes(bytes)) => {
+                let escaped = c_escape_bytes(bytes);
+                self.semihost_write0(&format!("\"{}\"", escaped));
+            }
+            SirIntrinsic::HostIoPrint(expr) => {
+                // 32-bit decimal itoa (print values are u32) with a
+                // quotient-derived remainder, so divide-by-10 lowers to a magic
+                // multiply — no 64-bit soft-divmod (__aeabi_uldivmod) that
+                // -nostdlib can't satisfy.
+                let e = self.emit_expr(expr);
+                self.line(&format!("{{ char __b[12]; int __n = 0; uint32_t __v = (uint32_t)({}); do {{ uint32_t __q = __v / 10U; __b[__n++] = (char)('0' + (__v - __q * 10U)); __v = __q; }} while (__v); char __o[13]; for (int __i = 0; __i < __n; __i++) __o[__i] = __b[__n - 1 - __i]; __o[__n] = 0;", e));
+                self.indent += 1;
+                self.semihost_write0("__o");
+                self.indent -= 1;
+                self.line("}");
+            }
+            // Semihosting writes immediately — flush is a no-op.
+            SirIntrinsic::HostIoFlush => self.line("/* host_io.flush: semihosting writes immediately */"),
         }
     }
 
