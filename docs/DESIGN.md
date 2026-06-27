@@ -1315,6 +1315,16 @@ checked in §10's foreclosure audit (LLVM, FFI, multicore all remain reachable).
 > path is unchanged (`now()` = cycle counter, trap = `llvm.trap`). `BUILD=llvm harness/overflow_trap.sh`
 > boots the LLVM firmware on Renode: the default `+` halts at the overflow (ticks froze at 4) while `+%`
 > wraps and runs every tick (10) — `sim ≡ metal(LLVM)`.
+>
+> **`poll` / `await` (audit P5-3).** The non-yielding reaction path gains a fault flow it never had on
+> the LLVM side: a reaction that can fault via a `poll`/`await` timeout gets a `%__faulted` flag and the
+> Layer-2 disposition routing (a `Retry` disposition wraps the body in a bounded re-run loop), mirroring
+> the C `emit_reaction_fn`. `poll` lowers to a bounded busy-wait (spin until the condition or the bound
+> elapses → `__faulted` → disposition); `await` to a bounded re-check with `wfi` between checks so ISRs
+> run (a full D2-style frame suspend across the await is a follow-up, as on the C path). `harness/
+> poll_await.sh` — the **first** Renode gate for these (the C path only ever validated them in sim + a
+> codegen test) — boots both, built only through LLVM: each passes when the condition is satisfied
+> (`done` advances) and faults into `skip` on timeout (`done` stays 0). `sim ≡ metal(LLVM)`.
 
 ### 6.4 Generated linker script, vector table, startup, `.data`/`.bss`
 

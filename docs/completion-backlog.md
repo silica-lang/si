@@ -447,11 +447,15 @@ implements every feature, so each gate is `sim ≡ metal(LLVM)` on Renode, the s
       (trap stays `llvm.trap`). tests/llvm_canary.rs (22, incl. host-unchanged guards) + harness/
       overflow_trap.sh gains `BUILD=llvm`. **Renode PASS** — LLVM-built `+` traps & halts (ticks froze
       at 4), `+%` wraps & runs (10); sim ≡ metal(LLVM). C path unchanged.
-- [ ] P5-3 `poll`/`await` + non-yielding fault flow (P4 follow-up) `[metal]`. PAUSE candidate.
-      Add `__faulted`/`current_disposition` + retry wrapper to the non-yielding reaction path; lower
-      `SirStmt::Poll` (bounded busy-wait) and `SirStmt::Await` (bounded recheck + wfi) with a terminal
-      disposition (mirror c.rs). Metal-observable example + new harness/poll_await.sh; PAUSE & report if
-      no metal oracle can be built.
+- [x] P5-3 `poll`/`await` + non-yielding fault flow (P4 follow-up) `[metal]` — PR #70.
+      The non-yielding reaction path gains a fault flow: a reaction that can fault via a poll/await
+      timeout gets a `%__faulted` flag + Layer-2 disposition routing (`Retry` wraps the body in a
+      bounded re-run loop), mirroring c.rs `emit_reaction_fn`. `SirStmt::Poll` → bounded busy-wait;
+      `SirStmt::Await` → bounded re-check with `wfi` between checks (full D2 frame suspend deferred, as
+      on the C path). examples/{poll,await}_nrf52840.si + tests/llvm_canary.rs (25, incl. retry wrapper
+      + busy-wait-has-no-wfi) + new harness/poll_await.sh (the FIRST Renode gate for poll/await — the C
+      path only had sim + codegen tests). **Renode PASS** — both poll & await pass when satisfied
+      (done=3) and fault→skip on timeout (done=0); sim ≡ metal(LLVM). C path unchanged.
 - [ ] P5-4 `within`-deadline + watchdog (P4 follow-up) `[metal]`. Extends P5-1's SysTick handler.
       `@__deadline_N`/`@__deadline_missed` globals; arm on the yielding trigger entry; decrement+latch
       in the SysTick handler; configure the watchdog (CR/RLR/KR, feed 0xAAAA) in reset; gate the idle
