@@ -380,8 +380,11 @@ smallest/highest-value → largest. (The first feature PR also introduces this s
       fires -> ticks freeze; with the config reaction it runs clean). NOTE: across-yield preemption of a
       shared device's proven state + the rich Layer-3 site map remain follow-ups.
 - [x] P3-4a Fuller LLVM backend — extended scalar subset (P2-1 follow-up) `[llvm]` — PR #62. `backend/llvm.rs`: `If` control flow (branches), `now()` → `llvm.readcyclecounter` (no libc), signed saturate (ashr clamp), and every non-`sys.start` reaction lowered to its own `void @__reaction_N` (no scheduler yet — P3-4c). examples/llvm_features.si + tests/llvm_canary.rs (9) + harness/llvm_canary.sh (`opt -verify` the extended IR). **LLVM 22.1.8 verify OK.**
-- [ ] P3-4b Fuller LLVM backend — MMIO register access (P2-1 follow-up) `[llvm]` — `SirPlace::Reg` store +
-      `RegLoad` -> `volatile` load/store at the absolute MMIO address. `opt -verify` + `llc` to object.
+- [x] P3-4b Fuller LLVM backend — MMIO register access (P2-1 follow-up) `[llvm]` — PR #63. `SirPlace::Reg`
+      store + `RegLoad` lower to a `volatile` load/store at `base + offset` via `inttoptr` (rw field =
+      read-modify-write; wo/w1c = direct store; read = masked + shifted). device_bases in the LLVM
+      backend. examples/llvm_mmio.si + tests/llvm_canary.rs (12) + harness/llvm_canary.sh (`opt -verify`
+      + `llc` to object). **LLVM 22.1.8 OK.**
 - [ ] P3-4c Fuller LLVM backend — yields state machine + metal startup/linker (P2-1 follow-up) `[metal]` —
       a real program links via the LLVM backend and runs on Renode (the genuine second-backend proof).
       Largest; re-implements much of the C metal backend in LLVM IR; PAUSE & report if Renode can't validate.

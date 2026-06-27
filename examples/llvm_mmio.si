@@ -1,0 +1,47 @@
+// LLVM MMIO register access (audit #35 P3-4b, DESIGN §6.2/§6.3).
+//
+// Proves the LLVM backend lowers SIR's target-neutral register node
+// (`{device, offset, mask, shift, access}`) to a `volatile` load/store at the
+// absolute MMIO address — the same node the sim services as a mock array and the
+// C backend emits as a `volatile` pointer.  A read/write field is a
+// read-modify-write; a read reads + masks + shifts.
+//
+//   silicac --emit-llvm examples/llvm_mmio.si -o mmio    # writes mmio.ll
+//   opt -passes=verify mmio.ll ; llc mmio.ll -o mmio.o   # well-formed + codegen
+
+device widget {
+  regs {
+    CTRL : reg32 at 0x00 access rw { enable: bit[0], mode: field[6:4] }
+    DATA : reg32 at 0x04 access ro {}
+  }
+  ops {
+    op configure() -> () {
+      CTRL.enable = 1        // read-modify-write a 1-bit field
+      CTRL.mode = 2          // RMW a multi-bit field (mask/shift)
+    }
+    op sample() -> u32 { return DATA }   // volatile read, masked + shifted
+  }
+}
+
+board demo {
+  soc s {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+  w : widget at 0x4000_5000
+}
+
+program app {
+  use board demo as b
+
+  let dev = b.w
+  cell last : u32 = 0
+
+  on sys.start {
+    dev.configure()      // → volatile RMW stores at 0x4000_5000
+    last = dev.sample()  // → volatile load at 0x4000_5004, masked/shifted
+  }
+}
