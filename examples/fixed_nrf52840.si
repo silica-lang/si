@@ -1,0 +1,43 @@
+// Fixed-point on the nRF52840-DK — isolates the metal LLVM fixed-point lowering
+// (audit P6-2, §4.3).  `fixed<I,F>` is integer math underneath: int↔fixed casts
+// shift the binary point (FixedCast), and mul/div rescale through a wider
+// intermediate (FixedArith).  Computed once at boot into readable cells.
+//
+//   silicac --sim                                   examples/fixed_nrf52840.si
+//   silicac --target metal-nrf52840 --emit-llvm     examples/fixed_nrf52840.si -o fixed
+//   ./harness/fixed_metal.sh                          # sim ≡ metal(LLVM) on Renode
+
+board nrf52840_dk {
+  soc nrf52840 {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+}
+
+program app {
+  use board nrf52840_dk as dev
+
+  cell n       : u32 = 0
+  cell triple  : u32 = 0        // n * 3.0
+  cell quarter : u32 = 0        // n / 4
+
+  // Runtime operands (a rolling counter) so the fixed math is genuinely computed
+  // at run time — not constant-folded — exercising the FixedCast/FixedArith
+  // lowering.  The divisor is a constant, so the 64-bit divide lowers to shifts
+  // (no libgcc), matching how the C path avoids a runtime 64-bit division.
+  every 100ms {
+    n = n + 1
+    let nf = n as fixed<16,16>          // u32 → fixed (FixedCast, << 16)
+    let p  = nf * (3 as fixed<16,16>)   // FixedArith Mul (wide intermediate, >>16)
+    triple = p as u32                   // → 3·n
+    let q  = nf / (4 as fixed<16,16>)   // FixedArith Div (constant divisor → shift)
+    quarter = q as u32                  // → n/4
+  }
+}
+
+sim app_sim for app {
+  run until 650ms                       // n reaches 6 → triple=18, quarter=1
+}

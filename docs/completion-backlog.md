@@ -479,9 +479,13 @@ Renode path can't be validated or a genuine design fork is the user's call (P6-7
       now recurses into if/critical and allocates RingPop dst. examples/ring_nrf52840.si +
       tests/llvm_canary.rs (28, repoint the unsupported-signpost test to DeviceOp) + new
       harness/ring_metal.sh. **Renode PASS** — LLVM-built ring len=4/sum=7 = sim; sim ≡ metal(LLVM).
-- [ ] P6-2 Fixed-point on the LLVM backend (`FixedArith` / `FixedCast`) `[metal]`. Mirror c.rs
-      fixmul/fixdiv (wide intermediate + div0/trap) + the cast binary-point shift. New
-      examples/fixed_nrf52840.si + harness/fixed_metal.sh + canary.
+- [x] P6-2 Fixed-point on the LLVM backend (`FixedArith` / `FixedCast`) `[metal]` — PR #73. mul/div in a
+      64-bit sign-aware intermediate + rescale by frac (mul `>>`, div `<<`-then-divide, div0 → trap),
+      overflow mode at width (trap → @__silica_overflow_trap, wrap=trunc, saturate=clamp); cast shifts
+      the binary point + narrows. Mirrors c.rs fixmul/fixdiv. Extended the arith-trap detection to
+      FixedArith. examples/fixed_nrf52840.si (runtime operand, constant divisor) + tests/llvm_canary.rs
+      (31) + harness/fixed_metal.sh (`opt -O2` folds the scale constants like the C `-Os`; runtime
+      divisor would need libgcc either way). **Renode PASS** — 3·n=18 / n÷4=1 = sim; sim ≡ metal(LLVM).
 - [ ] P6-3 LLVM HardFault fault-decoder parity (Layer-3 region map) `[metal]`. Port c.rs
       emit_fault_decoder (owner table + CFSR/BFAR decode + fault record). Reuse layer3::ownership_map +
       examples/fault_nrf52840.si + harness/fault_decode_metal.sh + canary. (Finer per-site map deferred.)
