@@ -175,6 +175,10 @@ pub struct LlvmBackend {
     /// only when a watchdog exists (the reset mechanism); the SysTick handler
     /// counts these down and the idle-loop feed is gated on none having elapsed.
     deadline_ticks: HashMap<usize, u32>,
+    /// ring name → (element bits, capacity) (P6-1).  A `ring<T,N>` cell lowers to
+    /// backing-store globals (`@__ring_<n>_buf/head/tail/count`) + index math,
+    /// mirroring the C backend's `ring_info`.
+    ring_info: HashMap<String, (u32, u32)>,
 }
 
 impl LlvmBackend {
@@ -205,6 +209,7 @@ impl LlvmBackend {
             current_disposition: None,
             retry_loop: None,
             deadline_ticks: HashMap::new(),
+            ring_info: HashMap::new(),
         }
     }
 
@@ -255,6 +260,17 @@ impl LlvmBackend {
         self.max_priority = module.reactions.iter().map(|r| r.priority).max().unwrap_or(0);
         // 1. Cells → module globals.
         for v in &module.vars {
+            // A bounded ring (§5.3, P6-1): backing array + head/tail/count globals
+            // instead of a scalar — mirrors the C `__ring_<n>_buf/head/tail/count`.
+            if let SirType::Ring { elem_bytes, cap } = v.ty {
+                let ebits = (elem_bytes as u32) * 8;
+                self.ring_info.insert(v.name.clone(), (ebits, cap));
+                self.globals.push_str(&format!(
+                    "@__ring_{n}_buf = global [{c} x i{e}] zeroinitializer\n@__ring_{n}_head = global i32 0\n@__ring_{n}_tail = global i32 0\n@__ring_{n}_count = global i32 0\n",
+                    n = v.name, c = cap.max(1), e = ebits
+                ));
+                continue;
+            }
             let bits = store_bits(sir_bits(&v.ty));
             let signed = sir_signed(&v.ty);
             self.vars.insert(v.name.clone(), (bits, signed, true));
@@ -1364,13 +1380,29 @@ impl LlvmBackend {
     /// Walk a body and `alloca` any Assign-target that is not a known global.
     fn collect_locals(&mut self, body: &[SirStmt]) {
         for stmt in body {
-            if let SirStmt::Assign { target: SirPlace::Var(name), value } = stmt {
-                if !self.vars.contains_key(name) {
-                    let bits = store_bits(self.natural_bits(value));
-                    self.vars.insert(name.clone(), (bits, false, false));
-                    self.allocas
-                        .push_str(&format!("  %{}.addr = alloca i{}\n", name, bits));
+            match stmt {
+                SirStmt::Assign { target: SirPlace::Var(name), value } => {
+                    if !self.vars.contains_key(name) {
+                        let bits = store_bits(self.natural_bits(value));
+                        self.vars.insert(name.clone(), (bits, false, false));
+                        self.allocas
+                            .push_str(&format!("  %{}.addr = alloca i{}\n", name, bits));
+                    }
                 }
+                // `let v = ring.pop()` (P6-1): the destination is a reaction-local
+                // that no Assign declares, so allocate it here (matches the C
+                // backend collecting RingPop dst as a reaction temp).
+                SirStmt::RingPop { dst, .. } => {
+                    if !self.vars.contains_key(dst) {
+                        self.vars.insert(dst.clone(), (32, false, false));
+                        self.allocas.push_str(&format!("  %{}.addr = alloca i32\n", dst));
+                    }
+                }
+                // Recurse into nested bodies so a `let`/pop inside an `if`/critical
+                // still gets an alloca (mirrors the C reaction-temp collection).
+                SirStmt::If { then, .. } => self.collect_locals(then),
+                SirStmt::Critical { body, .. } => self.collect_locals(body),
+                _ => {}
             }
         }
     }
@@ -1398,6 +1430,10 @@ impl LlvmBackend {
             SirStmt::RegWrite { device, reg_offset, width, writes } => {
                 self.emit_reg_write_multi(*device, *reg_offset, *width, writes);
             }
+            // Bounded ring push/pop (§5.3, P6-1) → backing-array + index math,
+            // mirroring the C ring lowering (overwrite-oldest on full; 0 if empty).
+            SirStmt::RingPush { ring, value } => self.emit_ring_push(ring, value),
+            SirStmt::RingPop { ring, dst } => self.emit_ring_pop(ring, dst),
             // §4.1/D07 runtime typestate guard failed (P3-3): drive the system to
             // its safe state and halt (P5-2).  Host has no safe sequence — it is a
             // signposted system-integrity fault.
@@ -1782,6 +1818,94 @@ impl LlvmBackend {
         self.functions.push_str("}\n\n");
     }
 
+    /// `ring.push(v)` (§5.3, P6-1): on a full ring overwrite the oldest, then
+    /// store at `tail` and advance.  Mirrors the C `RingPush` lowering.
+    fn emit_ring_push(&mut self, ring: &str, value: &SirExpr) {
+        let (ebits, cap) = self.ring_info.get(ring).copied().unwrap_or((32, 1));
+        let cap = cap.max(1);
+        let v = self.emit_expr(value, ebits);
+        // Evict the oldest if full: if count >= cap { head=(head+1)%cap; count-- }.
+        let cnt = self.fresh();
+        self.inst(&format!("{} = load i32, ptr @__ring_{}_count", cnt, ring));
+        let full = self.fresh();
+        self.inst(&format!("{} = icmp uge i32 {}, {}", full, cnt, cap));
+        let evict = self.fresh_label("evict");
+        let store = self.fresh_label("rstore");
+        self.inst(&format!("br i1 {}, label %{}, label %{}", full, evict, store));
+        self.label(&evict);
+        let h = self.fresh();
+        self.inst(&format!("{} = load i32, ptr @__ring_{}_head", h, ring));
+        let h2 = self.fresh();
+        self.inst(&format!("{} = add i32 {}, 1", h2, h));
+        let h3 = self.fresh();
+        self.inst(&format!("{} = urem i32 {}, {}", h3, h2, cap));
+        self.inst(&format!("store i32 {}, ptr @__ring_{}_head", h3, ring));
+        let cd = self.fresh();
+        self.inst(&format!("{} = sub i32 {}, 1", cd, cnt));
+        self.inst(&format!("store i32 {}, ptr @__ring_{}_count", cd, ring));
+        self.inst(&format!("br label %{}", store));
+        self.label(&store);
+        // buf[tail] = v; tail=(tail+1)%cap; count++.
+        let t = self.fresh();
+        self.inst(&format!("{} = load i32, ptr @__ring_{}_tail", t, ring));
+        let t64 = self.fresh();
+        self.inst(&format!("{} = zext i32 {} to i64", t64, t));
+        let slot = self.fresh();
+        self.inst(&format!("{} = getelementptr [{} x i{}], ptr @__ring_{}_buf, i64 0, i64 {}", slot, cap, ebits, ring, t64));
+        self.inst(&format!("store i{} {}, ptr {}", ebits, v, slot));
+        let t2 = self.fresh();
+        self.inst(&format!("{} = add i32 {}, 1", t2, t));
+        let t3 = self.fresh();
+        self.inst(&format!("{} = urem i32 {}, {}", t3, t2, cap));
+        self.inst(&format!("store i32 {}, ptr @__ring_{}_tail", t3, ring));
+        let cc = self.fresh();
+        self.inst(&format!("{} = load i32, ptr @__ring_{}_count", cc, ring));
+        let cc1 = self.fresh();
+        self.inst(&format!("{} = add i32 {}, 1", cc1, cc));
+        self.inst(&format!("store i32 {}, ptr @__ring_{}_count", cc1, ring));
+    }
+
+    /// `let d = ring.pop()` (§5.3, P6-1): dequeue the oldest into `dst`, or 0 if
+    /// empty.  Mirrors the C `RingPop` lowering.
+    fn emit_ring_pop(&mut self, ring: &str, dst: &str) {
+        let (ebits, cap) = self.ring_info.get(ring).copied().unwrap_or((32, 1));
+        let cap = cap.max(1);
+        let (dbits, _signed, dglobal) = self.vars.get(dst).copied().unwrap_or((32, false, false));
+        let dptr = self.var_ptr(dst, dglobal);
+        let cnt = self.fresh();
+        self.inst(&format!("{} = load i32, ptr @__ring_{}_count", cnt, ring));
+        let ne = self.fresh();
+        self.inst(&format!("{} = icmp ugt i32 {}, 0", ne, cnt));
+        let pop = self.fresh_label("rpop");
+        let empty = self.fresh_label("rempty");
+        let done = self.fresh_label("rpdone");
+        self.inst(&format!("br i1 {}, label %{}, label %{}", ne, pop, empty));
+        self.label(&pop);
+        let h = self.fresh();
+        self.inst(&format!("{} = load i32, ptr @__ring_{}_head", h, ring));
+        let h64 = self.fresh();
+        self.inst(&format!("{} = zext i32 {} to i64", h64, h));
+        let slot = self.fresh();
+        self.inst(&format!("{} = getelementptr [{} x i{}], ptr @__ring_{}_buf, i64 0, i64 {}", slot, cap, ebits, ring, h64));
+        let val = self.fresh();
+        self.inst(&format!("{} = load i{}, ptr {}", val, ebits, slot));
+        let conv = self.convert(&val, ebits, dbits, false);
+        self.inst(&format!("store i{} {}, ptr {}", dbits, conv, dptr));
+        let h2 = self.fresh();
+        self.inst(&format!("{} = add i32 {}, 1", h2, h));
+        let h3 = self.fresh();
+        self.inst(&format!("{} = urem i32 {}, {}", h3, h2, cap));
+        self.inst(&format!("store i32 {}, ptr @__ring_{}_head", h3, ring));
+        let cd = self.fresh();
+        self.inst(&format!("{} = sub i32 {}, 1", cd, cnt));
+        self.inst(&format!("store i32 {}, ptr @__ring_{}_count", cd, ring));
+        self.inst(&format!("br label %{}", done));
+        self.label(&empty);
+        self.inst(&format!("store i{} 0, ptr {}", dbits, dptr));
+        self.inst(&format!("br label %{}", done));
+        self.label(&done);
+    }
+
     /// Emit `e` as an operand of exactly `want` bits, inserting conversions.
     fn emit_expr(&mut self, e: &SirExpr, want: u32) -> String {
         match e {
@@ -1852,6 +1976,27 @@ impl LlvmBackend {
                     self.inst(&format!("{} = call i64 @llvm.readcyclecounter()", t));
                     self.convert(&t, 64, want, false)
                 }
+            }
+            // Bounded-ring reads (§5.3, P6-1): count / count==0 / count>=cap.
+            SirExpr::RingLen(r) => {
+                let t = self.fresh();
+                self.inst(&format!("{} = load i32, ptr @__ring_{}_count", t, r));
+                self.convert(&t, 32, want, false)
+            }
+            SirExpr::RingEmpty(r) => {
+                let c = self.fresh();
+                self.inst(&format!("{} = load i32, ptr @__ring_{}_count", c, r));
+                let t = self.fresh();
+                self.inst(&format!("{} = icmp eq i32 {}, 0", t, c));
+                self.convert(&t, 1, want, false)
+            }
+            SirExpr::RingFull(r) => {
+                let cap = self.ring_info.get(r).map(|(_, c)| *c).unwrap_or(1).max(1);
+                let c = self.fresh();
+                self.inst(&format!("{} = load i32, ptr @__ring_{}_count", c, r));
+                let t = self.fresh();
+                self.inst(&format!("{} = icmp uge i32 {}, {}", t, c, cap));
+                self.convert(&t, 1, want, false)
             }
             other => {
                 self.inst(&format!("; unsupported expr in llvm canary: {}", expr_kind(other)));

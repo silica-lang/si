@@ -1339,6 +1339,13 @@ checked in §10's foreclosure audit (LLVM, FFI, multicore all remain reachable).
 > `BUILD=llvm harness/watchdog_reset.sh` (a wedged bus → the mock WDT fires; a healthy one → fed) both
 > pass on Renode. **Every remaining runtime feature now runs on metal built only through the LLVM
 > backend, matching the simulator** — the metal LLVM runtime is complete.
+>
+> **Rings (audit P6-1).** Closing the LLVM language-parity gaps (Cluster P6) beyond the runtime. A
+> `ring<T,N>` cell now lowers (was `; unsupported`) to backing-store globals — `@__ring_<n>_buf` =
+> `[N x iW]` + `@__ring_<n>_head/_tail/_count` — with push/pop/len as index arithmetic (overwrite-oldest
+> on full, 0 on empty), mirroring the C `__ring_<n>_*` lowering. `harness/ring_metal.sh` boots an
+> LLVM-built producer that fills a cap-4 ring past capacity then drains it: the observable cells
+> (`len`=4, `sum`=7) match the simulator — `sim ≡ metal(LLVM)`.
 
 ### 6.4 Generated linker script, vector table, startup, `.data`/`.bss`
 
