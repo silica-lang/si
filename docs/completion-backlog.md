@@ -320,10 +320,21 @@ more expressive (persistent typestate + match-over-fault-codes). Plan:
       textual LLVM IR for a SIR subset (sys.start, cell assigns, integer Arith via
       `llvm.*.with.overflow`+`llvm.trap`, exit, host-io) with NO libc/`__builtin`; `--emit-llvm` flag;
       hermetic test + harness/llvm_canary.sh (`llvm-as`/`opt -verify` + run). Validates risk #2.
-- [ ] P2-4 `match` over an op's fault codes (audit #10b, full sim+metal) `[metal]` — `MatchPat::Ok/Fault`,
-      parse `ok`/`fault <code>` arms; new SIR fault-or-value result; exhaustiveness vs
-      `op.ret.fault_codes`; sim + metal (yields state machine). Largest/riskiest. tests/match_stmt.rs +
-      Renode. (PAUSE & report if metal can't be validated.)
+- [x] P2-4 `match` over an op's fault codes (audit #10b, full sim+metal) `[metal]` — PR #57.
+      `MatchPat::Ok(Option<Ident>)`/`Fault(Ident)`; parse `ok`/`ok v`/`fault <code>` arms. The op runs
+      without propagating; `BusXfer` gains `code_dst` (the outcome code index: `0` = ok, `1+i` = the
+      i-th declared fault code). Resolver `lower_result_match` enforces **exhaustiveness vs
+      `op.ret.fault_codes`** (every declared code + `ok`, or a `_`), rejects undeclared/duplicate
+      codes and a `?` scrutinee; bounded to a primitive (yielding) bus op. Sim maps an injected
+      `bus_fault <code>` → arm; metal decodes the controller's named SR error bits (nak=0x2,
+      arblost=0x4, timeout=0x8 — by NAME, not declaration order) → same arm via the yields state
+      machine. examples/fault_match.si + tests/match_stmt.rs (7 new) + harness/fault_match.sh.
+      **Renode: PASS** — fresh-boot per outcome gives a clean identity matrix (ok→reads, nak→naks,
+      timeout→timeouts, arblost→arblosts, no cross-talk); bus_parity.sh still PASS (no regression).
+      NOTE: a yielding `every` reaction's *multi-fire* re-arm on metal is a pre-existing, orthogonal
+      limitation (the 2nd transaction's completion IRQ lands pending-but-masked) — the gate validates
+      the decode on each reaction's first fire; multi-fire re-arm + match over a composed op are
+      follow-ups.
 
 ## Completed log
 _(append `item — PR #NN — date` here as items land)_

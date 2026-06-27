@@ -40,6 +40,13 @@ namespace Antmicro.Renode.Peripherals.Mocks
         // priority reaction to run during the suspension.
         public ulong LatencyMicroseconds { get; set; } = 5000;
 
+        // Fault injection for the `match`-over-fault-codes gate (harness/
+        // fault_match.sh, §4.4/D14): when nonzero, the next completion sets these
+        // SR error bits instead of SR.done — modelling a real bus error
+        // (nak=0x2, arblost=0x4, timeout=0x8, per std/i2c_controller.si).  The
+        // firmware's resumed transaction decodes them into the matching arm.
+        public uint FaultBits { get; set; } = 0;
+
         public void Reset()
         {
             cr = sr = sa = ra = dr = 0;
@@ -79,10 +86,19 @@ namespace Antmicro.Renode.Peripherals.Mocks
 
         private void Complete()
         {
-            dr = 0x42;       // fixed read data (value is irrelevant to the parity check)
-            sr = SR_DONE;    // SR.done, no error bits
-            IRQ.Set();       // raise the completion IRQ → firmware resumes the owner
-            this.Log(LogLevel.Noisy, "transfer complete, IRQ raised");
+            if(FaultBits != 0)
+            {
+                dr = 0;
+                sr = FaultBits;  // error completion (no SR.done) → firmware decodes the fault code
+                this.Log(LogLevel.Noisy, "transfer FAULTED (SR=0x{0:X}), IRQ raised", FaultBits);
+            }
+            else
+            {
+                dr = 0x42;       // fixed read data (value is irrelevant to the parity check)
+                sr = SR_DONE;    // SR.done, no error bits
+                this.Log(LogLevel.Noisy, "transfer complete, IRQ raised");
+            }
+            IRQ.Set();           // raise the completion IRQ → firmware resumes the owner
         }
 
         private readonly IMachine machine;

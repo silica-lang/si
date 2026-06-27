@@ -160,6 +160,11 @@ pub struct Resolver {
     /// re-entry of the same entry is recursion, which is banned (§5.3/SIL-005)
     /// and would also hang the inliner.
     inlining: Vec<(usize, String)>,
+    /// Set by `lower_result_match` just before lowering a `match`-scrutinee bus
+    /// op-call: the local the `BusXfer` should bind its outcome **code index**
+    /// to (§4.4/D14).  `lower_op_call` `take()`s it onto the emitted `BusXfer`'s
+    /// `code_dst`, so the match reuses all of `lower_op_call`'s checks.
+    pending_match_code: Option<String>,
 
     // ── output accumulators ──
     devices: Vec<SirDevice>,
@@ -215,6 +220,7 @@ impl Resolver {
             op_result: Vec::new(),
             device_states: HashMap::new(),
             inlining: Vec::new(),
+            pending_match_code: None,
             devices: Vec::new(),
             events: Vec::new(),
             cells: Vec::new(),
@@ -1485,6 +1491,15 @@ impl Resolver {
         vars: &[SirVar],
         out: &mut Vec<SirStmt>,
     ) {
+        // An `ok`/`fault` arm makes this a match over an op's *result* (§4.4/D14),
+        // dispatched on the outcome code rather than the scrutinee's value.
+        let is_result_match =
+            arms.iter().any(|a| matches!(a.pattern, MatchPat::Ok(_) | MatchPat::Fault(_)));
+        if is_result_match {
+            self.lower_result_match(scrutinee, arms, span, scope, vars, out);
+            return;
+        }
+
         let wild_count = arms.iter().filter(|a| matches!(a.pattern, MatchPat::Wild)).count();
         if wild_count == 0 {
             self.err(span, "a `match` must be exhaustive — add a `_` arm (§4.4/D14)");
@@ -1524,6 +1539,11 @@ impl Resolver {
                     });
                     out.push(SirStmt::If { cond, then });
                 }
+                // `ok`/`fault` arms route to `lower_result_match`, so they never
+                // reach the value-match path (guarded by `is_result_match`).
+                MatchPat::Ok(_) | MatchPat::Fault(_) => {
+                    self.err(arm.span, "`ok`/`fault` arms are only valid in a `match` over an op's result (§4.4/D14)");
+                }
             }
         }
         if let Some(arm) = wildcard {
@@ -1535,6 +1555,157 @@ impl Resolver {
             );
             out.push(SirStmt::If { cond, then });
         }
+    }
+
+    /// Lower `match <dev>.<op>(…) { ok [v] => …, fault <code> => …, … }` (§4.4/D14):
+    /// a `match` over an op's **result**, dispatched on the outcome code rather
+    /// than a value.  The op runs without propagating (`?`); the resumed
+    /// transaction binds an outcome code index (`0` = ok, `1 + i` = the i-th
+    /// declared fault code) which the lowered if-chain dispatches on.  Enforced
+    /// **exhaustive**: every declared fault code (and `ok`) must be covered, or a
+    /// `_` wildcard supplied.
+    fn lower_result_match(
+        &mut self,
+        scrutinee: &Expr,
+        arms: &[MatchArm],
+        span: Span,
+        scope: &mut Scope,
+        vars: &[SirVar],
+        out: &mut Vec<SirStmt>,
+    ) {
+        // The scrutinee must be a direct device-op call (no `?` — the match
+        // handles faults itself).
+        if matches!(scrutinee.kind, ExprKind::Try(_)) {
+            self.err(span, "drop the `?` — a `match` over an op result handles its faults (§4.4/D14)");
+        }
+        let Some((_inst, op)) = self.resolve_op_call(scrutinee, scope) else {
+            self.err(span, "a `match` with `ok`/`fault` arms requires a device-op call as its scrutinee (§4.4/D14)");
+            return;
+        };
+        // Bound to the keystone primitive bus op (empty body + `yields`) so the
+        // outcome flows through the one BusXfer the metal state machine resumes.
+        if !(op.body.stmts.is_empty() && op.yields) {
+            self.err(span, format!("`match` over the result of '{}' is not supported — only a primitive (yielding) bus op carries a matchable fault outcome (§4.4/D14)", op.name.name));
+            return;
+        }
+        let fault_codes: Vec<String> = op.ret.fault_codes.iter().map(|c| c.name.clone()).collect();
+        if fault_codes.is_empty() {
+            self.err(span, format!("op '{}' declares no fault codes — there is nothing to `match` (use a plain call) (§4.4/D14)", op.name.name));
+        }
+
+        // Lower the scrutinee op-call, capturing its outcome code into a temp.
+        // `lower_op_call` attaches `pending_match_code` to the emitted BusXfer.
+        let code = self.fresh("code");
+        self.pending_match_code = Some(code.clone());
+        let val = self.lower_expr_emit(scrutinee, scope, vars, out);
+        // If the op-call didn't consume it (shouldn't happen — we checked it is a
+        // primitive bus op), clear it so it can't leak onto a later transaction.
+        self.pending_match_code = None;
+        let value_tmp = self.fresh("okval");
+        out.push(SirStmt::Assign { target: SirPlace::Var(value_tmp.clone()), value: val });
+
+        let matched = self.fresh("matched");
+        out.push(SirStmt::Assign { target: SirPlace::Var(matched.clone()), value: SirExpr::U64(0) });
+
+        // Exhaustiveness bookkeeping: every declared code + `ok` must be covered.
+        let mut covered_ok = false;
+        let mut covered: Vec<String> = Vec::new();
+        let mut wildcard: Option<&MatchArm> = None;
+
+        for arm in arms {
+            match &arm.pattern {
+                MatchPat::Wild => {
+                    if wildcard.is_some() {
+                        self.err(arm.span, "a `match` has more than one `_` arm");
+                    }
+                    wildcard = Some(arm);
+                }
+                MatchPat::Ok(bind) => {
+                    if covered_ok {
+                        self.err(arm.span, "duplicate `ok` arm");
+                    }
+                    covered_ok = true;
+                    // Bind the returned value (if named) for this arm body only,
+                    // then restore the prior binding (Scope is a flat table).
+                    let saved = bind.as_ref().and_then(|n| scope.lookup(&n.name).cloned().map(|b| (n.name.clone(), b)));
+                    let bound_name = bind.as_ref().map(|n| n.name.clone());
+                    if let Some(name) = &bound_name {
+                        scope.insert(name, Binding::Local(value_tmp.clone(), resolve_type_expr(&op.ret.ty)));
+                    }
+                    let cond = SirExpr::BinOp(
+                        SirBinOp::EqEq,
+                        Box::new(SirExpr::Load(code.clone())),
+                        Box::new(SirExpr::U64(0)),
+                    );
+                    let mut then = self.lower_block(&arm.body, scope, vars);
+                    then.push(SirStmt::Assign { target: SirPlace::Var(matched.clone()), value: SirExpr::U64(1) });
+                    out.push(SirStmt::If { cond, then });
+                    // Restore: put back the shadowed binding, or remove ours.
+                    if let Some((name, b)) = saved {
+                        scope.insert(&name, b);
+                    } else if let Some(name) = bound_name {
+                        scope.bindings.remove(&name);
+                    }
+                }
+                MatchPat::Fault(name) => {
+                    let Some(idx) = fault_codes.iter().position(|c| c == &name.name) else {
+                        self.err(name.span, format!("op '{}' cannot raise fault '{}' (declared: {}) (§4.4/D14)", op.name.name, name.name, fault_codes.join(", ")));
+                        continue;
+                    };
+                    if covered.contains(&name.name) {
+                        self.err(arm.span, format!("duplicate `fault {}` arm", name.name));
+                    }
+                    covered.push(name.name.clone());
+                    let cond = SirExpr::BinOp(
+                        SirBinOp::EqEq,
+                        Box::new(SirExpr::Load(code.clone())),
+                        Box::new(SirExpr::U64((idx + 1) as u64)),
+                    );
+                    let mut then = self.lower_block(&arm.body, scope, vars);
+                    then.push(SirStmt::Assign { target: SirPlace::Var(matched.clone()), value: SirExpr::U64(1) });
+                    out.push(SirStmt::If { cond, then });
+                }
+                MatchPat::Lit(_) => {
+                    self.err(arm.span, "a `match` over an op result takes `ok`/`fault`/`_` arms, not literal patterns (§4.4/D14)");
+                }
+            }
+        }
+
+        // Exhaustiveness: with no `_`, `ok` and every declared fault must appear.
+        if wildcard.is_none() {
+            let mut missing: Vec<String> = Vec::new();
+            if !covered_ok {
+                missing.push("ok".into());
+            }
+            for c in &fault_codes {
+                if !covered.contains(c) {
+                    missing.push(format!("fault {c}"));
+                }
+            }
+            if !missing.is_empty() {
+                self.err(span, format!("non-exhaustive `match` over op result — add {} (or a `_` arm) (§4.4/D14)", missing.join(", ")));
+            }
+        }
+        if let Some(arm) = wildcard {
+            let then = self.lower_block(&arm.body, scope, vars);
+            let cond = SirExpr::BinOp(
+                SirBinOp::EqEq,
+                Box::new(SirExpr::Load(matched.clone())),
+                Box::new(SirExpr::U64(0)),
+            );
+            out.push(SirStmt::If { cond, then });
+        }
+    }
+
+    /// If `expr` is a direct device-instance op call (`<dev>.<op>(…)`), resolve
+    /// and return the instance + op declaration.  Used by `lower_result_match`.
+    fn resolve_op_call(&self, expr: &Expr, scope: &Scope) -> Option<(InstanceRef, OpDecl)> {
+        let ExprKind::Call { callee, .. } = &expr.kind else { return None };
+        let ExprKind::Field(dev_expr, method) = &callee.kind else { return None };
+        let root = expr_root_ident(dev_expr)?;
+        let Some(Binding::Device(inst)) = scope.lookup(root).cloned() else { return None };
+        let op = self.find_op(&inst.ty, &method.name).cloned()?;
+        Some((inst, op))
     }
 
     /// Recursively compute an expression's time-logical kind (§4.5), emitting an
@@ -2063,6 +2234,7 @@ impl Resolver {
                 dst: dst.clone(),
                 propagate,
                 fault_codes,
+                code_dst: self.pending_match_code.take(),
             });
             return SirExpr::Load(dst);
         }

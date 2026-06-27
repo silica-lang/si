@@ -83,3 +83,138 @@ fn metal_lowers_match_to_an_if_chain() {
     assert!(out.contains("__match"), "match temp:\n{}", out);
     assert!(out.contains("__matched"), "matched flag:\n{}", out);
 }
+
+// ─── `match` over an op's fault codes (§4.4/D14, audit #35 P2-4) ──────────────
+
+/// An inline bus controller with a primitive (yielding) fault-returning op, plus
+/// a board instance — the std-less fixture for result-match tests.
+const CTRL: &str = r#"
+device busctl {
+  regs {
+    CR : reg32 at 0x00 access rw { start: bit[0], dir: bit[1] }
+    SR : reg32 at 0x04 access ro { done: bit[0], nak: bit[1], arblost: bit[2], timeout: bit[3] }
+    SA : reg32 at 0x08 access rw {}
+    RA : reg32 at 0x0C access rw {}
+    DR : reg32 at 0x10 access rw {}
+  }
+  ops {
+    op read_reg(addr: u32, reg: u32) -> u32 or fault{nak, timeout, arblost} yields
+  }
+}
+board demo {
+  soc s { memory { flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K } clocks { sysclk : clock_source = 64MHz } }
+  i2c0 : busctl at 0x4000_3000
+}
+"#;
+
+/// A program whose `every 1000ms` body is a result-match with the given `arms`,
+/// plus a `sim` block carrying `inject`s.  Cells `reads/naks/timeouts/arblosts/
+/// last` record which arm fired.
+fn rprogram(arms: &str, injects: &str) -> String {
+    format!(
+        "{CTRL}\nprogram app {{\n  use board demo as b\n  let bus = b.i2c0\n  \
+         cell reads : u32 = 0\n  cell naks : u32 = 0\n  cell timeouts : u32 = 0\n  \
+         cell arblosts : u32 = 0\n  cell last : u32 = 0\n  \
+         every 1000ms {{\n    match bus.read_reg(0x40, 0x00) {{\n{arms}\n    }}\n  }}\n}}\n\
+         sim app_sim for app {{ {injects} run until 3500ms }}\n"
+    )
+}
+
+const ALL_ARMS: &str = "      ok v          => { reads = reads + 1  last = v }\n      \
+                         fault nak     => { naks = naks + 1 }\n      \
+                         fault timeout => { timeouts = timeouts + 1 }\n      \
+                         fault arblost => { arblosts = arblosts + 1 }";
+
+#[test]
+fn result_match_dispatches_ok_and_each_fault_code() {
+    // Inject nak then timeout; the 3rd transaction drains the queue → ok.
+    let t = trace(&rprogram(
+        ALL_ARMS,
+        "inject bus_fault nak times 1  inject bus_fault timeout times 1",
+    ));
+    let joined = t.join("\n");
+    assert!(t.iter().any(|l| l.contains("cell naks = 1")), "nak arm:\n{joined}");
+    assert!(t.iter().any(|l| l.contains("cell timeouts = 1")), "timeout arm:\n{joined}");
+    assert!(t.iter().any(|l| l.contains("cell reads = 1")), "ok arm:\n{joined}");
+    // The `ok v` binding captured the bus value.
+    assert!(t.iter().any(|l| l.contains("cell last = ")), "ok binding:\n{joined}");
+    // arblost was never injected, so its arm never ran.
+    assert!(!t.iter().any(|l| l.contains("cell arblosts = 1")), "arblost should not fire:\n{joined}");
+}
+
+#[test]
+fn a_non_exhaustive_result_match_is_rejected() {
+    // Missing `fault arblost` and no `_`.
+    let errs = resolve_err(&rprogram(
+        "      ok            => { reads = reads + 1 }\n      \
+         fault nak     => { naks = naks + 1 }\n      \
+         fault timeout => { timeouts = timeouts + 1 }",
+        "",
+    ));
+    assert!(
+        errs.iter().any(|m| m.contains("non-exhaustive") && m.contains("arblost")),
+        "errs: {:?}",
+        errs
+    );
+}
+
+#[test]
+fn a_wildcard_makes_a_result_match_exhaustive() {
+    // `_` covers the un-listed fault codes — must compile.
+    let _ = compile(&rprogram(
+        "      ok            => { reads = reads + 1 }\n      \
+         fault nak     => { naks = naks + 1 }\n      _ => { timeouts = timeouts + 1 }",
+        "",
+    ));
+}
+
+#[test]
+fn an_undeclared_fault_code_is_rejected() {
+    let errs = resolve_err(&rprogram(
+        "      ok            => { reads = reads + 1 }\n      \
+         fault nak     => { naks = naks + 1 }\n      \
+         fault timeout => { timeouts = timeouts + 1 }\n      \
+         fault bogus   => { arblosts = arblosts + 1 }",
+        "",
+    ));
+    assert!(
+        errs.iter().any(|m| m.contains("cannot raise fault 'bogus'")),
+        "errs: {:?}",
+        errs
+    );
+}
+
+#[test]
+fn a_question_mark_scrutinee_is_rejected() {
+    let errs = resolve_err(&rprogram(
+        &ALL_ARMS.replace("bus.read_reg", "bus.read_reg"), // arms unchanged
+        "",
+    ).replace("match bus.read_reg(0x40, 0x00)", "match bus.read_reg(0x40, 0x00)?"));
+    assert!(errs.iter().any(|m| m.contains("drop the `?`")), "errs: {:?}", errs);
+}
+
+#[test]
+fn a_duplicate_fault_arm_is_rejected() {
+    let errs = resolve_err(&rprogram(
+        "      ok            => { reads = reads + 1 }\n      \
+         fault nak     => { naks = naks + 1 }\n      \
+         fault nak     => { naks = naks + 2 }\n      _ => { timeouts = timeouts + 1 }",
+        "",
+    ));
+    assert!(errs.iter().any(|m| m.contains("duplicate `fault nak`")), "errs: {:?}", errs);
+}
+
+#[test]
+fn metal_decodes_each_fault_code_from_the_sr_bits() {
+    let sir = compile(&rprogram(ALL_ARMS, ""));
+    let out = c::CBackend::with_target(Target::MetalNrf52840).emit(&sir);
+    // The resumed transaction decodes the outcome for the match (not a dispose).
+    assert!(out.contains("decode outcome for `match`"), "missing match decode:\n{}", out);
+    // Each declared fault code maps to its named SR bit: nak=0x2, arblost=0x4,
+    // timeout=0x8.
+    assert!(out.contains("& 0x2U") && out.contains("/* fault nak */"), "nak bit:\n{}", out);
+    assert!(out.contains("& 0x8U") && out.contains("/* fault timeout */"), "timeout bit:\n{}", out);
+    assert!(out.contains("& 0x4U") && out.contains("/* fault arblost */"), "arblost bit:\n{}", out);
+    // The if-chain dispatches on the decoded code.
+    assert!(out.contains("__matched"), "match dispatch:\n{}", out);
+}

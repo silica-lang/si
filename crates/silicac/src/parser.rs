@@ -1545,10 +1545,24 @@ impl Parser {
                 return Err(self.error("unexpected EOF in match"));
             }
             let arm_start = self.current_span().start;
-            // Pattern: `_` wildcard, or a literal expression.
+            // Pattern: `_` wildcard, `ok`/`ok <name>`, `fault <code>`, or a
+            // literal expression (§4.4/D14).
             let pattern = if matches!(self.peek(), Some(Token::Ident(s)) if s == "_") {
                 self.advance();
                 MatchPat::Wild
+            } else if matches!(self.peek(), Some(Token::Ident(s)) if s == "ok") {
+                self.advance();
+                // `ok` alone, or `ok <name>` binding the returned value.
+                let bind = if let Some(Token::Ident(_)) = self.peek() {
+                    Some(self.eat_ident()?)
+                } else {
+                    None
+                };
+                MatchPat::Ok(bind)
+            } else if self.peek() == Some(&Token::KwFault) {
+                self.advance();
+                let code = self.eat_ident()?;
+                MatchPat::Fault(code)
             } else {
                 MatchPat::Lit(self.parse_or()?)
             };

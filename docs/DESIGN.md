@@ -769,13 +769,23 @@ embedded systems routinely depends on *which* failure occurred — `timeout` vs 
 vs `overflow` vs a `when`-precondition violation — so the codes are first-class to docs, tools, and
 disposition validation, while the value stays one regular shape to handle.
 
-> **Status (implemented — `match` + totality).** The `match` statement is built as the surface
-> conditional (`match <expr> { <lit> => …, _ => … }`, lowered to a guarded if-chain over existing
-> `SirStmt::If`). Matching is enforced **total**: a `_` wildcard arm is required (else a compile
-> error) and duplicate literal arms are rejected — the "completeness, no silent fall-through"
-> discipline D14 asks for, applied to value matching. **Remaining:** patterns are integer/bool
-> literals only; `ok`/`fault f` op-result patterns and exhaustiveness against an op's *declared fault
-> codes* (the `match usart2.write(b)` form above) build on this and are not yet wired.
+> **Status (implemented — `match` + totality, incl. match over fault codes).** The `match` statement
+> is the surface conditional (`match <expr> { <lit> => …, _ => … }`, lowered to a guarded if-chain
+> over `SirStmt::If`); value matching is enforced **total** (a `_` arm is required; duplicate literal
+> arms rejected).
+>
+> **Match over an op's result is now built (audit #35 P2-4).** `match dev.op() { ok v => …, fault
+> <code> => …, … }` (the `match usart2.write(b)` form above) runs the op *without* propagating; the
+> resolver checks **exhaustiveness against the op's declared fault codes** — every `fault <code>` must
+> name a declared code, and `ok` + every declared code must be covered (or a `_` supplied). The
+> outcome flows through ONE `BusXfer` (`code_dst`: `0` = ok, `1 + i` = the i-th declared fault code),
+> dispatched by the if-chain on both consumers: the **sim** maps an injected `bus_fault <code>` to the
+> arm; **metal** decodes the controller's named SR error bits (nak/arblost/timeout) into the same arm
+> — `harness/fault_match.sh` is the Renode parity gate (every code → its own arm, no cross-talk).
+> examples/fault_match.si, tests/match_stmt.rs. **Remaining:** value patterns are integer/bool only;
+> `match` over a *composed* (inlined, multi-transaction) op's result builds on the single-BusXfer case
+> here; and a yielding `every` reaction's multi-fire re-arm on metal (orthogonal to the decode) is a
+> separate follow-up.
 
 **Layer 2 — propagation through the reactive model: fault disposition.** Fallibility composes
 *within* a handler (via `?`), but a handler has **no caller to unwind to** — it was invoked by an

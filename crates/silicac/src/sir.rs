@@ -301,6 +301,13 @@ pub enum SirStmt {
         propagate: bool,
         /// Fault codes the op declares it can raise (§4.4/D14).
         fault_codes: Vec<String>,
+        /// When `Some`, this transaction is the scrutinee of a `match` over its
+        /// result (§4.4/D14): instead of disposing/swallowing a fault, the
+        /// resume binds an **outcome code index** into this local — `0` = `ok`,
+        /// `1 + i` = the i-th entry of `fault_codes` — for the following
+        /// `match` if-chain to dispatch on.  `None` = the ordinary `?`/swallow
+        /// transaction.
+        code_dst: Option<String>,
     },
 }
 

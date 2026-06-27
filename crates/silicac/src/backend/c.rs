@@ -464,17 +464,28 @@ impl CBackend {
             // A resumed segment first reads the prior transaction's result and,
             // on a propagated fault, applies the Layer-2 disposition.
             if i >= 1 {
-                if let Some(SirStmt::BusXfer { device, op, dst, propagate, .. }) = segs[i - 1].1 {
+                if let Some(SirStmt::BusXfer { device, op, dst, propagate, code_dst, fault_codes, .. }) = segs[i - 1].1 {
                     let dref = self.var_ref(dst);
-                    for l in self.emit_bus_resume_metal(*device, op, &dref, &frame) {
-                        self.line(&l);
-                    }
-                    if *propagate {
-                        self.line(&format!("if ({}.__faulted) {{", frame));
-                        self.indent += 1;
-                        self.emit_disposition_frame(reaction.disposition, &frame, n);
-                        self.indent -= 1;
-                        self.line("}");
+                    if let Some(code) = code_dst {
+                        // `match` over the result (§4.4/D14): decode the outcome
+                        // into the frame's code var; the following match if-chain
+                        // dispatches on it — no disposition here (every outcome,
+                        // including each fault, is handled by an arm or `_`).
+                        let cref = self.var_ref(code);
+                        for l in self.emit_bus_resume_match_metal(*device, op, &dref, &cref, fault_codes, &frame) {
+                            self.line(&l);
+                        }
+                    } else {
+                        for l in self.emit_bus_resume_metal(*device, op, &dref, &frame) {
+                            self.line(&l);
+                        }
+                        if *propagate {
+                            self.line(&format!("if ({}.__faulted) {{", frame));
+                            self.indent += 1;
+                            self.emit_disposition_frame(reaction.disposition, &frame, n);
+                            self.indent -= 1;
+                            self.line("}");
+                        }
                     }
                 }
             }
@@ -581,7 +592,12 @@ impl CBackend {
             match stmt {
                 SirStmt::Assign { target: SirPlace::Var(name), .. } => self.add_temp(name, seen, out),
                 SirStmt::RingPop { dst, .. } => self.add_temp(dst, seen, out),
-                SirStmt::BusXfer { dst, .. } => self.add_temp(dst, seen, out),
+                SirStmt::BusXfer { dst, code_dst, .. } => {
+                    self.add_temp(dst, seen, out);
+                    if let Some(code) = code_dst {
+                        self.add_temp(code, seen, out);
+                    }
+                }
                 SirStmt::If { then, .. } => self.collect_temps_in(then, seen, out),
                 SirStmt::Critical { body, .. } => self.collect_temps_in(body, seen, out),
                 _ => {}
@@ -667,6 +683,52 @@ impl CBackend {
                 dst, frame
             ));
         }
+        out.push("}".into());
+        out
+    }
+
+    /// Decode a completed transaction into an **outcome code** for a `match` over
+    /// the result (§4.4/D14): `code = 0` on success (`dst` ← DR for reads, else
+    /// 0), or `code = 1 + i` where `i` is the position of the matching declared
+    /// fault code in `fault_codes`, decoded from the SR error bits (nak/arblost/
+    /// timeout) — the named SR fields of `std/i2c_controller.si`.  The following
+    /// match if-chain dispatches on `code`.  Mirrors the sim's outcome mapping.
+    fn emit_bus_resume_match_metal(
+        &self,
+        device: usize,
+        op: &str,
+        dst: &str,
+        code: &str,
+        fault_codes: &[String],
+        _frame: &str,
+    ) -> Vec<String> {
+        let (_cr, sr, _sa, _ra, dr) = match self.bus_regs_metal(device) {
+            Ok(t) => t,
+            Err(e) => return vec![e],
+        };
+        let is_read = op == "read_reg";
+        let mut out = vec!["{ /* bus completion: decode outcome for `match` (§4.4/D14) */".into()];
+        out.push(format!("    uint32_t __sr = *(volatile uint32_t *)0x{:08x}UL; /* SR */", sr));
+        out.push("    if ((__sr & __I2C_SR_DONE) && !(__sr & __I2C_SR_ERR)) {".into());
+        if is_read {
+            out.push(format!("        {} = *(volatile uint32_t *)0x{:08x}UL; /* DR (read result) */", dst, dr));
+        } else {
+            out.push(format!("        {} = 0U;", dst));
+        }
+        out.push(format!("        {} = 0U; /* ok */", code));
+        out.push("    }".into());
+        // Each declared fault code → its SR bit (by name) and its 1-based index.
+        for (i, fc) in fault_codes.iter().enumerate() {
+            if let Some(bit) = i2c_fault_bit(fc) {
+                out.push(format!(
+                    "    else if (__sr & 0x{:x}U) {{ {} = {}U; {} = 0U; }} /* fault {} */",
+                    bit, code, i + 1, dst, fc
+                ));
+            }
+        }
+        // Any other (non-done, no known error bit) completion: a generic fault →
+        // falls through every arm to the `_` wildcard (sentinel ≠ any index).
+        out.push(format!("    else {{ {} = 0xFFFFFFFFU; {} = 0U; }} /* unknown → `_` */", code, dst));
         out.push("}".into());
         out
     }
@@ -1816,6 +1878,19 @@ impl CBackend {
 
 fn reaction_fn_name(id: usize) -> String {
     format!("__reaction_{}", id)
+}
+
+/// The I²C controller's SR error bit for a declared fault code name (§4.4/D14),
+/// matching the `SR { done:bit[0], nak:bit[1], arblost:bit[2], timeout:bit[3] }`
+/// fields of `std/i2c_controller.si`.  `None` for a code with no decodable SR
+/// bit (it then falls through to the `match`'s `_` arm on metal).
+fn i2c_fault_bit(code: &str) -> Option<u32> {
+    match code {
+        "nak" => Some(0x2),
+        "arblost" => Some(0x4),
+        "timeout" => Some(0x8),
+        _ => None,
+    }
 }
 
 /// Strip a leading `&` (vector-table symbols are pre-formatted with one for
