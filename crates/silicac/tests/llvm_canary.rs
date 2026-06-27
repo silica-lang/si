@@ -759,3 +759,76 @@ fn metal_poll_retry_disposition_wraps_the_body_in_a_retry_loop() {
     assert!(ll.contains("retryloop"), "no retry back-edge:\n{}", ll);
     assert_no_c_isms(&ll);
 }
+
+// ─── P5-4: within-deadline + watchdog ─────────────────────────────────────────
+
+#[test]
+fn metal_deadline_and_watchdog_are_wired() {
+    // A yielding reaction with a `within` deadline + a board watchdog → deadline
+    // countdown globals, an arm on the trigger entry, a SysTick decrement that
+    // latches `@__deadline_missed`, watchdog config in the reset, and a feed
+    // gated on the deadline.
+    let mut m = module(vec![cell("samples", SirType::U32, 0)], vec![]);
+    let mut rx = reaction(vec![
+        SirStmt::BusXfer {
+            device: 0,
+            op: "read_reg".into(),
+            args: vec![SirExpr::U64(0x76), SirExpr::U64(0xFA)],
+            dst: "__bus".into(),
+            propagate: true,
+            fault_codes: vec!["nak".into()],
+            code_dst: None,
+        },
+        SirStmt::Assign {
+            target: SirPlace::Var("samples".into()),
+            value: SirExpr::BinOp(
+                SirBinOp::Add,
+                Box::new(SirExpr::Load("samples".into())),
+                Box::new(SirExpr::U64(1)),
+            ),
+        },
+    ]);
+    rx.id = 1;
+    rx.trigger = SirTrigger::EveryNs(100_000_000);
+    rx.yields = true;
+    rx.deadline_ns = Some(30_000_000); // within 30ms
+    m.reactions.push(rx);
+    let reg = |name: &str, off: u64| SirReg {
+        name: name.into(),
+        offset: off,
+        width: 32,
+        access: SirRegAccess::Rw,
+        reset: 0,
+    };
+    m.devices.push(SirDevice {
+        id: 0,
+        name: "i2c0".into(),
+        base_addr: Some(0x4000_3000),
+        kind: SirDeviceKind::Generic,
+        regs: vec![reg("CR", 0x0), reg("SR", 0x4), reg("SA", 0x8), reg("RA", 0xC), reg("DR", 0x10)],
+    });
+    m.devices.push(SirDevice {
+        id: 1,
+        name: "wdt0".into(),
+        base_addr: Some(0x4001_0000),
+        kind: SirDeviceKind::Generic,
+        regs: vec![reg("CR", 0x0), reg("RLR", 0x4), reg("KR", 0x8)],
+    });
+    m.watchdog_device = Some(1);
+    m.watchdog_timeout_ns = Some(100_000_000); // 100ms
+    let ll = LlvmBackend::with_target(Target::MetalNrf52840).emit(&m);
+
+    // Deadline state + arm (30ms → 30 ticks) on the trigger entry.
+    assert!(ll.contains("@__deadline_1 = global i32 0"), "no deadline countdown:\n{}", ll);
+    assert!(ll.contains("@__deadline_missed = global i32 0"), "no deadline-missed flag:\n{}", ll);
+    assert!(ll.contains("store i32 30, ptr @__deadline_1"), "deadline not armed on fire:\n{}", ll);
+    // SysTick decrements the deadline and latches the miss.
+    assert!(ll.contains("load i32, ptr @__rf_1_state"), "SysTick must check the frame state:\n{}", ll);
+    assert!(ll.contains("store i32 1, ptr @__deadline_missed"), "overrun must latch the miss:\n{}", ll);
+    // Watchdog configured in the reset + fed (0xAAAA = 43690), gated on the miss.
+    assert!(ll.contains("WDT RLR: reload") && ll.contains("WDT CR: start"), "watchdog not configured:\n{}", ll);
+    assert!(ll.contains("store volatile i32 43690") && ll.contains("feed on clean idle"), "no gated feed:\n{}", ll);
+    assert!(ll.contains("load i32, ptr @__deadline_missed"), "feed not gated on the deadline:\n{}", ll);
+    assert!(ll.contains("ptr @SysTick_Handler"), "SysTick must be vectored (watchdog needs it):\n{}", ll);
+    assert_no_c_isms(&ll);
+}

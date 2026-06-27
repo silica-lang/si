@@ -171,6 +171,10 @@ pub struct LlvmBackend {
     /// While lowering a `Retry`-disposition reaction (P5-3): the back-edge label
     /// to re-run the body on a retry.  `None` otherwise.
     retry_loop: Option<String>,
+    /// reaction id → `within` deadline in SysTick (1 ms) ticks (P5-4).  Populated
+    /// only when a watchdog exists (the reset mechanism); the SysTick handler
+    /// counts these down and the idle-loop feed is gated on none having elapsed.
+    deadline_ticks: HashMap<usize, u32>,
 }
 
 impl LlvmBackend {
@@ -200,6 +204,7 @@ impl LlvmBackend {
             cells: std::collections::HashSet::new(),
             current_disposition: None,
             retry_loop: None,
+            deadline_ticks: HashMap::new(),
         }
     }
 
@@ -290,6 +295,26 @@ impl LlvmBackend {
         // mirroring the C `__uptime_ns` (host keeps `llvm.readcyclecounter`).
         if uses_now {
             self.globals.push_str("@__uptime_ns = global i64 0\n");
+        }
+        // `within` deadlines (P5-4) — enforced on metal only when a watchdog
+        // exists (the reset mechanism), and only for yielding reactions (a
+        // non-yielding one is bounded by construction in its ISR).  Mirrors c.rs.
+        if metal && module.watchdog_device.is_some() {
+            for r in &module.reactions {
+                if r.yields {
+                    if let Some(ns) = r.deadline_ns {
+                        self.deadline_ticks.insert(r.id, ns.div_ceil(1_000_000).max(1) as u32);
+                    }
+                }
+            }
+        }
+        if !self.deadline_ticks.is_empty() {
+            let mut ids: Vec<usize> = self.deadline_ticks.keys().copied().collect();
+            ids.sort_unstable();
+            for id in ids {
+                self.globals.push_str(&format!("@__deadline_{} = global i32 0\n", id));
+            }
+            self.globals.push_str("@__deadline_missed = global i32 0\n");
         }
         if metal {
             // Metal: `Reset_Handler` does real startup (.data/.bss/pins + GPIOTE)
@@ -668,13 +693,79 @@ impl LlvmBackend {
             self.m_store32(NVIC_ISER0, &(1u64 << GPIOTE_IRQN).to_string(), "NVIC ISER enable GPIOTE");
         }
 
+        // Configure + start the system watchdog over its declared CR/RLR/KR
+        // (§5.6, P5-4): reload = the timeout (ms), CR.start begins it, a KR write
+        // feeds it.  Mirrors the C startup.
+        let wdt_regs: Option<(u64, u64, u64)> = module.watchdog_device.and_then(|wdt| {
+            let regs = self.device_regs.get(&wdt)?;
+            Some((*regs.get("CR")?, *regs.get("RLR")?, *regs.get("KR")?))
+        });
+        let wdt_kr = if let Some((cr, rlr, kr)) = wdt_regs {
+            let timeout_ms = module.watchdog_timeout_ns.unwrap_or(0) / 1_000_000;
+            self.m_store32(rlr, &timeout_ms.to_string(), "WDT RLR: reload (ms)");
+            self.m_store32(cr, "1", "WDT CR: start");
+            self.m_store32(kr, "43690", "WDT KR: feed (0xAAAA)");
+            Some(kr)
+        } else {
+            None
+        };
+
         // Enable interrupts, then idle forever.
         self.m_asm("cpsie i", "enable IRQs");
         let idle = self.fresh_label("idle");
         self.inst(&format!("br label %{}", idle));
         self.label(&idle);
-        self.m_asm("wfi", "idle");
-        self.inst(&format!("br label %{}", idle));
+        if let Some(kr) = wdt_kr {
+            // Feed the watchdog ONLY on a clean return to idle (§5.6): no yielding
+            // reaction mid-transaction AND no `within` deadline missed.  A hung
+            // reaction never satisfies this, so the watchdog resets the system.
+            let yielding: Vec<usize> =
+                module.reactions.iter().filter(|r| r.yields).map(|r| r.id).collect();
+            let mut cond: Option<String> = None;
+            for id in &yielding {
+                let s = self.fresh();
+                self.inst(&format!("{} = load i32, ptr @__rf_{}_state", s, id));
+                let z = self.fresh();
+                self.inst(&format!("{} = icmp eq i32 {}, 0", z, s));
+                cond = Some(match cond {
+                    None => z,
+                    Some(prev) => {
+                        let a = self.fresh();
+                        self.inst(&format!("{} = and i1 {}, {}", a, prev, z));
+                        a
+                    }
+                });
+            }
+            if !self.deadline_ticks.is_empty() {
+                let m = self.fresh();
+                self.inst(&format!("{} = load i32, ptr @__deadline_missed", m));
+                let notm = self.fresh();
+                self.inst(&format!("{} = icmp eq i32 {}, 0", notm, m));
+                cond = Some(match cond {
+                    None => notm,
+                    Some(prev) => {
+                        let a = self.fresh();
+                        self.inst(&format!("{} = and i1 {}, {}", a, prev, notm));
+                        a
+                    }
+                });
+            }
+            let feed_l = self.fresh_label("feed");
+            let after_l = self.fresh_label("afterfeed");
+            match cond {
+                Some(c) => self.inst(&format!("br i1 {}, label %{}, label %{}", c, feed_l, after_l)),
+                None => self.inst(&format!("br label %{}", feed_l)),
+            }
+            self.label(&feed_l);
+            self.m_store32(kr, "43690", "WDT KR: feed on clean idle (§5.6)");
+            self.inst(&format!("br label %{}", after_l));
+            self.label(&after_l);
+            self.m_asm("wfi", "idle");
+            self.inst(&format!("br label %{}", idle));
+        } else {
+            self.m_asm("wfi", "idle");
+            self.inst(&format!("br label %{}", idle));
+        }
 
         self.functions.push_str("define void @Reset_Handler() {\nentry:\n");
         self.functions.push_str(&self.allocas);
@@ -940,6 +1031,11 @@ impl LlvmBackend {
         self.label(&inflight);
         self.inst("ret void");
         self.label(&fire);
+        // Arm this activation's `within` deadline (P5-4): if it is still in flight
+        // when the SysTick countdown elapses, it overran (§4.5/§5.6).
+        if let Some(&ticks) = self.deadline_ticks.get(&n) {
+            self.inst(&format!("store i32 {}, ptr @__deadline_{} ; arm `within` deadline", ticks, n));
+        }
         self.inst(&format!("call void @__react_{}_run()", n));
         self.inst("ret void");
         self.functions.push_str(&format!("define void @__reaction_{}() {{\nentry:\n", n));
@@ -1158,6 +1254,43 @@ impl LlvmBackend {
             let next = self.fresh();
             self.inst(&format!("{} = add i64 {}, 1000000", next, cur));
             self.inst(&format!("store volatile i64 {}, ptr @__uptime_ns ; +1ms uptime", next));
+        }
+        // §4.5/§5.6 (P5-4) — tick down each armed `within` deadline.  A reaction
+        // back at idle (frame state 0) disarms; one still in flight when its
+        // countdown hits 0 overran → latch `@__deadline_missed` (stops the feed).
+        let mut ids: Vec<usize> = self.deadline_ticks.keys().copied().collect();
+        ids.sort_unstable();
+        for id in ids {
+            let state = self.fresh();
+            self.inst(&format!("{} = load i32, ptr @__rf_{}_state", state, id));
+            let idle = self.fresh();
+            self.inst(&format!("{} = icmp eq i32 {}, 0", idle, state));
+            let disarm = self.fresh_label("disarm");
+            let active = self.fresh_label("active");
+            let cont = self.fresh_label("dlcont");
+            self.inst(&format!("br i1 {}, label %{}, label %{}", idle, disarm, active));
+            self.label(&disarm);
+            self.inst(&format!("store i32 0, ptr @__deadline_{}", id));
+            self.inst(&format!("br label %{}", cont));
+            self.label(&active);
+            let d = self.fresh();
+            self.inst(&format!("{} = load i32, ptr @__deadline_{}", d, id));
+            let armed = self.fresh();
+            self.inst(&format!("{} = icmp ne i32 {}, 0", armed, d));
+            let tick = self.fresh_label("dltick");
+            self.inst(&format!("br i1 {}, label %{}, label %{}", armed, tick, cont));
+            self.label(&tick);
+            let d1 = self.fresh();
+            self.inst(&format!("{} = sub i32 {}, 1", d1, d));
+            self.inst(&format!("store i32 {}, ptr @__deadline_{}", d1, id));
+            let elapsed = self.fresh();
+            self.inst(&format!("{} = icmp eq i32 {}, 0", elapsed, d1));
+            let miss = self.fresh_label("dlmiss");
+            self.inst(&format!("br i1 {}, label %{}, label %{}", elapsed, miss, cont));
+            self.label(&miss);
+            self.inst("store i32 1, ptr @__deadline_missed ; `within` overrun → stop the feed");
+            self.inst(&format!("br label %{}", cont));
+            self.label(&cont);
         }
         self.inst("ret void");
         self.functions.push_str("define void @SysTick_Handler() {\nentry:\n");
