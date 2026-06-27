@@ -1234,9 +1234,18 @@ checked in §10's foreclosure audit (LLVM, FFI, multicore all remain reachable).
 > absolute address (`base + offset`) via `inttoptr` — a rw field is a read-modify-write, a wo/w1c field
 > a direct store, a read masks + shifts the field. The same target-neutral register node the sim
 > services as a mock array and the C backend emits as a `volatile` pointer. `examples/llvm_mmio.si`;
-> `harness/llvm_canary.sh` `opt -verify`s it and `llc`s it to an object. **Remaining** for a full LLVM
-> backend: the event loop / scheduler that *calls* the reaction functions, the yields state machine,
-> and metal startup/linker emission (P3-4c).
+> `harness/llvm_canary.sh` `opt -verify`s it and `llc`s it to an object.
+>
+> **Metal boot (audit P3-4c).** `LlvmBackend::with_target(MetalNrf52840)` emits a **freestanding**
+> module — `target triple = thumbv7em-none-eabi`, a `.vectors` table `[_estack, Reset_Handler]`, and a
+> `Reset_Handler` that runs `sys.start` then idles (`wfi`); no `@main`, no host syscall. It links
+> against the *generated* linker script (the same `emit_linker_script`, now also dropping `.ARM.exidx`)
+> and **boots on Renode**: `harness/llvm_metal.sh` takes `examples/boot_nrf52840.si` all the way — SIR →
+> LLVM IR → `llc` → object → ELF → Renode → reads the cell back as **42**, with the C backend not
+> involved anywhere. This is the genuine second-backend proof for the metal direction. **Remaining:**
+> the metal *scheduler* that wires `every`/`on` (TIMER/GPIOTE/NVIC) to *call* the per-reaction
+> functions, and the yields state machine — the periodic/event/bus runtime — are the next LLVM step;
+> today only `sys.start` runs on metal via LLVM.
 
 ### 6.4 Generated linker script, vector table, startup, `.data`/`.bss`
 

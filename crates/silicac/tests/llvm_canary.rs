@@ -11,6 +11,7 @@
 //!   2. The module references no libc / C-runtime symbol — SIR is target-neutral.
 
 use silicac::backend::llvm::LlvmBackend;
+use silicac::backend::Target;
 use silicac::sir::*;
 
 fn reaction(body: Vec<SirStmt>) -> SirReaction {
@@ -341,4 +342,38 @@ fn reg_load_is_a_masked_shifted_volatile_load() {
     assert!(ll.contains("load volatile i32"), "volatile read:\n{}", ll);
     assert!(ll.contains("and i32") && ll.contains("lshr i32"), "mask + shift:\n{}", ll);
     assert_no_c_isms(&ll);
+}
+
+// ─── P3-4c: metal direction (vector table + Reset_Handler) ────────────────────
+
+#[test]
+fn metal_emits_a_freestanding_reset_handler_not_main() {
+    // `--target metal-nrf52840 --emit-llvm`: a freestanding module that boots via
+    // a `.vectors` table into `Reset_Handler` (runs sys.start, then idles) — no
+    // `@main`, no host syscall.
+    let body = vec![SirStmt::Assign {
+        target: SirPlace::Var("value".into()),
+        value: SirExpr::U64(42),
+    }];
+    let ll = LlvmBackend::with_target(Target::MetalNrf52840)
+        .emit(&module(vec![cell("value", SirType::U32, 7)], body));
+    assert!(ll.contains("target triple = \"thumbv7em-none-eabi\""), "no metal triple:\n{}", ll);
+    assert!(ll.contains("@__vectors") && ll.contains("section \".vectors\""), "no vector table:\n{}", ll);
+    assert!(ll.contains("[ptr @_estack, ptr @Reset_Handler]"), "vector table contents:\n{}", ll);
+    assert!(ll.contains("define void @Reset_Handler()"), "no Reset_Handler:\n{}", ll);
+    assert!(ll.contains("store i32 42, ptr @value"), "sys.start body not in reset:\n{}", ll);
+    assert!(ll.contains("wfi"), "reset handler must idle:\n{}", ll);
+    // Metal must NOT emit the host entry or a host syscall.
+    assert!(!ll.contains("define i32 @main()"), "metal must not emit @main:\n{}", ll);
+    assert!(!ll.contains("svc #"), "metal must not emit a host syscall:\n{}", ll);
+    assert_no_c_isms(&ll);
+}
+
+#[test]
+fn host_emit_is_unchanged_by_the_metal_path() {
+    // The default (host) target still emits `@main` — the two directions coexist.
+    let body = vec![SirStmt::Exit(SirExpr::U64(0))];
+    let ll = LlvmBackend::new().emit(&module(vec![], body));
+    assert!(ll.contains("define i32 @main()"), "host still emits main:\n{}", ll);
+    assert!(!ll.contains("@Reset_Handler"), "host must not emit a reset handler:\n{}", ll);
 }
