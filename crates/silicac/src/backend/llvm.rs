@@ -129,6 +129,16 @@ pub struct LlvmBackend {
     /// Max reaction priority in the module (audit P4-2): the `basepri_byte`
     /// reference for NVIC/BASEPRI priority-ceiling mapping (§5.5).
     max_priority: u8,
+    /// device id → (register name → absolute MMIO address) (audit P4-3): a bus
+    /// controller's CR/SR/SA/RA/DR, resolved by name for the yields kick/resume.
+    device_regs: HashMap<usize, HashMap<String, u64>>,
+    /// While lowering a yielding reaction (P4-3): `(global prefix, cross-yield
+    /// temp names)`.  Those temps are module globals (`@<prefix><name>`) so they
+    /// survive an IRQ return; `var_ptr` rewrites refs to them.
+    frame: Option<(String, std::collections::HashSet<String>)>,
+    /// Module cell names (P4-3): distinguishes a cell (real global) from a
+    /// reaction-local temp when collecting a yielding reaction's frame.
+    cells: std::collections::HashSet<String>,
 }
 
 impl LlvmBackend {
@@ -153,6 +163,9 @@ impl LlvmBackend {
             device_bases: HashMap::new(),
             target,
             max_priority: 0,
+            device_regs: HashMap::new(),
+            frame: None,
+            cells: std::collections::HashSet::new(),
         }
     }
 
@@ -196,6 +209,8 @@ impl LlvmBackend {
         for dev in &module.devices {
             if let Some(base) = dev.base_addr {
                 self.device_bases.insert(dev.id, base);
+                let regs = dev.regs.iter().map(|r| (r.name.clone(), base + r.offset)).collect();
+                self.device_regs.insert(dev.id, regs);
             }
         }
         self.max_priority = module.reactions.iter().map(|r| r.priority).max().unwrap_or(0);
@@ -204,6 +219,7 @@ impl LlvmBackend {
             let bits = store_bits(sir_bits(&v.ty));
             let signed = sir_signed(&v.ty);
             self.vars.insert(v.name.clone(), (bits, signed, true));
+            self.cells.insert(v.name.clone());
             let init = const_init(&v.init);
             self.globals
                 .push_str(&format!("@{} = global i{} {}\n", v.name, bits, init));
@@ -235,21 +251,33 @@ impl LlvmBackend {
             self.lower_function("i32 @main()", true, &sys);
         }
 
-        // Every non-`sys.start` reaction lowers to its own `void @__reaction_N`
-        // function; on metal the TIMER1 handler (P4-1) / GPIOTE (P4-2) call them.
+        // Every non-`sys.start` reaction lowers to its own function; on metal the
+        // TIMER1 handler (P4-1) / GPIOTE (P4-2) call them.  A **yielding** reaction
+        // (a bus transaction) lowers to the IRQ-driven segment state machine
+        // (P4-3) instead of a flat body.
+        let bus_reactions: Vec<usize> = module.reactions.iter().filter(|r| r.yields).map(|r| r.id).collect();
         for r in &module.reactions {
-            if !matches!(r.trigger, SirTrigger::SysStart) {
+            if matches!(r.trigger, SirTrigger::SysStart) {
+                continue;
+            }
+            if metal && r.yields {
+                self.emit_yielding_metal(r);
+            } else {
                 let sig = format!("void @__reaction_{}()", r.id);
                 self.lower_function(&sig, false, &[r.body.as_slice()]);
             }
         }
 
+        let has_bus = metal && !bus_reactions.is_empty();
         if metal {
             if let Some(plan) = &timer {
                 self.emit_timer_handler(plan);
             }
             if !events.is_empty() {
                 self.emit_gpiote_handler(&events);
+            }
+            if has_bus {
+                self.emit_bus_irq_handler(&bus_reactions);
             }
             self.emit_default_handlers();
         }
@@ -266,9 +294,14 @@ impl LlvmBackend {
             for s in ["_sidata", "_sdata", "_edata", "_sbss", "_ebss"] {
                 out.push_str(&format!("@{} = external global i8\n", s));
             }
+            if has_bus {
+                // The single in-flight bus owner (P4-3): which `@__react_N_run` the
+                // shared `@__BUS_IRQHandler` resumes on completion (§5.1/§5.2).
+                out.push_str("@__bus_owner = global i32 -1\n");
+            }
             out.push('\n');
             // The Cortex-M vector table (placed at flash base by the linker).
-            out.push_str(&self.emit_vector_table(timer.is_some(), !events.is_empty(), false));
+            out.push_str(&self.emit_vector_table(timer.is_some(), !events.is_empty(), has_bus));
             out.push('\n');
         }
         if !self.globals.is_empty() {
@@ -581,6 +614,372 @@ impl LlvmBackend {
         self.inst("ret void");
         self.functions.push_str("define void @GPIOTE_IRQHandler() {\nentry:\n");
         self.functions.push_str(&self.allocas);
+        self.functions.push_str(&self.body);
+        self.functions.push_str("}\n\n");
+    }
+
+    // ── Yields state machine (P4-3) ───────────────────────────────────────────
+
+    /// Cross-yield temps of a reaction (frame globals): non-cell `Assign` targets,
+    /// `BusXfer` dst/code_dst, `RingPop` dst — recursing into `If`/`Critical`.
+    fn collect_frame_temps(&self, reaction: &SirReaction) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        self.collect_frame_temps_in(&reaction.body, &mut seen, &mut out);
+        out
+    }
+    fn collect_frame_temps_in(&self, stmts: &[SirStmt], seen: &mut HashSet<String>, out: &mut Vec<String>) {
+        let add = |name: &str, seen: &mut HashSet<String>, out: &mut Vec<String>| {
+            if !self.cells.contains(name) && seen.insert(name.to_string()) {
+                out.push(name.to_string());
+            }
+        };
+        for stmt in stmts {
+            match stmt {
+                SirStmt::Assign { target: SirPlace::Var(name), .. } => add(name, seen, out),
+                SirStmt::RingPop { dst, .. } => add(dst, seen, out),
+                SirStmt::BusXfer { dst, code_dst, .. } => {
+                    add(dst, seen, out);
+                    if let Some(c) = code_dst {
+                        add(c, seen, out);
+                    }
+                }
+                SirStmt::If { then, .. } => self.collect_frame_temps_in(then, seen, out),
+                SirStmt::Critical { body, .. } => self.collect_frame_temps_in(body, seen, out),
+                _ => {}
+            }
+        }
+    }
+
+    /// Resolve a bus controller's CR/SR/SA/RA/DR absolute addresses by name.
+    fn bus_regs(&self, device: usize) -> Option<(u64, u64, u64, u64, u64)> {
+        let regs = self.device_regs.get(&device)?;
+        Some((*regs.get("CR")?, *regs.get("SR")?, *regs.get("SA")?, *regs.get("RA")?, *regs.get("DR")?))
+    }
+
+    /// A yielding reaction (P4-3) → an IRQ-driven segment state machine
+    /// (`@__react_N_run`) + a coalescing trigger entry (`@__reaction_N`),
+    /// mirroring the C `emit_yielding_reaction_metal`.
+    fn emit_yielding_metal(&mut self, reaction: &SirReaction) {
+        let n = reaction.id;
+        let prefix = format!("__rf_{}_", n);
+
+        // Segment the body at each top-level BusXfer.
+        let mut segs: Vec<(Vec<&SirStmt>, Option<&SirStmt>)> = Vec::new();
+        let mut cur: Vec<&SirStmt> = Vec::new();
+        for stmt in &reaction.body {
+            if matches!(stmt, SirStmt::BusXfer { .. }) {
+                segs.push((std::mem::take(&mut cur), Some(stmt)));
+            } else {
+                cur.push(stmt);
+            }
+        }
+        segs.push((cur, None));
+
+        // Frame globals: dispatcher state + retry/fault + every cross-yield temp.
+        let temps = self.collect_frame_temps(reaction);
+        self.globals.push_str(&format!("@{p}state = global i32 0\n@{p}retry = global i32 0\n@{p}faulted = global i32 0\n", p = prefix));
+        for t in &temps {
+            self.globals.push_str(&format!("@{}{} = global i32 0\n", prefix, t));
+            self.vars.insert(t.clone(), (32, false, true));
+        }
+        let temp_set: HashSet<String> = temps.iter().cloned().collect();
+        self.frame = Some((prefix.clone(), temp_set));
+
+        // Dispatcher body.
+        self.body.clear();
+        self.allocas.clear();
+        self.terminated = false;
+        self.ret_i32 = false;
+        let state_g = format!("@{}state", prefix);
+        let nseg = segs.len();
+        let seg0_reset = self.fresh_label("seg0reset");
+        let default_l = self.fresh_label("bdefault");
+        let body_labels: Vec<String> = (0..nseg).map(|i| self.fresh_label(&format!("seg{}_", i))).collect();
+        let st = self.fresh();
+        self.inst(&format!("{} = load i32, ptr {}", st, state_g));
+        let mut arms = vec![format!("i32 0, label %{}", seg0_reset)];
+        for (i, lbl) in body_labels.iter().enumerate().skip(1) {
+            arms.push(format!("i32 {}, label %{}", i, lbl));
+        }
+        self.inst(&format!("switch i32 {}, label %{} [ {} ]", st, default_l, arms.join(" ")));
+        // case 0: reset retry/fault, then enter segment 0.
+        self.label(&seg0_reset);
+        self.inst(&format!("store i32 0, ptr @{}retry", prefix));
+        self.inst(&format!("store i32 0, ptr @{}faulted", prefix));
+        self.inst(&format!("br label %{}", body_labels[0]));
+
+        for (i, (pre, xfer)) in segs.iter().enumerate() {
+            self.label(&body_labels[i]);
+            self.terminated = false;
+            // Resume the prior transaction (segments after the first).
+            if i >= 1 {
+                if let Some(SirStmt::BusXfer { device, op, dst, propagate, code_dst, fault_codes, .. }) = segs[i - 1].1 {
+                    let dref = self.var_ptr(dst, true);
+                    if let Some(code) = code_dst {
+                        let cref = self.var_ptr(code, true);
+                        self.emit_bus_resume_match(*device, op, &dref, &cref, fault_codes, &prefix);
+                    } else {
+                        self.emit_bus_resume(*device, op, &dref, &prefix);
+                        if *propagate {
+                            let f = self.fresh();
+                            self.inst(&format!("{} = load i32, ptr @{}faulted", f, prefix));
+                            let nz = self.fresh();
+                            self.inst(&format!("{} = icmp ne i32 {}, 0", nz, f));
+                            let disp = self.fresh_label("disp");
+                            let cont = self.fresh_label("dcont");
+                            self.inst(&format!("br i1 {}, label %{}, label %{}", nz, disp, cont));
+                            self.label(&disp);
+                            self.emit_disposition(reaction.disposition, &prefix, &body_labels[0]);
+                            self.label(&cont);
+                        }
+                    }
+                }
+            }
+            for &stmt in pre.iter() {
+                if self.terminated {
+                    break;
+                }
+                self.emit_stmt(stmt);
+            }
+            // Terminate: kick the next transaction (suspend), or complete (tail).
+            if let Some(SirStmt::BusXfer { device, op, args, .. }) = xfer {
+                self.emit_bus_kick(*device, op, args, n);
+                self.inst(&format!("store i32 {}, ptr @{}state", i + 1, prefix));
+                self.inst("ret void");
+            } else {
+                self.inst(&format!("store i32 0, ptr @{}state", prefix));
+                self.inst("ret void");
+            }
+        }
+        self.label(&default_l);
+        self.inst("ret void");
+        self.functions.push_str(&format!("define void @__react_{}_run() {{\nentry:\n", n));
+        self.functions.push_str(&self.allocas);
+        self.functions.push_str(&self.body);
+        self.functions.push_str("}\n\n");
+        self.frame = None;
+
+        // Trigger entry: coalesce a re-fire that arrives while in flight (§5.1).
+        self.body.clear();
+        self.allocas.clear();
+        let s2 = self.fresh();
+        self.inst(&format!("{} = load i32, ptr {}", s2, state_g));
+        let busy = self.fresh();
+        self.inst(&format!("{} = icmp ne i32 {}, 0", busy, s2));
+        let inflight = self.fresh_label("inflight");
+        let fire = self.fresh_label("gofire");
+        self.inst(&format!("br i1 {}, label %{}, label %{}", busy, inflight, fire));
+        self.label(&inflight);
+        self.inst("ret void");
+        self.label(&fire);
+        self.inst(&format!("call void @__react_{}_run()", n));
+        self.inst("ret void");
+        self.functions.push_str(&format!("define void @__reaction_{}() {{\nentry:\n", n));
+        self.functions.push_str(&self.body);
+        self.functions.push_str("}\n\n");
+    }
+
+    /// Bus kick: write SA/RA/DR, barrier, CR start, own the bus, clear-pending +
+    /// enable the completion IRQ (the caller then sets state and returns).
+    fn emit_bus_kick(&mut self, device: usize, op: &str, args: &[SirExpr], n: usize) {
+        let Some((cr, _sr, sa, ra, dr)) = self.bus_regs(device) else {
+            self.inst(&format!("; unsupported: bus device {} missing CR/SR/SA/RA/DR", device));
+            return;
+        };
+        let is_read = op == "read_reg";
+        let a0 = args.first().map(|a| self.emit_expr(a, 32)).unwrap_or_else(|| "0".into());
+        let a1 = args.get(1).map(|a| self.emit_expr(a, 32)).unwrap_or_else(|| "0".into());
+        let a2 = args.get(2).map(|a| self.emit_expr(a, 32));
+        let p_sa = self.fresh();
+        self.inst(&format!("{} = inttoptr i64 {} to ptr", p_sa, sa));
+        self.inst(&format!("store volatile i32 {}, ptr {} ; SA", a0, p_sa));
+        let p_ra = self.fresh();
+        self.inst(&format!("{} = inttoptr i64 {} to ptr", p_ra, ra));
+        self.inst(&format!("store volatile i32 {}, ptr {} ; RA", a1, p_ra));
+        if let Some(v) = a2 {
+            let p_dr = self.fresh();
+            self.inst(&format!("{} = inttoptr i64 {} to ptr", p_dr, dr));
+            self.inst(&format!("store volatile i32 {}, ptr {} ; DR (write)", v, p_dr));
+        }
+        self.m_asm("dmb 0xf", "arm: operands before CR kick");
+        let kick = if is_read { 3 } else { 1 }; // START | (DIR_RD for read)
+        let p_cr = self.fresh();
+        self.inst(&format!("{} = inttoptr i64 {} to ptr", p_cr, cr));
+        self.inst(&format!("store volatile i32 {}, ptr {} ; CR kick", kick, p_cr));
+        self.m_asm("dsb 0xf", "kick committed before IRQ enable");
+        self.inst(&format!("store i32 {}, ptr @__bus_owner", n));
+        self.m_store32(0xE000_E280, &(1u64 << BUS_IRQN).to_string(), "NVIC ICPR clear stale bus pending");
+        self.m_store32(NVIC_ISER0, &(1u64 << BUS_IRQN).to_string(), "NVIC ISER enable bus IRQ");
+    }
+
+    /// Bus resume: read SR; on done+!err set `dst` (DR for reads, else 0), else
+    /// flag `faulted`.  `dst_ptr` is the frame-global pointer operand.
+    fn emit_bus_resume(&mut self, device: usize, op: &str, dst_ptr: &str, prefix: &str) {
+        let Some((_cr, sr, _sa, _ra, dr)) = self.bus_regs(device) else {
+            self.inst(&format!("; unsupported: bus device {} missing regs", device));
+            return;
+        };
+        let is_read = op == "read_reg";
+        let psr = self.fresh();
+        self.inst(&format!("{} = inttoptr i64 {} to ptr", psr, sr));
+        let srv = self.fresh();
+        self.inst(&format!("{} = load volatile i32, ptr {} ; SR", srv, psr));
+        let done = self.fresh();
+        self.inst(&format!("{} = and i32 {}, 1", done, srv)); // SR_DONE
+        let err = self.fresh();
+        self.inst(&format!("{} = and i32 {}, 14", err, srv)); // SR_ERR (0xE)
+        let d1 = self.fresh();
+        self.inst(&format!("{} = icmp ne i32 {}, 0", d1, done));
+        let e0 = self.fresh();
+        self.inst(&format!("{} = icmp eq i32 {}, 0", e0, err));
+        let ok = self.fresh();
+        self.inst(&format!("{} = and i1 {}, {}", ok, d1, e0));
+        let okl = self.fresh_label("rok");
+        let badl = self.fresh_label("rbad");
+        let contl = self.fresh_label("rcont");
+        self.inst(&format!("br i1 {}, label %{}, label %{}", ok, okl, badl));
+        self.label(&okl);
+        if is_read {
+            let pdr = self.fresh();
+            self.inst(&format!("{} = inttoptr i64 {} to ptr", pdr, dr));
+            let v = self.fresh();
+            self.inst(&format!("{} = load volatile i32, ptr {} ; DR", v, pdr));
+            self.inst(&format!("store i32 {}, ptr {}", v, dst_ptr));
+        } else {
+            self.inst(&format!("store i32 0, ptr {}", dst_ptr));
+        }
+        self.inst(&format!("br label %{}", contl));
+        self.label(&badl);
+        self.inst(&format!("store i32 1, ptr @{}faulted", prefix));
+        self.inst(&format!("br label %{}", contl));
+        self.label(&contl);
+    }
+
+    /// Bus resume for a `match` over the result (§4.4/D14): decode the outcome
+    /// code (0 = ok; 1+i = the i-th declared fault by its SR bit) into `code_ptr`.
+    fn emit_bus_resume_match(&mut self, device: usize, op: &str, dst_ptr: &str, code_ptr: &str, fault_codes: &[String], _prefix: &str) {
+        let Some((_cr, sr, _sa, _ra, dr)) = self.bus_regs(device) else {
+            self.inst(&format!("; unsupported: bus device {} missing regs", device));
+            return;
+        };
+        let is_read = op == "read_reg";
+        let psr = self.fresh();
+        self.inst(&format!("{} = inttoptr i64 {} to ptr", psr, sr));
+        let srv = self.fresh();
+        self.inst(&format!("{} = load volatile i32, ptr {} ; SR", srv, psr));
+        let done = self.fresh();
+        self.inst(&format!("{} = and i32 {}, 1", done, srv));
+        let err = self.fresh();
+        self.inst(&format!("{} = and i32 {}, 14", err, srv));
+        let d1 = self.fresh();
+        self.inst(&format!("{} = icmp ne i32 {}, 0", d1, done));
+        let e0 = self.fresh();
+        self.inst(&format!("{} = icmp eq i32 {}, 0", e0, err));
+        let ok = self.fresh();
+        self.inst(&format!("{} = and i1 {}, {}", ok, d1, e0));
+        let okl = self.fresh_label("mok");
+        let chkl = self.fresh_label("mchk");
+        let contl = self.fresh_label("mcont");
+        self.inst(&format!("br i1 {}, label %{}, label %{}", ok, okl, chkl));
+        self.label(&okl);
+        if is_read {
+            let pdr = self.fresh();
+            self.inst(&format!("{} = inttoptr i64 {} to ptr", pdr, dr));
+            let v = self.fresh();
+            self.inst(&format!("{} = load volatile i32, ptr {} ; DR", v, pdr));
+            self.inst(&format!("store i32 {}, ptr {}", v, dst_ptr));
+        } else {
+            self.inst(&format!("store i32 0, ptr {}", dst_ptr));
+        }
+        self.inst(&format!("store i32 0, ptr {} ; ok", code_ptr));
+        self.inst(&format!("br label %{}", contl));
+        // Decode each declared fault code by its SR bit (else 0xFFFFFFFF → `_`).
+        self.label(&chkl);
+        self.inst(&format!("store i32 0, ptr {}", dst_ptr));
+        for (i, fc) in fault_codes.iter().enumerate() {
+            let Some(bit) = crate::backend::c::i2c_fault_bit(fc) else { continue };
+            let masked = self.fresh();
+            self.inst(&format!("{} = and i32 {}, {}", masked, srv, bit));
+            let hit = self.fresh();
+            self.inst(&format!("{} = icmp ne i32 {}, 0", hit, masked));
+            let setl = self.fresh_label("mset");
+            let nextl = self.fresh_label("mnext");
+            self.inst(&format!("br i1 {}, label %{}, label %{}", hit, setl, nextl));
+            self.label(&setl);
+            self.inst(&format!("store i32 {}, ptr {} ; fault {}", i + 1, code_ptr, fc));
+            self.inst(&format!("br label %{}", contl));
+            self.label(&nextl);
+        }
+        // No known bit matched → unknown (falls to the `_` arm).
+        self.inst(&format!("store i32 4294967295, ptr {} ; unknown", code_ptr));
+        self.inst(&format!("br label %{}", contl));
+        self.label(&contl);
+    }
+
+    /// A propagated fault's Layer-2 disposition at a resumed segment (frame form):
+    /// retry (back-edge to seg-0), skip/escalate (complete), or safe (halt).
+    fn emit_disposition(&mut self, disp: SirDisposition, prefix: &str, seg0: &str) {
+        match disp {
+            SirDisposition::Retry { max } => {
+                let r = self.fresh();
+                self.inst(&format!("{} = load i32, ptr @{}retry", r, prefix));
+                let lt = self.fresh();
+                self.inst(&format!("{} = icmp ult i32 {}, {}", lt, r, max));
+                let retry = self.fresh_label("retry");
+                let exhaust = self.fresh_label("exhaust");
+                self.inst(&format!("br i1 {}, label %{}, label %{}", lt, retry, exhaust));
+                self.label(&retry);
+                let r1 = self.fresh();
+                self.inst(&format!("{} = add i32 {}, 1", r1, r));
+                self.inst(&format!("store i32 {}, ptr @{}retry", r1, prefix));
+                self.inst(&format!("store i32 0, ptr @{}faulted", prefix));
+                self.inst(&format!("br label %{}", seg0));
+                self.label(&exhaust);
+                self.inst(&format!("store i32 0, ptr @{}state", prefix));
+                self.inst("ret void");
+            }
+            SirDisposition::Skip | SirDisposition::Escalate => {
+                self.inst(&format!("store i32 0, ptr @{}state", prefix));
+                self.inst("ret void");
+            }
+            SirDisposition::Safe => {
+                // No safe-sequence emission on metal LLVM yet — mask + halt.
+                self.m_asm("cpsid i", "safe disposition → halt");
+                let halt = self.fresh_label("safehalt");
+                self.inst(&format!("br label %{}", halt));
+                self.label(&halt);
+                self.m_asm("wfi", "hold safe");
+                self.inst(&format!("br label %{}", halt));
+            }
+        }
+    }
+
+    /// `@__BUS_IRQHandler` (P4-3): disable the bus IRQ, then resume the in-flight
+    /// owner's dispatcher (single owner, §5.1/§5.2).
+    fn emit_bus_irq_handler(&mut self, bus_reactions: &[usize]) {
+        self.body.clear();
+        self.allocas.clear();
+        self.m_store32(0xE000_E180, &(1u64 << BUS_IRQN).to_string(), "NVIC ICER disable bus IRQ");
+        self.m_asm("dsb 0xf", "disable takes effect");
+        self.m_asm("isb 0xf", "before proceeding");
+        let o = self.fresh();
+        self.inst(&format!("{} = load i32, ptr @__bus_owner", o));
+        self.inst("store i32 -1, ptr @__bus_owner");
+        let done = self.fresh_label("busdone");
+        let arms: Vec<String> = bus_reactions
+            .iter()
+            .map(|id| format!("i32 {}, label %call{}", id, id))
+            .collect();
+        self.inst(&format!("switch i32 {}, label %{} [ {} ]", o, done, arms.join(" ")));
+        for id in bus_reactions {
+            self.label(&format!("call{}", id));
+            self.inst(&format!("call void @__react_{}_run()", id));
+            self.inst(&format!("br label %{}", done));
+        }
+        self.label(&done);
+        self.inst("ret void");
+        self.functions.push_str("define void @__BUS_IRQHandler() {\nentry:\n");
         self.functions.push_str(&self.body);
         self.functions.push_str("}\n\n");
     }
@@ -1096,6 +1495,12 @@ impl LlvmBackend {
     }
 
     fn var_ptr(&self, name: &str, is_global: bool) -> String {
+        // A yielding reaction's cross-yield temps are module globals `@<prefix><name>`.
+        if let Some((prefix, temps)) = &self.frame {
+            if temps.contains(name) {
+                return format!("@{}{}", prefix, name);
+            }
+        }
         if is_global {
             format!("@{}", name)
         } else {

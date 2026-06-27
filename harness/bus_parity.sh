@@ -32,8 +32,19 @@ if ! echo "$SIM_TRACE" | awk '/cell hits = 1/{h=NR} /cell samples = 1/{s=NR} END
 fi
 echo "sim: button interleaves during the bus suspension (hits before samples) ✓"
 
-echo "== build metal firmware =="
-(cd "$REPO" && cargo run -q -- --target metal-nrf52840 "$EX" -o "$ELF")
+echo "== build metal firmware (${BUILD:-c} backend) =="
+if [[ "${BUILD:-c}" == "llvm" ]]; then
+  # Build the yielding firmware ENTIRELY through the LLVM backend (audit P4-3).
+  if [[ -d /opt/homebrew/opt/llvm/bin ]]; then PATH="/opt/homebrew/opt/llvm/bin:$PATH"; fi
+  if [[ -d "$HOME/arm-gnu-toolchain-15.2/Payload/bin" ]]; then PATH="$HOME/arm-gnu-toolchain-15.2/Payload/bin:$PATH"; fi
+  for t in llc arm-none-eabi-gcc; do command -v "$t" >/dev/null 2>&1 || { echo "SKIP: '$t' not found (need LLVM + ARM toolchain for BUILD=llvm)"; exit 0; }; done
+  (cd "$REPO" && cargo run -q --bin silicac -- --target metal-nrf52840 --emit-llvm "$EX" -o "$ELFDIR/m")
+  llc "$ELFDIR/m.ll" -filetype=obj -o "$ELFDIR/m.o" || { echo "FAIL: llc"; exit 1; }
+  arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -nostdlib -nostartfiles -T "$ELFDIR/m.ld" "$ELFDIR/m.o" -o "$ELF" \
+    || { echo "FAIL: link"; exit 1; }
+else
+  (cd "$REPO" && cargo run -q -- --target metal-nrf52840 "$EX" -o "$ELF")
+fi
 
 # Cell addresses (in .bss) — read them from the ELF so the check is layout-robust.
 addr() { arm-none-eabi-nm "$ELF" | awk -v s="$1" '$3==s{print "0x"$1}'; }

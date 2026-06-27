@@ -1280,8 +1280,21 @@ checked in §10's foreclosure audit (LLVM, FFI, multicore all remain reachable).
 > bound `@__reaction_N`s; the GPIOTE slot (`16+6`) joins the vector table. `SirStmt::Critical` lowers to
 > a **BASEPRI** raise/restore (`msr/mrs basepri` + ISB/DMB, ceiling via `basepri_byte`) so a shared cell
 > stays consistent. `BUILD=llvm harness/metal_vs_sim.sh` boots an LLVM-built blink+button on Renode and
-> matches the sim LED sequence (including button-triggered toggles) — `sim ≡ metal(LLVM)`. **Remaining:**
-> the yields state machine + bus IRQ (P4-3) — the bus runtime.
+> matches the sim LED sequence (including button-triggered toggles) — `sim ≡ metal(LLVM)`.
+>
+> **Yields — the bus runtime (audit P4-3).** A yielding reaction (a bus transaction) lowers to an
+> IRQ-driven **segment state machine**, mirroring the C path: the body splits at each `BusXfer`;
+> cross-yield temps + `__state`/`__retry`/`__faulted` become **module globals** (so they survive an IRQ
+> return); `@__react_N_run` is a `switch i32 @__rf_N_state` into per-segment blocks (case 0 resets retry/
+> fault then enters seg-0; case s resumes seg s; default returns). A segment resume-decodes the prior
+> transaction's SR (→ frame temp, or `__faulted` → the Layer-2 disposition, with `Retry` a back-edge to
+> seg-0), then kicks the next (CR/SA/RA/DR volatile stores + `@__bus_owner` + NVIC clear-pending/enable)
+> and suspends, or completes. `@__BUS_IRQHandler` resumes the single owner. The trigger entry coalesces
+> a re-fire while in flight. `BUILD=llvm harness/bus_parity.sh` boots the LLVM firmware on Renode and
+> shows the button reaction running **during** the bus suspension (mid: hits=1, samples=0; end: both 1)
+> — `sim ≡ metal(LLVM)`. **The metal LLVM runtime is now complete** for the every/event/bus core; a real
+> reactive program runs end-to-end through the LLVM backend with no C. (Watchdog/`within`, `poll`/
+> `await`, `now()`/SysTick, and safe-sequence `drive_safe` remain `; unsupported` follow-ups.)
 
 ### 6.4 Generated linker script, vector table, startup, `.data`/`.bss`
 
