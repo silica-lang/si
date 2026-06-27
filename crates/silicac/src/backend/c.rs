@@ -785,7 +785,18 @@ impl CBackend {
             .reactions
             .iter()
             .any(|r| r.overflow == SirOverflow::Fault);
-        if module.safe_seqs.is_empty() && !has_safe_disp && !has_arith_trap && !has_overflow_fault {
+        // A runtime typestate guard (§4.1/D07, audit P3-3) also drives the safe
+        // state, so the function must exist whenever a `DriveSafe` is emitted.
+        let has_drive_safe = module
+            .reactions
+            .iter()
+            .any(|r| any_stmt(&r.body, &|s| matches!(s, SirStmt::DriveSafe)));
+        if module.safe_seqs.is_empty()
+            && !has_safe_disp
+            && !has_arith_trap
+            && !has_overflow_fault
+            && !has_drive_safe
+        {
             return;
         }
         self.line("/* Safe-state drive (§5.6): bounded, non-yielding register writes. */");
@@ -986,6 +997,22 @@ impl CBackend {
                 let c = self.emit_expr(code);
                 self.line(&format!("exit((int)({}));", c));
             }
+            // §4.1/D07 runtime typestate guard failed (audit P3-3): drive safe +
+            // halt — the metal counterpart of the sim's `drive_safe()`.
+            SirStmt::DriveSafe => match self.target {
+                Target::MetalNrf52840 => {
+                    self.line("__asm__ volatile(\"cpsid i\" ::: \"memory\"); /* typestate guard → halt (§4.1/D07) */");
+                    self.line("__drive_safe();");
+                    self.line("for (;;) { __asm__ volatile(\"wfi\"); }");
+                }
+                Target::Host => {
+                    // Host has no safe-sequence emission; a typestate violation is
+                    // a system-integrity fault → exit non-zero (mirrors the sim's
+                    // halt).  §4.1/D07.
+                    self.line("/* typestate precondition failed — system-integrity fault (§4.1/D07) */");
+                    self.line("exit(70); /* EX_SOFTWARE */");
+                }
+            },
         }
     }
 
@@ -2134,6 +2161,7 @@ fn collect_arith_stmts(stmts: &[SirStmt], set: &mut HashSet<(SirArithOp, Overflo
             SirStmt::RingPop { .. } => {}
             SirStmt::Intrinsic(SirIntrinsic::HostIoPrint(e)) => collect_arith_expr(e, set),
             SirStmt::Intrinsic(_) => {}
+            SirStmt::DriveSafe => {}
         }
     }
 }
@@ -2207,6 +2235,7 @@ fn stmts_have_now(stmts: &[SirStmt]) -> bool {
         SirStmt::RingPop { .. } => false,
         SirStmt::Intrinsic(SirIntrinsic::HostIoPrint(e)) => expr_has_now(e),
         SirStmt::Intrinsic(_) => false,
+        SirStmt::DriveSafe => false,
     })
 }
 

@@ -505,12 +505,21 @@ statically-proven fraction; the runtime check is the sound fallback, never silen
 > provably `ready` in a separate `every`/`on` reaction's `read() when ready`. This is sound (sys.start
 > precedes all event/timer reactions) and is the canonical "configure at boot, use everywhere" driver
 > pattern; a device *not* initialised at boot still resets to its declared initial state per reaction
-> (so the check stays honest). `tests/typestate.rs`, `examples/typestate_persist.si`. **Remaining:** the
-> *runtime-precondition* lowering for the unprovable cases (across a `yields` / dynamic ref →
-> Layer-3 fault) and the Layer-3 **site map** (per-call-site debug info so the decoder can name
-> "handler X touched device Y outside its valid state") are follow-ups; today the unprovable case is
-> conservatively a compile error rather than a runtime check, and op-internal transitions are read
-> from the op's own top-level `become` (not through nested sub-op inlining).
+> (so the check stays honest). `tests/typestate.rs`, `examples/typestate_persist.si`.
+>
+> **Runtime-checked half (audit P3-3).** A `when S` op call that is **not** statically provable in its
+> reaction — because `S` is established in a *different* reaction (e.g. configured on a button press,
+> used in a periodic reaction) — no longer needs to be rejected. The compiler emits a **runtime
+> precondition guard**: a generated per-device state cell (`__dev<id>_state`, written by every
+> `become`) is checked at the call site, and a mismatch drives the system to its safe state (§5.6,
+> `SirStmt::DriveSafe`) — calling an op in the wrong state is undefined. A state that **no** reaction
+> can establish stays a compile error (the op is provably uncallable). The same SIR drives both
+> consumers: the sim halts in `drive_safe`; metal does `__drive_safe()` + halt. `harness/typestate_runtime.sh`
+> is the Renode gate (unarmed → ticks frozen; armed → ticks climb); `examples/typestate_runtime.si`.
+> **Remaining:** the Layer-3 **site map** (per-call-site debug info naming "handler X touched device Y
+> outside its valid state"); soundness of a *proven* state across a `yields` when a shared device may
+> be preempted; and op-internal transitions read from the op's own top-level `become` (not through
+> nested sub-op inlining).
 
 An **interface** is the contract a device provides (`implements i2c`) or requires
 (`needs bus: i2c`). Interfaces are how composition is typed: any device providing `i2c` can satisfy

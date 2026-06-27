@@ -371,10 +371,14 @@ smallest/highest-value → largest. (The first feature PR also introduces this s
       `code_dst` path already services an inlined BusXfer. examples/fault_match_composed.si +
       tests/match_stmt.rs (composed); harness/fault_match.sh parametrized (runs on both examples).
       sim + **Renode PASS**.
-- [ ] P3-3 Broader typestate: runtime-precondition lowering (P2-3 follow-up) `[metal]` — the unprovable
-      `when <state>` case (across a `yields`/dynamic ref) becomes a runtime Layer-3 fault instead of a
-      conservative compile error; + single-owner-firing persistence + Layer-3 site map. tests/typestate.rs
-      + sim/metal Layer-3 decode.
+- [x] P3-3 Broader typestate: runtime-precondition lowering (P2-3 follow-up) `[metal]` — PR #61. A
+      `when <state>` op call NOT proven by a dominating `become <state>` in the same reaction (e.g. the
+      state is configured in another reaction) now lowers a RUNTIME guard → safe state on mismatch,
+      instead of a conservative compile error; a state no op can establish stays a compile error. A
+      generated per-device state cell tracks the runtime state (every `become` writes it); new
+      `SirStmt::DriveSafe`. tests/typestate.rs + examples/typestate_runtime.si; sim + **Renode** (guard
+      fires -> ticks freeze; with the config reaction it runs clean). NOTE: across-yield preemption of a
+      shared device's proven state + the rich Layer-3 site map remain follow-ups.
 - [ ] P3-4a Fuller LLVM backend — extended scalar subset (P2-1 follow-up) `[llvm]` — add `Now`/`RegLoad`/
       signed saturate/full `BinOp`/`Not`, `If` control flow, and non-`sys.start` reaction bodies as
       functions (no scheduler yet). tests/llvm_canary.rs + `opt -verify`.

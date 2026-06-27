@@ -263,6 +263,12 @@ pub enum SirStmt {
     If { cond: SirExpr, then: Vec<SirStmt> },
     /// `exit(code)` — terminate the process (host only).
     Exit(SirExpr),
+    /// Drive the system to its safe state (§5.6) and halt — a system-integrity
+    /// fault, not a recoverable Layer-2 disposition.  Emitted by a runtime
+    /// typestate precondition guard (§4.1/D07, audit P3-3): reaching a `when S`
+    /// op while the device is not provably in state S is undefined, so the
+    /// system is driven safe rather than allowed to proceed.
+    DriveSafe,
     /// A priority-ceiling critical section around a shared-cell access (§5.5).
     /// On a single-threaded host the body runs without masking, but the section
     /// is recorded so the analysis is observable; a metal backend lowers

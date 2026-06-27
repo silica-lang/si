@@ -2,6 +2,8 @@
 //! when a dominating `become S` proves the device is in state S; otherwise it is
 //! a compile error.
 
+use silicac::backend::{c, Target};
+use silicac::sim;
 use silicac::sir::SirModule;
 use silicac::{lexer, parser, resolver};
 
@@ -10,6 +12,11 @@ fn compile(src: &str) -> SirModule {
     let ast = parser::parse(tokens).expect("parse");
     resolver::resolve(&ast)
         .unwrap_or_else(|e| panic!("resolve: {:?}", e.iter().map(|d| &d.msg).collect::<Vec<_>>()))
+}
+
+fn trace(src: &str) -> Vec<String> {
+    let sir = compile(src);
+    sim::run(&sir).render(&sir).lines().map(|s| s.to_string()).collect()
 }
 
 fn resolve_err(src: &str) -> Vec<String> {
@@ -139,4 +146,98 @@ fn a_become_to_an_undeclared_state_is_rejected() {
         "dev.power_on()  n = n + 1",
     ));
     assert!(errs.iter().any(|m| m.contains("no such state") && m.contains("flying")), "errs: {:?}", errs);
+}
+
+// ─── Runtime typestate precondition (§4.1/D07, audit #35 P3-3) ────────────────
+
+/// A `thermostat` (idle→ready, + an unreachable `broken` state) plus a program
+/// body of one or more reactions.  `dev_ops` injects extra device ops.
+fn rt(dev_ops: &str, reactions: &str) -> String {
+    format!(
+        r#"
+device thermostat {{
+  regs {{
+    CTRL : reg32 at 0x00 access rw {{ enable: bit[0] }}
+    TEMP : reg32 at 0x04 access ro {{}}
+  }}
+  states {{ idle, ready, broken }}
+  ops {{
+    op power_on() -> () {{ CTRL.enable = 1  become ready }}
+    op read() when ready -> u32 {{ return TEMP }}
+    {dev_ops}
+  }}
+}}
+board demo {{
+  soc s {{ memory {{ flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K }} clocks {{ sysclk : clock_source = 64MHz }} }}
+  t : thermostat at 0x4000_5000
+}}
+program app {{
+  use board demo as b
+  let dev = b.t
+  cell n : u32 = 0
+{reactions}
+}}
+sim app_sim for app {{ run until 250ms }}
+"#
+    )
+}
+
+#[test]
+fn cross_reaction_when_lowers_a_runtime_guard_instead_of_erroring() {
+    // `read()` (when ready) is used in a reaction that doesn't establish `ready`
+    // (it is configured in another reaction) → compiles now (runtime guard).
+    let _ = compile(&rt(
+        "",
+        "  every 50ms { dev.power_on() }\n  every 100ms { let v = dev.read()  n = n + 1 }",
+    ));
+}
+
+#[test]
+fn runtime_guard_passes_when_the_state_was_established_first() {
+    // power_on @50ms arms the device; the read @100/200ms passes → n climbs.
+    let t = trace(&rt(
+        "",
+        "  every 50ms { dev.power_on() }\n  every 100ms { let v = dev.read()  n = n + 1 }",
+    ));
+    assert!(t.iter().any(|l| l.contains("cell n = 1")), "read should pass once armed:\n{}", t.join("\n"));
+}
+
+#[test]
+fn runtime_guard_drives_safe_when_the_state_is_not_yet_established() {
+    // power_on is configured in a *slow* reaction (1000ms) but the read fires
+    // first (100ms) — at runtime the device is still idle, so the guard fires
+    // and drives the safe state before `n` is ever incremented.
+    let t = trace(&rt(
+        "",
+        "  every 1000ms { dev.power_on() }\n  every 100ms { let v = dev.read()  n = n + 1 }",
+    ));
+    assert!(!t.iter().any(|l| l.contains("cell n = 1")), "guard must stop the early read:\n{}", t.join("\n"));
+}
+
+#[test]
+fn a_when_on_an_unreachable_state_is_still_a_compile_error() {
+    // `broken` is declared but no op `become`s it → an op guarded on it can never
+    // be callable → compile error (not a runtime guard).
+    let errs = resolve_err(&rt(
+        "op zap() when broken -> () { }",
+        "  every 100ms { dev.zap() }",
+    ));
+    assert!(
+        errs.iter().any(|m| m.contains("no reaction establishes 'broken'")),
+        "errs: {:?}",
+        errs
+    );
+}
+
+#[test]
+fn metal_emits_the_runtime_state_cell_guard_and_safe_drive() {
+    let sir = compile(&rt(
+        "",
+        "  every 50ms { dev.power_on() }\n  every 100ms { let v = dev.read()  n = n + 1 }",
+    ));
+    let out = c::CBackend::with_target(Target::MetalNrf52840).emit(&sir);
+    // A per-device runtime state cell exists and `become` writes it.
+    assert!(out.contains("_state"), "runtime state cell:\n{}", out);
+    // The guard drives the safe state on a mismatch.
+    assert!(out.contains("__drive_safe"), "safe-state drive:\n{}", out);
 }
