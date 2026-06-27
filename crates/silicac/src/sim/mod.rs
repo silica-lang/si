@@ -901,6 +901,11 @@ impl<'m> Sim<'m> {
             SirStmt::Exit(_) => {
                 self.stop = true;
             }
+            // §4.1/D07 runtime typestate guard failed (audit P3-3): drive the
+            // system to its safe state and halt — a system-integrity fault.
+            SirStmt::DriveSafe => {
+                self.drive_safe();
+            }
         }
     }
 
