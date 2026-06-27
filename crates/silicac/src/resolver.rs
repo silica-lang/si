@@ -1746,25 +1746,46 @@ impl Resolver {
             self.err(span, "a `match` with `ok`/`fault` arms requires a device-op call as its scrutinee (§4.4/D14)");
             return;
         };
-        // Bound to the keystone primitive bus op (empty body + `yields`) so the
-        // outcome flows through the one BusXfer the metal state machine resumes.
-        if !(op.body.stmts.is_empty() && op.yields) {
-            self.err(span, format!("`match` over the result of '{}' is not supported — only a primitive (yielding) bus op carries a matchable fault outcome (§4.4/D14)", op.name.name));
-            return;
-        }
-        let fault_codes: Vec<String> = op.ret.fault_codes.iter().map(|c| c.name.clone()).collect();
-        if fault_codes.is_empty() {
-            self.err(span, format!("op '{}' declares no fault codes — there is nothing to `match` (use a plain call) (§4.4/D14)", op.name.name));
-        }
+        let op_name = op.name.name.clone();
 
         // Lower the scrutinee op-call, capturing its outcome code into a temp.
-        // `lower_op_call` attaches `pending_match_code` to the emitted BusXfer.
+        // `lower_op_call` attaches `pending_match_code` to the *single* primitive
+        // BusXfer it reaches — directly for a leaf bus op, or through inlining for
+        // a **composed** op whose body wraps one bus transaction (e.g. a sensor
+        // `read_temp` = `return bus.read_reg(...)?`), §3.5/§4.4 P3-2.
         let code = self.fresh("code");
         self.pending_match_code = Some(code.clone());
+        let before = out.len();
         let val = self.lower_expr_emit(scrutinee, scope, vars, out);
-        // If the op-call didn't consume it (shouldn't happen — we checked it is a
-        // primitive bus op), clear it so it can't leak onto a later transaction.
         self.pending_match_code = None;
+
+        // The matchable outcome rides exactly one bus transaction — the one that
+        // consumed our `code`.  Its declared `fault_codes` are the runtime truth
+        // (the leaf controller's), so exhaustiveness + arm indices come from it.
+        let mut bus_count = 0usize;
+        let mut fault_codes: Vec<String> = Vec::new();
+        let mut carrier = false;
+        for s in &out[before..] {
+            if let SirStmt::BusXfer { code_dst, fault_codes: fc, .. } = s {
+                bus_count += 1;
+                if code_dst.as_deref() == Some(code.as_str()) {
+                    fault_codes = fc.clone();
+                    carrier = true;
+                }
+            }
+        }
+        if !carrier {
+            self.err(span, format!("`match` over the result of '{}' is not supported — it performs no bus transaction with a matchable fault outcome (call it plainly, or use a value `match`) (§4.4/D14)", op_name));
+            return;
+        }
+        if bus_count > 1 {
+            self.err(span, format!("`match` over the result of '{}' is not yet supported — it performs {} bus transactions; only a single-transaction op carries one matchable outcome (§4.4/D14)", op_name, bus_count));
+            return;
+        }
+        if fault_codes.is_empty() {
+            self.err(span, format!("op '{}' declares no fault codes — there is nothing to `match` (use a plain call) (§4.4/D14)", op_name));
+        }
+
         let value_tmp = self.fresh("okval");
         out.push(SirStmt::Assign { target: SirPlace::Var(value_tmp.clone()), value: val });
 
