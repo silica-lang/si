@@ -167,11 +167,12 @@ fn host_io_is_a_raw_syscall_not_libc() {
 #[test]
 fn unsupported_constructs_are_signposted_not_silently_dropped() {
     // A construct outside the supported subset becomes a visible comment, never
-    // invalid IR — the signpost for what a full LLVM backend would still need
-    // (a ring push has no lowering yet; the MMIO/bus paths are P3-4b/c).
-    let body = vec![SirStmt::RingPush { ring: "q".into(), value: SirExpr::U64(1) }];
+    // invalid IR — the signpost for what a full LLVM backend would still need.
+    // `DeviceOp` stays unsupported by design (the C backend `#error`s it on metal;
+    // the resolver inlines composed ops to register/bus accesses before codegen).
+    let body = vec![SirStmt::DeviceOp { device: 0, op: "frob".into(), args: vec![] }];
     let ll = LlvmBackend::new().emit(&module(vec![], body));
-    assert!(ll.contains("; unsupported in llvm canary: RingPush"), "RingPush should be signposted:\n{}", ll);
+    assert!(ll.contains("; unsupported in llvm canary: DeviceOp"), "DeviceOp should be signposted:\n{}", ll);
     assert!(ll.contains("ret i32 0"));
 }
 
@@ -830,5 +831,62 @@ fn metal_deadline_and_watchdog_are_wired() {
     assert!(ll.contains("store volatile i32 43690") && ll.contains("feed on clean idle"), "no gated feed:\n{}", ll);
     assert!(ll.contains("load i32, ptr @__deadline_missed"), "feed not gated on the deadline:\n{}", ll);
     assert!(ll.contains("ptr @SysTick_Handler"), "SysTick must be vectored (watchdog needs it):\n{}", ll);
+    assert_no_c_isms(&ll);
+}
+
+// ─── P6-1: rings on the LLVM backend ──────────────────────────────────────────
+
+#[test]
+fn ring_lowers_to_backing_store_and_index_math() {
+    // A `ring<u32,4>` cell → backing-array + head/tail/count globals; push/pop/len
+    // become index arithmetic (no `; unsupported`).
+    let mut m = module(vec![cell("out", SirType::U32, 0)], vec![]);
+    m.vars.push(SirVar {
+        name: "q".into(),
+        ty: SirType::Ring { elem_bytes: 4, cap: 4 },
+        init: SirExpr::U64(0),
+        is_cell: true,
+    });
+    let mut rx = reaction(vec![
+        SirStmt::RingPush { ring: "q".into(), value: SirExpr::U64(7) },
+        SirStmt::RingPop { ring: "q".into(), dst: "v".into() },
+        SirStmt::Assign { target: SirPlace::Var("out".into()), value: SirExpr::RingLen("q".into()) },
+    ]);
+    rx.id = 1;
+    rx.trigger = SirTrigger::EveryNs(100_000_000);
+    m.reactions.push(rx);
+    let ll = LlvmBackend::with_target(Target::MetalNrf52840).emit(&m);
+
+    // Backing store globals.
+    assert!(ll.contains("@__ring_q_buf = global [4 x i32] zeroinitializer"), "no ring buffer:\n{}", ll);
+    assert!(ll.contains("@__ring_q_head = global i32 0"), "no head:\n{}", ll);
+    assert!(ll.contains("@__ring_q_count = global i32 0"), "no count:\n{}", ll);
+    // Index math: push stores into buf via GEP, count/tail wrap with urem.
+    assert!(ll.contains("getelementptr [4 x i32], ptr @__ring_q_buf"), "no GEP into ring:\n{}", ll);
+    assert!(ll.contains("urem i32"), "no modulo wrap:\n{}", ll);
+    // len reads count; nothing signposted unsupported.
+    assert!(ll.contains("load i32, ptr @__ring_q_count"), "len must read count:\n{}", ll);
+    assert!(!ll.contains("; unsupported in llvm canary: RingPush"), "RingPush should be lowered:\n{}", ll);
+    assert!(!ll.contains("; unsupported in llvm canary: RingPop"), "RingPop should be lowered:\n{}", ll);
+    assert!(!ll.contains("; unsupported expr in llvm canary: RingLen"), "RingLen should be lowered:\n{}", ll);
+    assert_no_c_isms(&ll);
+}
+
+#[test]
+fn ring_pop_is_bounded_with_an_empty_path() {
+    // pop guards count > 0 and writes 0 on empty (the defined bounded behaviour).
+    let mut m = module(vec![], vec![]);
+    m.vars.push(SirVar {
+        name: "q".into(),
+        ty: SirType::Ring { elem_bytes: 4, cap: 2 },
+        init: SirExpr::U64(0),
+        is_cell: true,
+    });
+    let mut rx = reaction(vec![SirStmt::RingPop { ring: "q".into(), dst: "v".into() }]);
+    rx.id = 1;
+    rx.trigger = SirTrigger::EveryNs(100_000_000);
+    m.reactions.push(rx);
+    let ll = LlvmBackend::with_target(Target::MetalNrf52840).emit(&m);
+    assert!(ll.contains("icmp ugt i32") && ll.contains("@__ring_q_count"), "pop must guard count>0:\n{}", ll);
     assert_no_c_isms(&ll);
 }

@@ -464,5 +464,43 @@ implements every feature, so each gate is `sim ≡ metal(LLVM)` on Renode, the s
       c.rs. Reuses examples/{deadline,bus_watchdog}_nrf52840.si; tests/llvm_canary.rs (26) + harness/
       {deadline_reset,watchdog_reset}.sh gain `BUILD=llvm`. **Renode PASS** — deadline tight=1/loose=0;
       watchdog wedged=1/healthy=0; sim ≡ metal(LLVM). C path unchanged. **Metal LLVM runtime complete.**
+
+### Cluster P6 — deferred follow-ups (LLVM parity + the deferred register)
+Complete the remaining deferred follow-ups: the `; unsupported` LLVM gaps (mirror `backend/c.rs`) and
+the broader deferred register (some are front-to-back features: SIR + sim + resolver + both backends).
+Plan: `~/.claude/plans/as-an-embedded-firmware-functional-pebble.md`. Stacked branches off `main`; PRs
+target `main` (not auto-merged). Each `[metal]` item is `sim ≡ metal` Renode-gated. PAUSE-and-report if a
+Renode path can't be validated or a genuine design fork is the user's call (P6-7/8/9).
+
+- [x] P6-1 Rings on the LLVM backend (`RingPush`/`Pop` + `Len`/`Empty`/`Full`) `[metal]` — PR #72.
+      A `ring<T,N>` cell lowers to backing-store globals (`@__ring_<n>_buf`=`[N x iW]` +
+      `@__ring_<n>_head/_tail/_count`) with push/pop/len as index arithmetic (overwrite-oldest on full,
+      0 on empty), mirroring c.rs. Added a `ring_info` field + ring-global emission; `collect_locals`
+      now recurses into if/critical and allocates RingPop dst. examples/ring_nrf52840.si +
+      tests/llvm_canary.rs (28, repoint the unsupported-signpost test to DeviceOp) + new
+      harness/ring_metal.sh. **Renode PASS** — LLVM-built ring len=4/sum=7 = sim; sim ≡ metal(LLVM).
+- [ ] P6-2 Fixed-point on the LLVM backend (`FixedArith` / `FixedCast`) `[metal]`. Mirror c.rs
+      fixmul/fixdiv (wide intermediate + div0/trap) + the cast binary-point shift. New
+      examples/fixed_nrf52840.si + harness/fixed_metal.sh + canary.
+- [ ] P6-3 LLVM HardFault fault-decoder parity (Layer-3 region map) `[metal]`. Port c.rs
+      emit_fault_decoder (owner table + CFSR/BFAR decode + fault record). Reuse layer3::ownership_map +
+      examples/fault_nrf52840.si + harness/fault_decode_metal.sh + canary. (Finer per-site map deferred.)
+- [ ] P6-4 Dynamic `Bytes` / `host_io.print` on host. Lower SirExpr::Bytes + dynamic HostIoPrint via a
+      private constant + emit_write. Host canary only (host-io has no metal target — see P6-7).
+- [ ] P6-5 `await` full D2-style frame suspend (both backends) `[metal]`. Generalize the bus-only
+      yielding state machine to await; resolver `body_yields` includes Await; TIMER recheck-channel
+      resume; await deadline separate from the watchdog. examples/await_interleave_nrf52840.si +
+      harness/await_interleave.sh (a higher-priority reaction runs DURING the await). PAUSE if true
+      suspend can't be shown.
+- [ ] P6-6 TIMER-rebase `now()`/deadlines, retire SysTick (both backends) `[metal]`. now()/deadlines on
+      the 1 MHz TIMER (64-bit ns extension; preserve the watchdog wake cadence; CC budget). Public
+      change: now() 1 ms → 1 µs; update tests + re-validate all metal gates.
+- [ ] P6-7 Metal semihosting (`host_io` on metal, both backends) `[metal]`. BKPT 0xAB ABI. **PAUSE
+      candidate** — first verify Renode semihosting capture; report if unavailable.
+- [ ] P6-8 Runtime float arithmetic on metal (front-to-back). Float SIR literal+arith, sim float oracle,
+      resolver, C+LLVM emission, FPU enable (CPACR). **PAUSE** to confirm the sim float value model.
+- [ ] P6-9 Multi-consumer bus arbitration / bounded per-bus wait queue (front-to-back). Per-bus owner +
+      queue in SIR, resolver contention, sim oracle, both backends. **PAUSE** to confirm the arbitration
+      policy.
 ## Completed log
 _(append `item — PR #NN — date` here as items land)_

@@ -1,0 +1,48 @@
+// Bounded ring on the nRF52840-DK — isolates the metal LLVM ring lowering
+// (audit P6-1, §5.3).  A single reaction drives a deterministic push/saturate/pop
+// sequence (no inter-reaction timing race), so the observable cells match the
+// simulator exactly.
+//
+//   silicac --sim                                   examples/ring_nrf52840.si
+//   silicac --target metal-nrf52840 --emit-llvm     examples/ring_nrf52840.si -o ring
+//   ./harness/ring_metal.sh                          # sim ≡ metal(LLVM) on Renode
+//
+// A cap-4 ring is filled past capacity, so the two oldest elements are dropped
+// (the defined bounded-overflow policy); then two elements are popped and summed.
+
+board nrf52840_dk {
+  soc nrf52840 {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+}
+
+program app {
+  use board nrf52840_dk as dev
+
+  cell q   : ring<u32, 4> = 0   // bounded queue (init ignored)
+  cell n   : u32 = 0
+  cell len : u32 = 0            // ring length after saturation
+  cell sum : u32 = 0            // sum of the two oldest survivors
+
+  every 100ms {
+    n = n + 1
+    q.push(n)                   // push 1,2,3,4,5,6 → cap 4 keeps 3,4,5,6
+    match n {
+      6 => {
+        len = q.len()           // = 4 (saturated)
+        let a = q.pop()         // 3 (oldest survivor; 1,2 were dropped)
+        let b = q.pop()         // 4
+        sum = a + b             // = 7
+      }
+      _ => {}                   // mandatory default
+    }
+  }
+}
+
+sim app_sim for app {
+  run until 650ms               // n reaches 6 at t=600ms
+}
