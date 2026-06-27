@@ -1,0 +1,68 @@
+// Runtime typestate precondition (§4.1/D07, audit #35 P3-3).
+//
+// `read()` is guarded `when ready`, but it is established in a DIFFERENT reaction
+// (`on button.falling → power_on`), so the periodic reaction cannot statically
+// prove the device is `ready`.  Rather than reject the program at compile time,
+// the compiler lowers a RUNTIME precondition: a per-device state cell (written by
+// every `become`) is checked at the call site, and a mismatch drives the system
+// to its safe state (§5.6) — calling an op in the wrong state is undefined.
+//
+//   silicac --sim examples/typestate_runtime.si                 # button @50ms → runs
+//   silicac --target metal-nrf52840 examples/typestate_runtime.si -o t.elf
+//   ./harness/typestate_runtime.sh                              # sim + metal (Renode)
+//
+// With the button pressed first, the device is `ready` and the periodic read runs
+// (ticks climb).  WITHOUT a press (see the harness), the first read's guard fires
+// and the system halts in its safe state — ticks frozen.
+
+device thermostat {
+  regs {
+    CTRL : reg32 at 0x00 access rw { enable: bit[0] }
+    TEMP : reg32 at 0x04 access ro {}
+  }
+  states { idle, ready }
+  ops {
+    op power_on() -> () { CTRL.enable = 1  become ready }
+    op read() when ready -> u32 { return TEMP }
+  }
+}
+
+board nrf52840_dk {
+  soc nrf52840 {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+
+  gpio0 : nrf_gpio at 0x5000_0000
+  therm : thermostat at 0x4000_5000
+  btn_user : nrf_gpio.pin = gpio0.pin(11) as input pulling up
+}
+
+program app {
+  use board nrf52840_dk as dev
+
+  let therm  = dev.therm
+  let button = dev.btn_user
+
+  cell ticks : u32 = 0
+
+  // Configure the device in one reaction …
+  on button.falling {
+    therm.power_on()        // become ready  (writes the runtime state cell)
+  }
+
+  // … and use it in another.  `read()` is `when ready`, established elsewhere →
+  // a runtime guard (→ safe state if not ready).
+  every 100ms {
+    let v = therm.read()
+    ticks = ticks + 1
+  }
+}
+
+sim app_sim for app {
+  inject btn_user.falling at 50ms   // arm the device before the first read
+  run until 350ms                   // reads at 100/200/300ms all pass → ticks = 3
+}

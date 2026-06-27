@@ -699,6 +699,7 @@ fn stmt_kind(s: &SirStmt) -> &'static str {
         SirStmt::RingPop { .. } => "RingPop",
         SirStmt::If { .. } => "If",
         SirStmt::Exit(_) => "Exit",
+        SirStmt::DriveSafe => "DriveSafe",
         SirStmt::Critical { .. } => "Critical",
         SirStmt::Poll { .. } => "Poll",
         SirStmt::Await { .. } => "Await",

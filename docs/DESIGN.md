@@ -505,12 +505,21 @@ statically-proven fraction; the runtime check is the sound fallback, never silen
 > provably `ready` in a separate `every`/`on` reaction's `read() when ready`. This is sound (sys.start
 > precedes all event/timer reactions) and is the canonical "configure at boot, use everywhere" driver
 > pattern; a device *not* initialised at boot still resets to its declared initial state per reaction
-> (so the check stays honest). `tests/typestate.rs`, `examples/typestate_persist.si`. **Remaining:** the
-> *runtime-precondition* lowering for the unprovable cases (across a `yields` / dynamic ref →
-> Layer-3 fault) and the Layer-3 **site map** (per-call-site debug info so the decoder can name
-> "handler X touched device Y outside its valid state") are follow-ups; today the unprovable case is
-> conservatively a compile error rather than a runtime check, and op-internal transitions are read
-> from the op's own top-level `become` (not through nested sub-op inlining).
+> (so the check stays honest). `tests/typestate.rs`, `examples/typestate_persist.si`.
+>
+> **Runtime-checked half (audit P3-3).** A `when S` op call that is **not** statically provable in its
+> reaction — because `S` is established in a *different* reaction (e.g. configured on a button press,
+> used in a periodic reaction) — no longer needs to be rejected. The compiler emits a **runtime
+> precondition guard**: a generated per-device state cell (`__dev<id>_state`, written by every
+> `become`) is checked at the call site, and a mismatch drives the system to its safe state (§5.6,
+> `SirStmt::DriveSafe`) — calling an op in the wrong state is undefined. A state that **no** reaction
+> can establish stays a compile error (the op is provably uncallable). The same SIR drives both
+> consumers: the sim halts in `drive_safe`; metal does `__drive_safe()` + halt. `harness/typestate_runtime.sh`
+> is the Renode gate (unarmed → ticks frozen; armed → ticks climb); `examples/typestate_runtime.si`.
+> **Remaining:** the Layer-3 **site map** (per-call-site debug info naming "handler X touched device Y
+> outside its valid state"); soundness of a *proven* state across a `yields` when a shared device may
+> be preempted; and op-internal transitions read from the op's own top-level `become` (not through
+> nested sub-op inlining).
 
 An **interface** is the contract a device provides (`implements i2c`) or requires
 (`needs bus: i2c`). Interfaces are how composition is typed: any device providing `i2c` can satisfy
@@ -787,11 +796,25 @@ disposition validation, while the value stays one regular shape to handle.
 > outcome flows through ONE `BusXfer` (`code_dst`: `0` = ok, `1 + i` = the i-th declared fault code),
 > dispatched by the if-chain on both consumers: the **sim** maps an injected `bus_fault <code>` to the
 > arm; **metal** decodes the controller's named SR error bits (nak/arblost/timeout) into the same arm
-> — `harness/fault_match.sh` is the Renode parity gate (every code → its own arm, no cross-talk).
-> examples/fault_match.si, tests/match_stmt.rs. **Remaining:** value patterns are integer/bool only;
-> `match` over a *composed* (inlined, multi-transaction) op's result builds on the single-BusXfer case
-> here; and a yielding `every` reaction's multi-fire re-arm on metal (orthogonal to the decode) is a
-> separate follow-up.
+> — `harness/fault_match.sh` is the Renode parity gate. Since the P3-1 multi-fire fix it drives all
+> four outcomes across four consecutive fires in **one boot** (nak→timeout→arblost→ok), each to its own
+> arm. examples/fault_match.si, tests/match_stmt.rs.
+>
+> **Composed-op match (P3-2).** `match` now also works one composition hop up: a `match
+> sensor.read_temp()` where `read_temp` is a **composed** op whose body wraps a single bus transaction
+> (`return bus.read_reg(...)?`, §3.5) — the outcome rides the inner transaction reached through
+> inlining, so no backend change is needed (the `code_dst` path already services an inlined `BusXfer`).
+> Fault codes + exhaustiveness come from that transaction (the leaf controller's runtime codes); a
+> *multi-transaction* composed op is rejected with a clear error. examples/fault_match_composed.si.
+> **Remaining:** value patterns are integer/bool only; `match` over a multi-transaction composed op.
+>
+> **Status (P3-1 — yielding reactions re-fire on metal).** A yielding `every` reaction now fires
+> repeatedly on metal. The bus completion line is *level* (held asserted until the next transaction),
+> so after `__BUS_IRQHandler` disabled the NVIC line a stale **pending** survived; the next kick's
+> `__bus_irq_enable()` re-took it spuriously and resumed before the new transfer completed — so the
+> reaction fired only once. Fix: each kick clears the bus IRQ's NVIC pending (`__bus_irq_clear_pending`,
+> ICPR) before arming. Gate: `harness/bus_refire.sh` (≥3 fires in one boot → counter == 3);
+> `harness/bus_parity.sh` unchanged. (§5.2)
 
 **Layer 2 — propagation through the reactive model: fault disposition.** Fallibility composes
 *within* a handler (via `?`), but a handler has **no caller to unwind to** — it was invoked by an
