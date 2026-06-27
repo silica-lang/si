@@ -1245,10 +1245,15 @@ checked in §10's foreclosure audit (LLVM, FFI, multicore all remain reachable).
 > `write`/`printf`). Gate: `harness/llvm_canary.sh` runs `llvm-as` + `opt -verify` on the IR, compiles
 > and runs the arithmetic canary (`examples/llvm_canary.si`, exit code 42 = 20 + 22), and greps the IR
 > for any libc/`__builtin` leak; `tests/llvm_canary.rs` asserts the IR shape hermetically (no toolchain
-> needed). Subset today: `on sys.start` reactions, `Assign(Var)`, `Exit`, host-io, and
-> `SirExpr::{Bool,U64,Load,Not,BinOp,Arith,Cast}`; anything else emits a visible `; unsupported`
-> signpost. **Remaining** for a full LLVM backend: reactions beyond `sys.start`, the event loop /
-> scheduler, MMIO register access, the yields state machine, and metal startup/linker emission.
+> needed).
+>
+> **Extended (audit P3-4a).** `@main` runs the `sys.start` bodies and **every other reaction lowers to
+> its own `void @__reaction_N` function**; statements add `If` control flow (so `match` lowers); the
+> expression set adds `Now` (→ `llvm.readcyclecounter`, never a libc clock) and signed `saturate`
+> (clamp via `ashr`). `examples/llvm_features.si` exercises `match`→`if`, `now()`, and a non-`sys.start`
+> reaction; `harness/llvm_canary.sh` `opt -verify`s it. **Remaining** for a full LLVM backend: the
+> event loop / scheduler that *calls* the reaction functions, MMIO register access (`RegLoad`/`Reg`
+> store → `volatile` — P3-4b), the yields state machine, and metal startup/linker emission (P3-4c).
 
 ### 6.4 Generated linker script, vector table, startup, `.data`/`.bss`
 

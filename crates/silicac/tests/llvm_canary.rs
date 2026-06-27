@@ -165,10 +165,99 @@ fn host_io_is_a_raw_syscall_not_libc() {
 
 #[test]
 fn unsupported_constructs_are_signposted_not_silently_dropped() {
-    // A construct outside the canary subset becomes a visible comment, never
-    // invalid IR — the signpost for what a full LLVM backend would still need.
-    let body = vec![SirStmt::If { cond: SirExpr::Bool(true), then: vec![] }];
+    // A construct outside the supported subset becomes a visible comment, never
+    // invalid IR — the signpost for what a full LLVM backend would still need
+    // (a ring push has no lowering yet; the MMIO/bus paths are P3-4b/c).
+    let body = vec![SirStmt::RingPush { ring: "q".into(), value: SirExpr::U64(1) }];
     let ll = LlvmBackend::new().emit(&module(vec![], body));
-    assert!(ll.contains("; unsupported in llvm canary: If"), "If should be signposted:\n{}", ll);
+    assert!(ll.contains("; unsupported in llvm canary: RingPush"), "RingPush should be signposted:\n{}", ll);
     assert!(ll.contains("ret i32 0"));
+}
+
+// ─── P3-4a: extended scalar subset + control flow + reaction functions ────────
+
+#[test]
+fn if_lowers_to_branches() {
+    // `if cond { out = 1 }` → a `br i1` over a then-block joining at endif.
+    let body = vec![SirStmt::If {
+        cond: SirExpr::BinOp(
+            SirBinOp::EqEq,
+            Box::new(SirExpr::Load("sel".into())),
+            Box::new(SirExpr::U64(5)),
+        ),
+        then: vec![SirStmt::Assign {
+            target: SirPlace::Var("out".into()),
+            value: SirExpr::U64(1),
+        }],
+    }];
+    let ll = LlvmBackend::new()
+        .emit(&module(vec![cell("sel", SirType::U32, 5), cell("out", SirType::U32, 0)], body));
+    assert!(ll.contains("br i1"), "no conditional branch:\n{}", ll);
+    assert!(ll.contains("then") && ll.contains("endif"), "no then/endif blocks:\n{}", ll);
+    assert!(ll.contains("br label %endif"), "then must join the end block:\n{}", ll);
+    assert_no_c_isms(&ll);
+}
+
+#[test]
+fn now_is_the_llvm_cycle_counter_not_libc() {
+    let body = vec![SirStmt::Assign {
+        target: SirPlace::Var("stamp".into()),
+        value: SirExpr::Now,
+    }];
+    let ll = LlvmBackend::new().emit(&module(vec![cell("stamp", SirType::Instant, 0)], body));
+    assert!(ll.contains("call i64 @llvm.readcyclecounter()"), "now() not the LLVM intrinsic:\n{}", ll);
+    assert!(ll.contains("declare i64 @llvm.readcyclecounter()"), "intrinsic not declared:\n{}", ll);
+    // Never a libc clock.
+    assert!(!ll.contains("clock_gettime") && !ll.contains("@time"), "now() leaked a libc clock:\n{}", ll);
+    assert_no_c_isms(&ll);
+}
+
+#[test]
+fn signed_saturate_clamps_via_ashr() {
+    // A signed saturating add clamps to INT_MAX/INT_MIN by the sign of lhs.
+    let body = vec![SirStmt::Assign {
+        target: SirPlace::Var("s".into()),
+        value: SirExpr::Arith {
+            op: SirArithOp::Add,
+            mode: OverflowMode::Saturate,
+            width: 16,
+            signed: true,
+            lhs: Box::new(SirExpr::Load("s".into())),
+            rhs: Box::new(SirExpr::U64(1)),
+        },
+    }];
+    let ll = LlvmBackend::new().emit(&module(vec![cell("s", SirType::S16, 0)], body));
+    assert!(ll.contains("@llvm.sadd.with.overflow.i16"), "signed overflow intrinsic:\n{}", ll);
+    assert!(ll.contains("ashr i16"), "signed saturate should clamp via ashr:\n{}", ll);
+    assert!(ll.contains("select i1"), "saturate should select the clamp:\n{}", ll);
+    assert_no_c_isms(&ll);
+}
+
+#[test]
+fn non_sys_start_reactions_become_void_functions() {
+    // A periodic reaction lowers to its own `@__reaction_N` (no scheduler yet);
+    // `@main` (sys.start) and the reaction function coexist in one module.
+    let mut m = module(
+        vec![cell("out", SirType::U32, 0)],
+        vec![SirStmt::Assign { target: SirPlace::Var("out".into()), value: SirExpr::U64(7) }],
+    );
+    let mut rx = reaction(vec![SirStmt::Assign {
+        target: SirPlace::Var("out".into()),
+        value: SirExpr::Arith {
+            op: SirArithOp::Add,
+            mode: OverflowMode::Wrap,
+            width: 32,
+            signed: false,
+            lhs: Box::new(SirExpr::Load("out".into())),
+            rhs: Box::new(SirExpr::U64(1)),
+        },
+    }]);
+    rx.id = 1;
+    rx.trigger = SirTrigger::EveryNs(100_000_000);
+    m.reactions.push(rx);
+    let ll = LlvmBackend::new().emit(&m);
+    assert!(ll.contains("define i32 @main()"), "main present:\n{}", ll);
+    assert!(ll.contains("define void @__reaction_1()"), "reaction function:\n{}", ll);
+    assert!(ll.contains("ret void"), "reaction returns void:\n{}", ll);
+    assert_no_c_isms(&ll);
 }

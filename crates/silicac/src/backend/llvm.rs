@@ -18,11 +18,15 @@
 //!     `printf`/`write` symbol.  The emitted module references no external C
 //!     symbol at all.
 //!
-//! The supported subset (the canary, not the whole language): `on sys.start`
-//! reactions, `Assign(SirPlace::Var)`, `Exit`, the host-io intrinsics, and
-//! `SirExpr::{Bool, U64, Load, Not, BinOp, Arith, Cast}`.  Anything else emits a
-//! `; unsupported in llvm canary` comment (harmless to IR validity) — a deliberate
-//! signpost for what a full LLVM backend would still need.
+//! The supported subset (extended in P3-4a — still not the whole language):
+//! `@main` runs the `on sys.start` bodies and **every other reaction lowers to
+//! its own `void @__reaction_N` function** (no scheduler yet — wiring `every`/`on`
+//! to a timer/IRQ is P3-4c).  Statements: `Assign(SirPlace::Var)`, `If`, `Exit`,
+//! the host-io intrinsics.  Expressions: `SirExpr::{Bool, U64, Load, Not, BinOp,
+//! Arith (trap/wrap/saturate, signed + unsigned), Cast, Now}` (`now()` →
+//! `llvm.readcyclecounter`).  Anything else (MMIO `RegLoad`/`Reg` store — P3-4b;
+//! rings; bus transactions) emits a `; unsupported in llvm canary` comment
+//! (harmless to IR validity) — a deliberate signpost for what is still missing.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -65,8 +69,13 @@ pub struct LlvmBackend {
     globals: String,
     /// `alloca`s for reaction-local `let`s, emitted at the top of `@main`.
     allocas: String,
-    /// The instruction stream of `@main`.
+    /// The instruction stream of the function currently being lowered.
     body: String,
+    /// Completed `define` blocks (`@main` + one per non-`sys.start` reaction).
+    functions: String,
+    /// True while lowering an `i32`-returning function (`@main`); false for the
+    /// `void`-returning reaction functions — so `Exit` picks the right `ret`.
+    ret_i32: bool,
     /// `declare` lines for the LLVM intrinsics actually used (deduped).
     decls: String,
     declared: HashSet<String>,
@@ -88,6 +97,8 @@ impl LlvmBackend {
             globals: String::new(),
             allocas: String::new(),
             body: String::new(),
+            functions: String::new(),
+            ret_i32: true,
             decls: String::new(),
             declared: HashSet::new(),
             next_reg: 0,
@@ -144,48 +155,73 @@ impl LlvmBackend {
                 .push_str(&format!("@{} = global i{} {}\n", v.name, bits, init));
         }
 
-        // 2. Discover reaction-local `let`s (Assign targets that aren't cells)
-        //    and give each an `alloca` at function entry.
-        for r in &module.reactions {
-            if matches!(r.trigger, SirTrigger::SysStart) {
-                self.collect_locals(&r.body);
-            }
-        }
+        // 2. `@main` runs every `on sys.start` body, in order (the program entry).
+        let sys: Vec<&[SirStmt]> = module
+            .reactions
+            .iter()
+            .filter(|r| matches!(r.trigger, SirTrigger::SysStart))
+            .map(|r| r.body.as_slice())
+            .collect();
+        self.lower_function("i32 @main()", true, &sys);
 
-        // 3. Lower every `on sys.start` body into `@main`, in order.
+        // 3. Every other reaction lowers to its own `void` function (no scheduler
+        //    yet — wiring `every`/`on` to a timer/IRQ is P3-4c).  This proves the
+        //    backend can lower reaction bodies beyond `sys.start`.
         for r in &module.reactions {
-            if matches!(r.trigger, SirTrigger::SysStart) {
-                for stmt in &r.body {
-                    if self.terminated {
-                        break;
-                    }
-                    self.emit_stmt(stmt);
-                }
+            if !matches!(r.trigger, SirTrigger::SysStart) {
+                let sig = format!("void @__reaction_{}()", r.id);
+                self.lower_function(&sig, false, &[r.body.as_slice()]);
             }
-        }
-        if !self.terminated {
-            self.inst("ret i32 0");
         }
 
         // 4. Assemble the module.
         let mut out = String::new();
-        out.push_str("; Silica LLVM-IR canary (audit #35 P2-1, DESIGN §6.3/§12)\n");
+        out.push_str("; Silica LLVM-IR backend (audit #35 P2-1 + P3-4a, DESIGN §6.3/§12)\n");
         out.push_str("; A second, structurally independent SIR consumer — proves SIR is\n");
         out.push_str("; target-neutral and the overflow trap is not a C-ism.\n\n");
         if !self.globals.is_empty() {
             out.push_str(&self.globals);
             out.push('\n');
         }
-        out.push_str("define i32 @main() {\n");
-        out.push_str("entry:\n");
-        out.push_str(&self.allocas);
-        out.push_str(&self.body);
-        out.push_str("}\n");
+        out.push_str(&self.functions);
         if !self.decls.is_empty() {
             out.push('\n');
             out.push_str(&self.decls);
         }
         out
+    }
+
+    /// Lower a list of statement bodies into one LLVM function `define`, appended
+    /// to `self.functions`.  `ret_i32` selects the return type (`@main` returns
+    /// `i32`; reaction functions return `void`).  Per-function state (the
+    /// instruction stream, allocas, locals, terminator flag) is reset first;
+    /// the SSA/label counters stay monotonic (uniqueness within each function is
+    /// all LLVM requires).
+    fn lower_function(&mut self, sig: &str, ret_i32: bool, bodies: &[&[SirStmt]]) {
+        self.body.clear();
+        self.allocas.clear();
+        self.terminated = false;
+        self.ret_i32 = ret_i32;
+        // Drop the previous function's locals; keep module globals.
+        self.vars.retain(|_, v| v.2);
+        for b in bodies {
+            self.collect_locals(b);
+        }
+        for b in bodies {
+            for stmt in b.iter() {
+                if self.terminated {
+                    break;
+                }
+                self.emit_stmt(stmt);
+            }
+        }
+        if !self.terminated {
+            self.inst(if ret_i32 { "ret i32 0" } else { "ret void" });
+        }
+        self.functions.push_str(&format!("define {} {{\nentry:\n", sig));
+        self.functions.push_str(&self.allocas);
+        self.functions.push_str(&self.body);
+        self.functions.push_str("}\n\n");
     }
 
     /// Walk a body and `alloca` any Assign-target that is not a known global.
@@ -213,9 +249,39 @@ impl LlvmBackend {
                 self.inst(&format!("store i{} {}, ptr {}", bits, v, ptr));
             }
             SirStmt::Exit(code) => {
-                let v = self.emit_expr(code, 32);
-                self.inst(&format!("ret i32 {}", v));
+                if self.ret_i32 {
+                    let v = self.emit_expr(code, 32);
+                    self.inst(&format!("ret i32 {}", v));
+                } else {
+                    // `exit()` outside `@main` has no process to end here — the
+                    // reaction function just returns (a full scheduler is P3-4c).
+                    self.inst("; exit() in a reaction function → return");
+                    self.inst("ret void");
+                }
                 self.terminated = true;
+            }
+            // `if <cond> { <then> }` — branch over the then-block (§ control flow).
+            SirStmt::If { cond, then } => {
+                let c = self.emit_expr(cond, 1);
+                let then_l = self.fresh_label("then");
+                let end_l = self.fresh_label("endif");
+                self.inst(&format!("br i1 {}, label %{}, label %{}", c, then_l, end_l));
+                self.label(&then_l);
+                self.terminated = false;
+                for s in then {
+                    if self.terminated {
+                        break;
+                    }
+                    self.emit_stmt(s);
+                }
+                // Close the then-block (unless it already ended in a terminator).
+                if !self.terminated {
+                    self.inst(&format!("br label %{}", end_l));
+                }
+                // The end block is always reachable (the false edge), so the
+                // continuation is live regardless of the then-block.
+                self.label(&end_l);
+                self.terminated = false;
             }
             SirStmt::Intrinsic(intr) => self.emit_intrinsic(intr),
             // A critical section is invisible to a single-threaded `@main` — its
@@ -291,6 +357,7 @@ impl LlvmBackend {
             }
             SirExpr::Arith { width, .. } => *width as u32,
             SirExpr::Cast { to_width, .. } => *to_width as u32,
+            SirExpr::Now => 64,
             _ => 64,
         }
     }
@@ -330,6 +397,14 @@ impl LlvmBackend {
                 let v = self.emit_expr(inner, nat);
                 let c = self.convert(&v, nat, *to_width as u32, *signed);
                 self.convert(&c, *to_width as u32, want, *signed)
+            }
+            // `now()` — a monotonic counter.  Lowers to the LLVM cycle-counter
+            // intrinsic (i64), never a libc `clock_gettime` (§4.5).
+            SirExpr::Now => {
+                self.declare("declare i64 @llvm.readcyclecounter()");
+                let t = self.fresh();
+                self.inst(&format!("{} = call i64 @llvm.readcyclecounter()", t));
+                self.convert(&t, 64, want, false)
             }
             other => {
                 self.inst(&format!("; unsupported expr in llvm canary: {}", expr_kind(other)));
@@ -419,13 +494,25 @@ impl LlvmBackend {
                 val
             }
             OverflowMode::Saturate => {
-                // Unsigned saturate: clamp to max on add/mul overflow, to 0 on
-                // sub underflow.  (Signed saturate is a follow-up — the canary
-                // exercises the unsigned path.)
                 let (_agg, ov, raw) = self.with_overflow(opc, width, signed, &l, &r);
-                let clamp = match op {
-                    SirArithOp::Sub => "0".to_string(),
-                    _ => "-1".to_string(), // all-ones = unsigned max at iN
+                let clamp = if signed {
+                    // Signed saturate (P3-4a): on overflow clamp to INT_MAX when
+                    // the result should be positive, INT_MIN when negative.  The
+                    // sign of `lhs` decides it: `(lhs >>s (W-1)) ^ INT_MAX` is
+                    // INT_MAX for lhs ≥ 0 (0 ^ INT_MAX) and INT_MIN for lhs < 0
+                    // (-1 ^ INT_MAX).
+                    let int_max = (1i128 << (width - 1)) - 1;
+                    let sign = self.fresh();
+                    self.inst(&format!("{} = ashr i{w} {}, {}", sign, l, width - 1, w = width));
+                    let cl = self.fresh();
+                    self.inst(&format!("{} = xor i{w} {}, {}", cl, sign, int_max, w = width));
+                    cl
+                } else {
+                    // Unsigned: clamp to 0 on sub underflow, else to all-ones (max).
+                    match op {
+                        SirArithOp::Sub => "0".to_string(),
+                        _ => "-1".to_string(),
+                    }
                 };
                 let t = self.fresh();
                 self.inst(&format!(
