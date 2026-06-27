@@ -1295,6 +1295,15 @@ checked in §10's foreclosure audit (LLVM, FFI, multicore all remain reachable).
 > — `sim ≡ metal(LLVM)`. **The metal LLVM runtime is now complete** for the every/event/bus core; a real
 > reactive program runs end-to-end through the LLVM backend with no C. (Watchdog/`within`, `poll`/
 > `await`, `now()`/SysTick, and safe-sequence `drive_safe` remain `; unsupported` follow-ups.)
+>
+> **`now()` / SysTick (audit P5-1).** The metal LLVM `now()` no longer borrows the host
+> `llvm.readcyclecounter`: the reset programs **SysTick** (SCS `SYST_RVR`/`CVR`/`CSR`, 1 ms base from
+> `c::systick_reload`) when `needs_systick` (now() ∥ a watchdog, mirroring `c.rs`), a
+> `@SysTick_Handler` advances `@__uptime_ns` by 1 ms, vector slot 15 points at it, and `SirExpr::Now`
+> lowers to a `load i64 @__uptime_ns` (the host path keeps the cycle counter). `harness/now_uptime.sh`
+> boots the LLVM firmware on Renode and confirms the `now()`-stamped cell reads ≈ the elapsed wall time
+> (300 ms ± 1 tick) — `sim ≡ metal(LLVM)`. This is the time base the `within`-deadline bookkeeping (P5-4)
+> builds on.
 
 ### 6.4 Generated linker script, vector table, startup, `.data`/`.bss`
 

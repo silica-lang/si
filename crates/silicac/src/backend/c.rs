@@ -2187,7 +2187,7 @@ fn collect_arith_expr(expr: &SirExpr, set: &mut HashSet<(SirArithOp, OverflowMod
     }
 }
 
-fn any_stmt(stmts: &[SirStmt], pred: &dyn Fn(&SirStmt) -> bool) -> bool {
+pub fn any_stmt(stmts: &[SirStmt], pred: &dyn Fn(&SirStmt) -> bool) -> bool {
     stmts.iter().any(|s| {
         pred(s)
             || match s {
@@ -2217,7 +2217,7 @@ fn trigger_comment(trigger: &SirTrigger) -> String {
 
 /// True if any expression in the module reads the clock via `now()` (§4.5) —
 /// gates the `__now_ns()` helper and the metal uptime counter.
-fn module_uses_now(module: &SirModule) -> bool {
+pub fn module_uses_now(module: &SirModule) -> bool {
     module.reactions.iter().any(|r| stmts_have_now(&r.body))
 }
 
@@ -2258,7 +2258,7 @@ fn module_has_bus_xfer(module: &SirModule) -> bool {
 
 /// True if any statement in `stmts` (recursively, through `if`/critical bodies)
 /// is a `poll` — i.e. the reaction can fault via a poll timeout (§3.2).
-fn body_has_poll(stmts: &[SirStmt]) -> bool {
+pub fn body_has_poll(stmts: &[SirStmt]) -> bool {
     // `await` shares the bounded-fault wrapper (`__faulted` → disposition).
     stmts.iter().any(|s| match s {
         SirStmt::Poll { .. } | SirStmt::Await { .. } => true,
