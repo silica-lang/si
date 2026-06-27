@@ -1,0 +1,54 @@
+// `match` over an op's fault codes (§4.4/D14, audit #35 P2-4).
+//
+// A bus op declares the faults it can raise: `read_reg(...) -> u32 or
+// fault{nak, timeout, arblost}`.  Instead of propagating with `?`, a `match`
+// over the *result* dispatches on the outcome — `ok v` binds the value, each
+// `fault <code>` handles one declared failure — and the resolver enforces that
+// **every** declared code (plus `ok`) is covered (or a `_` arm is present).
+//
+//   silicac --sim examples/fault_match.si
+//   ./harness/fault_match.sh                 # sim + metal (Renode) parity
+//
+// The same SIR drives both: the sim maps an injected `bus_fault <code>` to the
+// matching arm; on metal the resumed transaction decodes the controller's SR
+// error bits (nak/arblost/timeout) into the same arm — observable as the cells
+// below (the harness reads them back from RAM, like harness/bus_parity.sh).
+
+board sensor_board {
+  soc s {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+
+  i2c0 : i2c_controller at 0x4000_3000 { needs { clock = soc.sysclk } }
+}
+
+program app {
+  use board sensor_board as b
+
+  let bus = b.i2c0
+
+  cell reads    : u32 = 0   // `ok` arm
+  cell naks     : u32 = 0   // `fault nak`
+  cell timeouts : u32 = 0   // `fault timeout`
+  cell arblosts : u32 = 0   // `fault arblost`
+  cell last     : u32 = 0   // last value seen on success
+
+  every 1000ms {
+    match bus.read_reg(0x40, 0x00) {
+      ok v          => { reads = reads + 1  last = v }
+      fault nak     => { naks = naks + 1 }
+      fault timeout => { timeouts = timeouts + 1 }
+      fault arblost => { arblosts = arblosts + 1 }
+    }
+  }
+}
+
+sim app_sim for app {
+  inject bus_fault nak times 1        // fire @1000ms → nak arm
+  inject bus_fault timeout times 1    // fire @2000ms → timeout arm
+  run until 3500ms                    // fire @3000ms → ok arm (queue drained)
+}

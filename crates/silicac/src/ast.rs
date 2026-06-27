@@ -633,6 +633,12 @@ pub enum MatchPat {
     Lit(Expr),
     /// The `_` wildcard (the mandatory default).
     Wild,
+    /// `ok` / `ok <name>` — the success arm of a `match` over an op's result
+    /// (§4.4/D14).  The optional binding names the returned value.
+    Ok(Option<Ident>),
+    /// `fault <code>` — the arm for a specific declared fault code of the op
+    /// (§4.4/D14).
+    Fault(Ident),
 }
 
 // ─── Expressions ─────────────────────────────────────────────────────────────

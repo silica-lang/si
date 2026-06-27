@@ -184,6 +184,12 @@ enum Payload {
         dst: String,
         propagate: bool,
         outcome: Result<u64, String>,
+        /// `match`-over-result (§4.4/D14): bind the outcome **code index** to
+        /// this local (`0` = ok, `1 + i` = the i-th `fault_codes` entry) instead
+        /// of disposing/swallowing the fault.  `None` = ordinary transaction.
+        code_dst: Option<String>,
+        /// Declared fault codes, in order — maps a fault string to its index.
+        fault_codes: Vec<String>,
     },
     /// Re-check a suspended `await` (§5.2): re-enter the handler at the same `pc`
     /// to re-evaluate its condition (or time out).
@@ -429,8 +435,8 @@ impl<'m> Sim<'m> {
                         kind: TraceKind::Fault { address: addr, diagnosis: decoded.diagnosis },
                     });
                 }
-                Payload::Resume { act, device, op, dst, propagate, outcome } => {
-                    self.resume(act, device, op, dst, propagate, outcome);
+                Payload::Resume { act, device, op, dst, propagate, outcome, code_dst, fault_codes } => {
+                    self.resume(act, device, op, dst, propagate, outcome, code_dst, fault_codes);
                 }
                 Payload::AwaitRecheck { act } => {
                     // Re-enter at the same pc — run_activation re-evaluates the await.
@@ -571,7 +577,7 @@ impl<'m> Sim<'m> {
                 return;
             }
             match &body[act.pc] {
-                SirStmt::BusXfer { device, op, args, dst, propagate, .. } => {
+                SirStmt::BusXfer { device, op, args, dst, propagate, code_dst, fault_codes } => {
                     let argvals: Vec<u64> = args.iter().map(|a| self.eval_expr(a, &act.locals)).collect();
                     let _ = argvals; // args drive a real controller on metal; the mock is value-fixed
                     self.trace.push(TraceRecord {
@@ -598,6 +604,8 @@ impl<'m> Sim<'m> {
                                     dst: dst.clone(),
                                     propagate: *propagate,
                                     outcome,
+                                    code_dst: code_dst.clone(),
+                                    fault_codes: fault_codes.clone(),
                                 },
                             });
                             return; // suspend — the scheduler runs other work meanwhile
@@ -663,12 +671,30 @@ impl<'m> Sim<'m> {
     }
 
     /// Resume a suspended activation when its bus transaction completes.
-    fn resume(&mut self, mut act: Activation, device: usize, op: String, dst: String, propagate: bool, outcome: Result<u64, String>) {
+    #[allow(clippy::too_many_arguments)] // mirrors the BusXfer / Resume payload
+    fn resume(&mut self, mut act: Activation, device: usize, op: String, dst: String, propagate: bool, outcome: Result<u64, String>, code_dst: Option<String>, fault_codes: Vec<String>) {
         let code = outcome.as_ref().err().cloned();
         self.trace.push(TraceRecord {
             at_ns: self.now,
             kind: TraceKind::BusDone { device, op, code: code.clone() },
         });
+        // `match` over the result (§4.4/D14): bind the outcome code index and the
+        // value, then run the following match if-chain — never dispose here.
+        if let Some(code_var) = code_dst {
+            let (val, idx) = match &outcome {
+                Ok(v) => (*v, 0u64),
+                Err(c) => {
+                    // Map the fault string to its declared 1-based index; an
+                    // unknown code (shouldn't happen) falls through to the `_`.
+                    let i = fault_codes.iter().position(|f| f == c).map(|p| p as u64 + 1).unwrap_or(u64::MAX);
+                    (0, i)
+                }
+            };
+            act.locals.insert(code_var, idx);
+            act.locals.insert(dst, val);
+            self.run_activation(act);
+            return;
+        }
         match outcome {
             Ok(v) => {
                 act.locals.insert(dst, v);
