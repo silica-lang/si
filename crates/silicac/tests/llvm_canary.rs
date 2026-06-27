@@ -975,3 +975,44 @@ fn fixed_cast_shifts_the_binary_point() {
     assert!(!ll.contains("; unsupported expr in llvm canary: FixedCast"), "FixedCast should be lowered:\n{}", ll);
     assert_no_c_isms(&ll);
 }
+
+// ─── P6-3: LLVM HardFault fault-decoder parity ────────────────────────────────
+
+#[test]
+fn metal_emits_the_layer3_fault_decoder() {
+    // The HardFault handler reads SCB CFSR/BFAR, finds the owning region from the
+    // address-ownership table, and records the fault to fixed RAM (no on-device
+    // strings — the host renders labels from indices).
+    let mut m = module(vec![cell("lit", SirType::Bool, 0)], vec![]);
+    let mut rx = reaction(vec![SirStmt::Assign {
+        target: SirPlace::Var("lit".into()),
+        value: SirExpr::Bool(true),
+    }]);
+    rx.id = 1;
+    rx.trigger = SirTrigger::EveryNs(500_000_000);
+    m.reactions.push(rx);
+    m.devices.push(SirDevice {
+        id: 0,
+        name: "gpio0".into(),
+        base_addr: Some(0x5000_0000),
+        kind: SirDeviceKind::Gpio,
+        regs: vec![],
+    });
+    let ll = LlvmBackend::with_target(Target::MetalNrf52840).emit(&m);
+
+    // The decoder function + ownership table + fault record.
+    assert!(ll.contains("define void @HardFault_Handler()"), "no HardFault decoder:\n{}", ll);
+    assert!(ll.contains("@__owner_start = constant"), "no ownership-start table:\n{}", ll);
+    assert!(ll.contains("@__owner_end = constant"), "no ownership-end table:\n{}", ll);
+    assert!(ll.contains("@__fault_owner = global i32 -1"), "no fault-owner record:\n{}", ll);
+    assert!(ll.contains("@__fault_pending = global i32 0"), "no fault-pending record:\n{}", ll);
+    // Reads SCB CFSR (0xE000ED28 = 3758157096) + BFAR (0xE000ED38 = 3758157112).
+    assert!(ll.contains("inttoptr i64 3758157096 to ptr"), "must read SCB CFSR:\n{}", ll);
+    assert!(ll.contains("inttoptr i64 3758157112 to ptr"), "must read SCB BFAR:\n{}", ll);
+    // BFARVALID gate (bit 15 = 32768) + the owner-range comparison.
+    assert!(ll.contains("and i32") && ll.contains("32768"), "no BFARVALID check:\n{}", ll);
+    assert!(ll.contains("icmp uge i32") && ll.contains("icmp ult i32"), "no owner-range check:\n{}", ll);
+    // HardFault is vectored (slot 3).
+    assert!(ll.contains("ptr @HardFault_Handler"), "HardFault not vectored:\n{}", ll);
+    assert_no_c_isms(&ll);
+}

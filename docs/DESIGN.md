@@ -1355,6 +1355,16 @@ checked in §10's foreclosure audit (LLVM, FFI, multicore all remain reachable).
 > program (`opt -O2` folds the scale constants so a divide-by-constant lowers to shifts, as the C `-Os`
 > does; a runtime divisor would pull libgcc's `__divdi3` either way) and confirms `3·n`/`n÷4` match the
 > simulator — `sim ≡ metal(LLVM)`.
+>
+> **Layer-3 fault decoder (audit P6-3).** The LLVM `@HardFault_Handler` was a bare `wfi` stub; it now
+> emits the full Layer-3 decoder (parity with C): an `@__owner_start`/`@__owner_end` address-ownership
+> table from `layer3::ownership_map` (no on-device strings — the host renders labels from indices), and a
+> handler that reads SCB CFSR/BFAR, finds the owning region on a valid BFAR, and records `{addr, owner,
+> cfsr, pending}` to fixed RAM. The address→owner decode is validated by the sim oracle + the hermetic
+> canary; `harness/fault_decode_metal.sh` confirms the decoder + tables link and coexist with a live
+> program on Renode. (A precise BFAR fault can't be injected on Renode — CFSR is hardware-managed and
+> unmapped reads don't fault the core — the same reason the C Layer-3 has no on-metal fault-injection
+> gate; the *finer* per-call-site map remains deferred.)
 
 ### 6.4 Generated linker script, vector table, startup, `.data`/`.bss`
 
