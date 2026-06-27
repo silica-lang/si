@@ -72,4 +72,22 @@ if [[ "$code" -ne 42 ]]; then
 fi
 echo "PASS: canary computed and exited 42."
 
-echo "PASS: LLVM-IR canary gate (P2-1) — SIR is target-neutral; the trap is not a C-ism."
+# ── 5. Extended subset (P3-4a): match→if, now(), non-sys.start reactions ──────
+FEAT="$REPO/examples/llvm_features.si"
+if [[ -f "$FEAT" ]]; then
+  echo "== extended subset (P3-4a): emit + opt -verify examples/llvm_features.si =="
+  cargo run -q --bin silicac -- --emit-llvm "$FEAT" -o "$WORK/features" 2>"$WORK/feat.log" \
+    || { echo "FAIL: --emit-llvm errored on features"; cat "$WORK/feat.log"; exit 1; }
+  FLL="$WORK/features.ll"
+  llvm-as "$FLL" -o "$WORK/features.bc" || { echo "FAIL: llvm-as rejected features IR"; exit 1; }
+  opt -passes=verify "$WORK/features.bc" -o /dev/null || { echo "FAIL: opt -verify rejected features IR"; exit 1; }
+  grep -q "@llvm.readcyclecounter()" "$FLL" || { echo "FAIL: now() is not the LLVM cycle counter"; exit 1; }
+  grep -q "define void @__reaction_" "$FLL" || { echo "FAIL: no non-sys.start reaction function"; exit 1; }
+  grep -q "br i1" "$FLL" || { echo "FAIL: match did not lower to branches"; exit 1; }
+  if grep -Eq "__builtin|@printf|@malloc|clock_gettime" "$FLL"; then
+    echo "FAIL: features IR leaks a C-ism"; exit 1
+  fi
+  echo "PASS: extended subset is well-formed (match→if, now()→llvm.readcyclecounter, reaction functions; no C-ism)."
+fi
+
+echo "PASS: LLVM-IR backend gate (P2-1 + P3-4a) — SIR is target-neutral; the trap is not a C-ism."
