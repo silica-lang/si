@@ -1043,9 +1043,10 @@ impl CBackend {
                         self.line(&line);
                     }
                     _ => {
-                        // Variable-length bytes — emit a helper call.
+                        // A runtime value — print it as unsigned decimal (P6-4),
+                        // matching the simulator's `host_io.print(<value>)` oracle.
                         let e = self.emit_expr(expr);
-                        self.line(&format!("/* TODO: dynamic bytes print: {} */", e));
+                        self.line(&format!("{{ char __b[24]; int __n = 0; uint64_t __v = (uint64_t)({}); do {{ __b[__n++] = (char)('0' + (__v % 10U)); __v /= 10U; }} while (__v); char __o[24]; for (int __i = 0; __i < __n; __i++) __o[__i] = __b[__n - 1 - __i]; __host_io_print((const uint8_t *)__o, (uint32_t)__n); }}", e));
                     }
                 }
             }

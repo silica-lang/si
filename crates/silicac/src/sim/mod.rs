@@ -794,7 +794,7 @@ impl<'m> Sim<'m> {
 
     fn eval_stmt(&mut self, stmt: &SirStmt, frame: &mut HashMap<String, u64>) {
         match stmt {
-            SirStmt::Intrinsic(intr) => self.eval_intrinsic(intr),
+            SirStmt::Intrinsic(intr) => self.eval_intrinsic(intr, frame),
             SirStmt::Assign { target, value } => {
                 let v = self.eval_expr(value, frame);
                 // Read-to-clear (§4.2/D04, P0-2b): a read of an `rc` register has
@@ -909,7 +909,7 @@ impl<'m> Sim<'m> {
         }
     }
 
-    fn eval_intrinsic(&mut self, intr: &SirIntrinsic) {
+    fn eval_intrinsic(&mut self, intr: &SirIntrinsic, frame: &HashMap<String, u64>) {
         match intr {
             SirIntrinsic::HostIoPrintStr(s) => {
                 self.stdout.push_str(s);
@@ -919,14 +919,19 @@ impl<'m> Sim<'m> {
                 });
             }
             SirIntrinsic::HostIoPrint(e) => {
-                if let SirExpr::Bytes(b) = e {
-                    let s = String::from_utf8_lossy(b).into_owned();
-                    self.stdout.push_str(&s);
-                    self.trace.push(TraceRecord {
-                        at_ns: self.now,
-                        kind: TraceKind::Print { text: s },
-                    });
-                }
+                // A byte-string literal prints verbatim; any other expression is a
+                // runtime value, printed as unsigned decimal (P6-4) — the oracle
+                // the C/LLVM host backends match.
+                let s = if let SirExpr::Bytes(b) = e {
+                    String::from_utf8_lossy(b).into_owned()
+                } else {
+                    self.eval_expr(e, frame).to_string()
+                };
+                self.stdout.push_str(&s);
+                self.trace.push(TraceRecord {
+                    at_ns: self.now,
+                    kind: TraceKind::Print { text: s },
+                });
             }
             SirIntrinsic::HostIoFlush => {}
         }
