@@ -516,8 +516,13 @@ Renode path can't be validated or a genuine design fork is the user's call (P6-7
 - [ ] P6-6 TIMER-rebase `now()`/deadlines, retire SysTick (both backends) `[metal]`. now()/deadlines on
       the 1 MHz TIMER (64-bit ns extension; preserve the watchdog wake cadence; CC budget). Public
       change: now() 1 ms → 1 µs; update tests + re-validate all metal gates.
-- [ ] P6-7 Metal semihosting (`host_io` on metal, both backends) `[metal]`. BKPT 0xAB ABI. **PAUSE
-      candidate** — first verify Renode semihosting capture; report if unavailable.
+- [x] P6-7 Metal semihosting (`host_io` on metal, both backends) `[metal]` — PR #78. `host_io.print` on
+      metal → ARM semihosting (NUL-terminated constant + BKPT 0xAB SYS_WRITE0; runtime value reuses the
+      decimal itoa). Both backends (LLVM inline asm; C register-pinned bkpt). The earlier PAUSE is
+      resolved: Renode has no EnableSemihosting toggle, but attaching `UART.SemihostingUart @ cpu` +
+      `CreateFileBackend` captures the output headlessly. examples/semihosting_nrf52840.si +
+      tests/llvm_canary.rs + harness/semihosting.sh. **Renode PASS** (C and BUILD=llvm) — captured
+      stream (n=1/n=2/n=3) = sim stdout; sim ≡ metal.
 - [x] P6-8 Runtime float arithmetic on metal (front-to-back) `[metal]` — PR #77. Float was storage-only
       (math silently miscompiled to integer). Now front-to-back: SIR `FloatLit`/`FloatArith`; resolver
       types it type-directed (a decimal/int literal is float in a float context — `3.5` stays Q16.16

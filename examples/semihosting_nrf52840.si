@@ -1,0 +1,37 @@
+// Metal host_io via ARM semihosting on the nRF52840-DK (audit P6-7, §7.1).
+//
+//   silicac --sim                                   examples/semihosting_nrf52840.si
+//   silicac --target metal-nrf52840 --emit-llvm     examples/semihosting_nrf52840.si -o sh
+//   ./harness/semihosting.sh                          # sim stdout ≡ metal semihosting
+//
+// On metal `host_io.print` has no syscall and no UART wired here — it uses ARM
+// semihosting (BKPT 0xAB / SYS_WRITE0), the debug-probe console that Renode
+// captures via its SemihostingUart.  A string prints verbatim; a runtime value
+// prints as unsigned decimal (same as the host path).
+
+board nrf52840_dk {
+  soc nrf52840 {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+}
+
+program app {
+  use board nrf52840_dk as dev
+
+  cell n : u32 = 0
+
+  every 100ms {
+    n = n + 1
+    host_io.print("n=")
+    host_io.print(n)          // runtime value → decimal
+    host_io.print("\n")
+  }
+}
+
+sim app_sim for app {
+  run until 350ms             // prints n=1 / n=2 / n=3
+}
