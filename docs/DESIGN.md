@@ -497,9 +497,15 @@ statically-proven fraction; the runtime check is the sound fallback, never silen
 
 > **Status (implemented — static half).** Devices declare `states { … }`; an op may be guarded
 > `when <state>` and transitions with `become <state>`. The resolver tracks each device's provable
-> state through a reaction's straight-line flow (reset at every event boundary, since typestate is
-> not carried across one): a `when S` op call when a dominating `become S` has not run is a compile
-> error; a `when`/`become` naming an undeclared state is rejected at the device. **Remaining:** the
+> state through a reaction's straight-line flow: a `when S` op call when a dominating `become S` has
+> not run is a compile error; a `when`/`become` naming an undeclared state is rejected at the device.
+> **Persistent across reactions (audit #35 P2-2).** State established during `on sys.start` — the
+> boot-time writer that runs exactly once before the scheduler — now **persists** into every later
+> reaction (`persistent_states`), so a device configured at boot (`power_on()` → `become ready`) is
+> provably `ready` in a separate `every`/`on` reaction's `read() when ready`. This is sound (sys.start
+> precedes all event/timer reactions) and is the canonical "configure at boot, use everywhere" driver
+> pattern; a device *not* initialised at boot still resets to its declared initial state per reaction
+> (so the check stays honest). `tests/typestate.rs`, `examples/typestate_persist.si`. **Remaining:** the
 > *runtime-precondition* lowering for the unprovable cases (across a `yields` / dynamic ref →
 > Layer-3 fault) and the Layer-3 **site map** (per-call-site debug info so the decoder can name
 > "handler X touched device Y outside its valid state") are follow-ups; today the unprovable case is
@@ -1296,6 +1302,16 @@ idioms. Minimal v1: pool/arena allocator, ring buffer, fixed-capacity collection
 and the canonical device types `uart`, `gpio`, `i2c`, `spi`, `timer` (and the interfaces they
 implement). Every std-lib device is built from datasheets (§8), is un-privileged (§2), and
 demonstrates one pattern cleanly, because the agent will learn the language *from these files*.
+
+> **Status (implemented — escape-hatch metric, audit #35 P2-2).** Risk #4 said to *measure* how often
+> escape hatches appear in the idiom corpus rather than assert it. `backend`-free `metrics::
+> count_escape_hatches` (token-based, comment-safe) counts the strictness escape hatches — `<expr> as
+> <type>` casts, the `+%`/`+|`/… wrap-sat ops, and (forward-compat, 0 today) `.raw`/`.le`/`.be` — and
+> the `escape_audit` bin + `harness/escape_hatch_audit.sh` report them per file. Baseline: corpus
+> total **11** (9 casts, 2 wrap/sat), with the **std lib at just 1** (the bme280 compensation cast).
+> `tests/escape_hatch.rs` gates the std lib at ≤ 3 so a regression toward "escape-hatch everywhere"
+> fails CI — the concrete, deterministic proxy for the agentic-native thesis (a live agent eval, risk
+> #5, remains future work).
 
 ### 7.5 Self-versioning
 
