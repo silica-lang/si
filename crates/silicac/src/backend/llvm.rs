@@ -26,15 +26,27 @@
 //! Arith (trap/wrap/saturate, signed + unsigned), Cast, Now}` (`now()` →
 //! `llvm.readcyclecounter`).  MMIO is supported (P3-4b): a `SirPlace::Reg` store
 //! / `RegLoad` lowers to a `volatile` load/store at `base + offset` via
-//! `inttoptr` (a rw field is a read-modify-write).  Anything else (rings, bus
-//! transactions, the scheduler that *calls* the reaction functions — P3-4c)
-//! emits a `; unsupported in llvm canary` comment (harmless to IR validity) — a
-//! deliberate signpost for what is still missing.
+//! `inttoptr` (a rw field is a read-modify-write).
+//!
+//! Two target directions (P3-4c — `with_target`): `Host` emits an `@main` +
+//! raw-syscall host-io module; `MetalNrf52840` emits a **freestanding** module —
+//! a `.vectors` table `[_estack, Reset_Handler]` + a `Reset_Handler` that runs
+//! `sys.start` then idles (`wfi`), no `@main`/syscall — which links against the
+//! generated linker script and **boots on Renode** (`harness/llvm_metal.sh`).
+//!
+//! Anything else (rings, bus transactions, and on metal the scheduler that
+//! *calls* the per-reaction functions + the yields state machine) emits a
+//! `; unsupported in llvm canary` comment (harmless to IR validity) — a
+//! deliberate signpost for what a full LLVM backend would still need.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
+use crate::backend::Target;
 use crate::sir::*;
+
+/// LLVM target triple for the metal direction (Cortex-M4F, Thumb).
+const METAL_TRIPLE: &str = "thumbv7em-none-eabi";
 
 /// Bit width of a scalar SIR type, for `iN` selection.  Non-scalars default to
 /// 64 (they are outside the canary subset and never reach storage here).
@@ -95,10 +107,19 @@ pub struct LlvmBackend {
     /// device id → MMIO base address (audit P3-4b): a `SirPlace::Reg`/`RegLoad`
     /// lowers to a `volatile` load/store at `base + reg_offset` via `inttoptr`.
     device_bases: HashMap<usize, u64>,
+    /// Target direction (audit P3-4c): `Host` → an `@main` + raw-syscall host-io
+    /// module; `MetalNrf52840` → a freestanding module with a `.vectors` table
+    /// and a `Reset_Handler` that runs `sys.start` then idles (links against the
+    /// generated linker script and boots on Renode).
+    target: Target,
 }
 
 impl LlvmBackend {
     pub fn new() -> Self {
+        Self::with_target(Target::Host)
+    }
+
+    pub fn with_target(target: Target) -> Self {
         LlvmBackend {
             globals: String::new(),
             allocas: String::new(),
@@ -113,6 +134,7 @@ impl LlvmBackend {
             vars: HashMap::new(),
             terminated: false,
             device_bases: HashMap::new(),
+            target,
         }
     }
 
@@ -168,18 +190,27 @@ impl LlvmBackend {
                 .push_str(&format!("@{} = global i{} {}\n", v.name, bits, init));
         }
 
-        // 2. `@main` runs every `on sys.start` body, in order (the program entry).
         let sys: Vec<&[SirStmt]> = module
             .reactions
             .iter()
             .filter(|r| matches!(r.trigger, SirTrigger::SysStart))
             .map(|r| r.body.as_slice())
             .collect();
-        self.lower_function("i32 @main()", true, &sys);
 
-        // 3. Every other reaction lowers to its own `void` function (no scheduler
-        //    yet — wiring `every`/`on` to a timer/IRQ is P3-4c).  This proves the
-        //    backend can lower reaction bodies beyond `sys.start`.
+        let metal = self.target == Target::MetalNrf52840;
+        if metal {
+            // Metal (P3-4c): `Reset_Handler` runs `sys.start` then idles; no
+            // `@main`, no host syscalls.  A `.vectors` table + `_estack` make it
+            // boot under the generated linker script.
+            self.lower_reset_handler(&sys);
+        } else {
+            // Host: `@main` runs every `on sys.start` body, in order.
+            self.lower_function("i32 @main()", true, &sys);
+        }
+
+        // Every non-`sys.start` reaction lowers to its own `void` function (no
+        // scheduler yet — wiring `every`/`on` to a timer/IRQ is the remaining
+        // P3-4c work).  This proves the backend lowers bodies beyond `sys.start`.
         for r in &module.reactions {
             if !matches!(r.trigger, SirTrigger::SysStart) {
                 let sig = format!("void @__reaction_{}()", r.id);
@@ -187,11 +218,19 @@ impl LlvmBackend {
             }
         }
 
-        // 4. Assemble the module.
+        // Assemble the module.
         let mut out = String::new();
-        out.push_str("; Silica LLVM-IR backend (audit #35 P2-1 + P3-4a, DESIGN §6.3/§12)\n");
+        out.push_str("; Silica LLVM-IR backend (audit #35 P2-1 + P3-4a/b/c, DESIGN §6.3/§12)\n");
         out.push_str("; A second, structurally independent SIR consumer — proves SIR is\n");
         out.push_str("; target-neutral and the overflow trap is not a C-ism.\n\n");
+        if metal {
+            out.push_str(&format!("target triple = \"{}\"\n\n", METAL_TRIPLE));
+            // The stack top + the vector table the Cortex-M core reads on reset:
+            // [0] = initial SP (= address of `_estack`, a linker symbol), [1] =
+            // the reset vector.  `KEEP(*(.vectors))` places it at flash base.
+            out.push_str("@_estack = external global i8\n");
+            out.push_str("@__vectors = constant [2 x ptr] [ptr @_estack, ptr @Reset_Handler], section \".vectors\", align 4\n\n");
+        }
         if !self.globals.is_empty() {
             out.push_str(&self.globals);
             out.push('\n');
@@ -232,6 +271,41 @@ impl LlvmBackend {
             self.inst(if ret_i32 { "ret i32 0" } else { "ret void" });
         }
         self.functions.push_str(&format!("define {} {{\nentry:\n", sig));
+        self.functions.push_str(&self.allocas);
+        self.functions.push_str(&self.body);
+        self.functions.push_str("}\n\n");
+    }
+
+    /// Metal entry (P3-4c): lower the `sys.start` bodies into `@Reset_Handler`,
+    /// which runs them then **idles** in a `wfi` loop — a bare-metal reset
+    /// handler must never return (there is no caller).  The cell writes land in
+    /// RAM; the linker script + `.vectors` table make the core boot straight into
+    /// this on reset.
+    fn lower_reset_handler(&mut self, bodies: &[&[SirStmt]]) {
+        self.body.clear();
+        self.allocas.clear();
+        self.terminated = false;
+        self.ret_i32 = false;
+        self.vars.retain(|_, v| v.2);
+        for b in bodies {
+            self.collect_locals(b);
+        }
+        for b in bodies {
+            for stmt in b.iter() {
+                if self.terminated {
+                    break;
+                }
+                self.emit_stmt(stmt);
+            }
+        }
+        if !self.terminated {
+            let idle = self.fresh_label("idle");
+            self.inst(&format!("br label %{}", idle));
+            self.label(&idle);
+            self.inst("call void asm sideeffect \"wfi\", \"\"()");
+            self.inst(&format!("br label %{}", idle));
+        }
+        self.functions.push_str("define void @Reset_Handler() {\nentry:\n");
         self.functions.push_str(&self.allocas);
         self.functions.push_str(&self.body);
         self.functions.push_str("}\n\n");
@@ -322,6 +396,12 @@ impl LlvmBackend {
     }
 
     fn emit_intrinsic(&mut self, intr: &SirIntrinsic) {
+        // host-io is the host's macOS/arm64 syscall; on metal there is no
+        // semihosting path yet, so it is a signposted no-op (P3-4c).
+        if self.target == Target::MetalNrf52840 {
+            self.inst("; host_io unsupported on metal LLVM (no semihosting yet)");
+            return;
+        }
         match intr {
             SirIntrinsic::HostIoPrintStr(s) => self.emit_write(s.as_bytes()),
             SirIntrinsic::HostIoPrint(SirExpr::Bytes(b)) => self.emit_write(b),

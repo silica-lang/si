@@ -161,11 +161,20 @@ fn run(cfg: &Config) -> Result<(), String> {
     // subset to `.ll`, proving SIR is target-neutral and the overflow trap is a
     // first-class `llvm.*` intrinsic (not a C `__builtin`).
     if cfg.emit_llvm {
-        let ll = backend::llvm::LlvmBackend::new().emit(&sir);
+        let ll = backend::llvm::LlvmBackend::with_target(cfg.target).emit(&sir);
         let ll_path = cfg.output.with_extension("ll");
         std::fs::write(&ll_path, &ll)
             .map_err(|e| format!("cannot write '{}': {}", ll_path.display(), e))?;
         eprintln!("silicac: wrote LLVM IR to '{}'", ll_path.display());
+        // Metal LLVM links against the generated linker script (P3-4c) — same one
+        // the C metal backend uses; write it next to the `.ll`.
+        if cfg.target == Target::MetalNrf52840 {
+            let ld = backend::c::emit_linker_script(&sir)?;
+            let ld_path = cfg.output.with_extension("ld");
+            std::fs::write(&ld_path, ld)
+                .map_err(|e| format!("cannot write '{}': {}", ld_path.display(), e))?;
+            eprintln!("silicac: wrote linker script to '{}'", ld_path.display());
+        }
         return Ok(());
     }
 

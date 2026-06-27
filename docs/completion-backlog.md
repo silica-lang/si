@@ -385,9 +385,13 @@ smallest/highest-value → largest. (The first feature PR also introduces this s
       read-modify-write; wo/w1c = direct store; read = masked + shifted). device_bases in the LLVM
       backend. examples/llvm_mmio.si + tests/llvm_canary.rs (12) + harness/llvm_canary.sh (`opt -verify`
       + `llc` to object). **LLVM 22.1.8 OK.**
-- [ ] P3-4c Fuller LLVM backend — yields state machine + metal startup/linker (P2-1 follow-up) `[metal]` —
-      a real program links via the LLVM backend and runs on Renode (the genuine second-backend proof).
-      Largest; re-implements much of the C metal backend in LLVM IR; PAUSE & report if Renode can't validate.
-
+- [x] P3-4c Fuller LLVM backend — metal startup/linker, boots on Renode (P2-1 follow-up) `[metal]` — PR #64.
+      `LlvmBackend::with_target(metal)` emits a freestanding module: `thumbv7em-none-eabi` triple, a
+      `.vectors` table `[_estack, Reset_Handler]`, and a `Reset_Handler` that runs `sys.start` then idles
+      (`wfi`) — no `@main`/syscall. Links against the generated linker script (now drops `.ARM.exidx`) →
+      **boots on Renode**: SIR → LLVM IR → `llc` → ELF → reads the cell back as 42, C backend uninvolved.
+      examples/boot_nrf52840.si + tests/llvm_canary.rs (14) + harness/llvm_metal.sh. **Renode PASS.** NOTE:
+      minimal-viable — only `sys.start` runs on metal via LLVM; the metal scheduler (every/on → TIMER/GPIOTE)
+      + yields state machine are the next LLVM step (the periodic/event/bus runtime).
 ## Completed log
 _(append `item — PR #NN — date` here as items land)_

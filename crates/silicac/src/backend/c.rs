@@ -2564,6 +2564,10 @@ pub fn emit_linker_script(module: &SirModule) -> Result<String, String> {
     let _ = writeln!(s, "  _sidata = LOADADDR(.data);");
     let _ = writeln!(s, "  .data : {{ _sdata = .; *(.data*) _edata = .; }} > RAM AT > FLASH");
     let _ = writeln!(s, "  .bss  : {{ _sbss = .; *(.bss*) *(COMMON) _ebss = .; }} > RAM");
+    // Freestanding firmware has no stack unwinder; drop ARM EHABI unwind tables
+    // (the LLVM backend's `llc` emits `.ARM.exidx`, which would otherwise pull in
+    // `__aeabi_unwind_cpp_pr0` — no libc here).  Harmless for the C backend too.
+    let _ = writeln!(s, "  /DISCARD/ : {{ *(.ARM.exidx*) *(.ARM.extab*) }}");
     let _ = writeln!(s, "}}");
     Ok(s)
 }
