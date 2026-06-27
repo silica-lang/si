@@ -218,3 +218,101 @@ fn metal_decodes_each_fault_code_from_the_sr_bits() {
     // The if-chain dispatches on the decoded code.
     assert!(out.contains("__matched"), "match dispatch:\n{}", out);
 }
+
+// ─── `match` over a COMPOSED (inlined) op (§3.5/§4.4/D14, audit #35 P3-2) ─────
+
+/// A leaf bus controller (implements an interface) + a **composed** sensor whose
+/// op wraps one bus transaction — the std-less fixture for composed-op matches.
+/// `{extra_ops}` injects additional sensor ops (e.g. a multi-transaction one).
+fn composed(extra_ops: &str) -> String {
+    format!(
+        r#"
+interface bus_if {{
+  op read_reg(addr: u32, reg: u32) -> u32 or fault{{nak, timeout, arblost}} yields
+}}
+device busctl implements bus_if {{
+  regs {{
+    CR : reg32 at 0x00 access rw {{ start: bit[0], dir: bit[1] }}
+    SR : reg32 at 0x04 access ro {{ done: bit[0], nak: bit[1], arblost: bit[2], timeout: bit[3] }}
+    SA : reg32 at 0x08 access rw {{}}
+    RA : reg32 at 0x0C access rw {{}}
+    DR : reg32 at 0x10 access rw {{}}
+  }}
+  ops {{
+    op read_reg(addr: u32, reg: u32) -> u32 or fault{{nak, timeout, arblost}} yields
+  }}
+}}
+device sensor {{
+  needs {{ bus : bus_if }}
+  ops {{
+    op read_temp() -> u32 or fault{{nak, timeout, arblost}} yields {{
+      return bus.read_reg(0x76, 0xFA)?
+    }}
+    {extra_ops}
+  }}
+}}
+board demo {{
+  soc s {{ memory {{ flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K }} clocks {{ sysclk : clock_source = 64MHz }} }}
+  i2c0 : busctl at 0x4000_3000
+  env  : sensor {{ needs {{ bus = i2c0 }} }}
+}}
+program app {{
+  use board demo as b
+  let dev = b.env
+  cell reads : u32 = 0
+  cell naks : u32 = 0
+  cell timeouts : u32 = 0
+  cell arblosts : u32 = 0
+  every 1000ms {{
+    match dev.read_temp() {{
+      ok v          => {{ reads = reads + 1 }}
+      fault nak     => {{ naks = naks + 1 }}
+      fault timeout => {{ timeouts = timeouts + 1 }}
+      fault arblost => {{ arblosts = arblosts + 1 }}
+    }}
+  }}
+}}
+sim app_sim for app {{ inject bus_fault nak times 1  inject bus_fault timeout times 1  run until 3500ms }}
+"#
+    )
+}
+
+#[test]
+fn match_over_a_composed_op_dispatches_each_outcome() {
+    // `dev.read_temp()` is a composed op whose body is `return bus.read_reg(...)?`.
+    // The match's outcome rides the single inner bus transaction (P3-2).
+    let t = trace(&composed(""));
+    let joined = t.join("\n");
+    assert!(t.iter().any(|l| l.contains("cell naks = 1")), "nak arm:\n{joined}");
+    assert!(t.iter().any(|l| l.contains("cell timeouts = 1")), "timeout arm:\n{joined}");
+    assert!(t.iter().any(|l| l.contains("cell reads = 1")), "ok arm:\n{joined}");
+}
+
+#[test]
+fn match_over_a_composed_op_lowers_the_same_on_metal() {
+    // Metal needs no new lowering: the inlined inner BusXfer carries `code_dst`,
+    // so the SR-decode + match if-chain are emitted exactly as for a leaf op.
+    let sir = compile(&composed(""));
+    let out = c::CBackend::with_target(Target::MetalNrf52840).emit(&sir);
+    assert!(out.contains("decode outcome for `match`"), "missing match decode:\n{}", out);
+    assert!(out.contains("/* fault nak */") && out.contains("/* fault timeout */"), "fault decode:\n{}", out);
+}
+
+#[test]
+fn match_over_a_multi_transaction_composed_op_is_rejected() {
+    // A composed op with two bus transactions has no single matchable outcome.
+    let extra = r#"
+    op read2() -> u32 or fault{nak, timeout, arblost} yields {
+      let a = bus.read_reg(0x10, 0x00)?
+      let c = bus.read_reg(0x10, 0x01)?
+      return a + c
+    }"#;
+    let mut src = composed(extra);
+    src = src.replace("match dev.read_temp()", "match dev.read2()");
+    let errs = resolve_err(&src);
+    assert!(
+        errs.iter().any(|m| m.contains("2 bus transactions") || m.contains("single-transaction")),
+        "errs: {:?}",
+        errs
+    );
+}

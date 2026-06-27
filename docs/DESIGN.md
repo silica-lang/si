@@ -788,10 +788,15 @@ disposition validation, while the value stays one regular shape to handle.
 > dispatched by the if-chain on both consumers: the **sim** maps an injected `bus_fault <code>` to the
 > arm; **metal** decodes the controller's named SR error bits (nak/arblost/timeout) into the same arm
 > — `harness/fault_match.sh` is the Renode parity gate (every code → its own arm, no cross-talk).
-> examples/fault_match.si, tests/match_stmt.rs. **Remaining:** value patterns are integer/bool only;
-> `match` over a *composed* (inlined, multi-transaction) op's result builds on the single-BusXfer case
-> here; and a yielding `every` reaction's multi-fire re-arm on metal (orthogonal to the decode) is a
-> separate follow-up.
+> examples/fault_match.si, tests/match_stmt.rs.
+>
+> **Composed-op match (P3-2).** `match` now also works one composition hop up: a `match
+> sensor.read_temp()` where `read_temp` is a **composed** op whose body wraps a single bus transaction
+> (`return bus.read_reg(...)?`, §3.5) — the outcome rides the inner transaction reached through
+> inlining, so no backend change is needed (the `code_dst` path already services an inlined `BusXfer`).
+> Fault codes + exhaustiveness come from that transaction (the leaf controller's runtime codes); a
+> *multi-transaction* composed op is rejected with a clear error. examples/fault_match_composed.si.
+> **Remaining:** value patterns are integer/bool only; `match` over a multi-transaction composed op.
 
 **Layer 2 — propagation through the reactive model: fault disposition.** Fallibility composes
 *within* a handler (via `?`), but a handler has **no caller to unwind to** — it was invoked by an

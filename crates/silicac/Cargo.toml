@@ -3,6 +3,9 @@ name = "silicac"
 version = "0.1.0"
 edition = "2021"
 description = "Silica language compiler — Phase 0"
+# Disambiguate `cargo run` now that `src/bin/escape_audit.rs` adds a second
+# binary (audit P2-2) — the harnesses invoke `cargo run -- …` for the compiler.
+default-run = "silicac"
 
 [lib]
 name = "silicac"

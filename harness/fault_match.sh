@@ -20,7 +20,10 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-EX="$REPO/examples/fault_match.si"
+# Default: the leaf-bus-op example (P2-4); pass a path to validate another (e.g.
+# examples/fault_match_composed.si — the composed-op form, P3-2).  Both expose
+# the same reads/naks/timeouts/arblosts cells.
+EX="${1:-$REPO/examples/fault_match.si}"
 RENODE="${RENODE:-renode}"
 ELFDIR="$(mktemp -d)"
 ELF="$ELFDIR/metal.elf"

@@ -1,0 +1,51 @@
+// `match` over a COMPOSED op's fault codes (§3.5/§4.4/D14, audit #35 P3-2).
+//
+// `sensor.read_temp()` is a composed-device op (std bme280): it has no MMIO of
+// its own — its body is one yielding bus transaction, `return bus.read_reg(...)?`,
+// over the i2c substrate it `needs`.  A `match` over its *result* dispatches the
+// outcome exactly as for a leaf bus op (P2-4): the match's outcome rides the
+// single inner transaction (reached through inlining), so `ok v` / `fault <code>`
+// work one composition hop up, unaware of the bus underneath.
+//
+//   silicac --sim examples/fault_match_composed.si
+//   ./harness/fault_match.sh examples/fault_match_composed.si   # sim + metal
+
+board sensor_board {
+  soc s {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+
+  i2c0 : i2c_controller at 0x4000_3000 { needs { clock = soc.sysclk } }
+  env  : bme280 { needs { bus = i2c0 } }
+}
+
+program app {
+  use board sensor_board as b
+
+  let sensor = b.env
+
+  cell reads    : u32 = 0   // `ok` arm
+  cell naks     : u32 = 0   // `fault nak`
+  cell timeouts : u32 = 0   // `fault timeout`
+  cell arblosts : u32 = 0   // `fault arblost`
+  cell last     : u32 = 0   // last raw value on success
+
+  every 1000ms {
+    match sensor.read_temp() {
+      ok v          => { reads = reads + 1  last = v }
+      fault nak     => { naks = naks + 1 }
+      fault timeout => { timeouts = timeouts + 1 }
+      fault arblost => { arblosts = arblosts + 1 }
+    }
+  }
+}
+
+sim app_sim for app {
+  inject bus_fault nak times 1        // fire @1000ms → nak arm
+  inject bus_fault timeout times 1    // fire @2000ms → timeout arm
+  run until 3500ms                    // fire @3000ms → ok arm (queue drained)
+}
