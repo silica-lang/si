@@ -407,10 +407,12 @@ p4-2 off p4-1, p4-3 off p4-2); PRs target `main` (not auto-merged).
       `@__default_handler`/`@HardFault_Handler` stubs. Reuses `c::{TIMER_BASE,timer_plan,timer_priority}`.
       examples/blink_nrf52840.si + tests/llvm_canary.rs (15) + harness/llvm_metal_sched.sh. **Renode
       PASS** — LLVM-built blink toggles the LED on its 500ms period, sim ≡ metal(LLVM).
-- [ ] P4-2 Metal LLVM `on <pin>.falling` → GPIOTE/NVIC + BASEPRI critical sections (P3-4c follow-up)
-      `[metal]` — GPIOTE config + `@GPIOTE_IRQHandler` + input pull-ups + vector slot 16+6; lower
-      `SirStmt::Critical` to BASEPRI raise/restore. Gate: BUILD=llvm harness/metal_vs_sim.sh on
-      blink_button (button pressed on Renode) — LED sequence ≡ sim.
+- [x] P4-2 Metal LLVM `on <pin>.falling` → GPIOTE/NVIC + BASEPRI critical sections (P3-4c follow-up)
+      `[metal]` — PR #66. Reset configures GPIOTE channels (from module.events) + input pull-ups +
+      NVIC; `@GPIOTE_IRQHandler` clears EVENTS_IN and calls the bound `@__reaction_N`s; GPIOTE vector
+      slot 16+6. `SirStmt::Critical` → BASEPRI raise/restore (msr/mrs basepri + ISB/DMB, ceiling via
+      basepri_byte). tests/llvm_canary.rs (16) + harness/metal_vs_sim.sh gains a `BUILD=llvm` mode.
+      **Renode PASS** — LLVM-built blink_button LED sequence ≡ sim (button + timer); C path unchanged.
 - [ ] P4-3 Metal LLVM yields state machine + bus IRQ (P3-4c follow-up) `[metal]` — segment state
       machine (split at BusXfer; cross-yield temps + state as globals; `@__react_N_run` switch into
       per-segment blocks), bus kick/resume/`@__BUS_IRQHandler`, dispositions. Gate: BUILD=llvm
