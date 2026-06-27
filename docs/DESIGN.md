@@ -1346,6 +1346,15 @@ checked in §10's foreclosure audit (LLVM, FFI, multicore all remain reachable).
 > on full, 0 on empty), mirroring the C `__ring_<n>_*` lowering. `harness/ring_metal.sh` boots an
 > LLVM-built producer that fills a cap-4 ring past capacity then drains it: the observable cells
 > (`len`=4, `sum`=7) match the simulator — `sim ≡ metal(LLVM)`.
+>
+> **Fixed-point (audit P6-2).** `FixedArith`/`FixedCast` now lower (were `; unsupported`): mul/div
+> compute in a 64-bit sign-aware intermediate and rescale by `frac` (mul `>>`, div `<<`-then-divide with
+> a divide-by-zero trap), then apply the overflow mode at `width` (trap range-check → the P5-2
+> `@__silica_overflow_trap`, wrap = trunc, saturate = clamp); the cast shifts the binary point and
+> narrows. Mirrors the C `fixmul`/`fixdiv` helpers. `harness/fixed_metal.sh` boots an LLVM-built Q16.16
+> program (`opt -O2` folds the scale constants so a divide-by-constant lowers to shifts, as the C `-Os`
+> does; a runtime divisor would pull libgcc's `__divdi3` either way) and confirms `3·n`/`n÷4` match the
+> simulator — `sim ≡ metal(LLVM)`.
 
 ### 6.4 Generated linker script, vector table, startup, `.data`/`.bss`
 

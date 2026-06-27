@@ -890,3 +890,88 @@ fn ring_pop_is_bounded_with_an_empty_path() {
     assert!(ll.contains("icmp ugt i32") && ll.contains("@__ring_q_count"), "pop must guard count>0:\n{}", ll);
     assert_no_c_isms(&ll);
 }
+
+// ─── P6-2: fixed-point on the LLVM backend ────────────────────────────────────
+
+#[test]
+fn fixed_mul_lowers_to_wide_intermediate_and_rescale() {
+    // FixedArith Mul → 64-bit intermediate, ashr by frac, trap range-check (the
+    // metal trap routes to @__silica_overflow_trap).
+    let body = vec![SirStmt::Assign {
+        target: SirPlace::Var("out".into()),
+        value: SirExpr::FixedArith {
+            op: FixedArithOp::Mul,
+            mode: OverflowMode::Trap,
+            frac_bits: 16,
+            width: 32,
+            signed: true,
+            lhs: Box::new(SirExpr::Load("a".into())),
+            rhs: Box::new(SirExpr::Load("b".into())),
+        },
+    }];
+    let mut m = module(
+        vec![cell("a", SirType::U32, 0), cell("b", SirType::U32, 0), cell("out", SirType::U32, 0)],
+        vec![],
+    );
+    let mut rx = reaction(body);
+    rx.id = 1;
+    rx.trigger = SirTrigger::EveryNs(100_000_000);
+    m.reactions.push(rx);
+    let ll = LlvmBackend::with_target(Target::MetalNrf52840).emit(&m);
+
+    assert!(ll.contains("mul i64"), "fixed mul must use a 64-bit intermediate:\n{}", ll);
+    assert!(ll.contains("ashr i64") && ll.contains(", 16"), "fixed mul must rescale by frac:\n{}", ll);
+    assert!(ll.contains("call void @__silica_overflow_trap()"), "trap mode must route to safe-state:\n{}", ll);
+    assert!(!ll.contains("; unsupported expr in llvm canary: FixedArith"), "FixedArith should be lowered:\n{}", ll);
+    assert_no_c_isms(&ll);
+}
+
+#[test]
+fn fixed_div_guards_divide_by_zero() {
+    // FixedArith Div → shl-then-sdiv in 64-bit, with a divide-by-zero trap guard.
+    let body = vec![SirStmt::Assign {
+        target: SirPlace::Var("out".into()),
+        value: SirExpr::FixedArith {
+            op: FixedArithOp::Div,
+            mode: OverflowMode::Wrap,
+            frac_bits: 16,
+            width: 32,
+            signed: true,
+            lhs: Box::new(SirExpr::Load("a".into())),
+            rhs: Box::new(SirExpr::Load("b".into())),
+        },
+    }];
+    let mut m = module(
+        vec![cell("a", SirType::U32, 0), cell("b", SirType::U32, 0), cell("out", SirType::U32, 0)],
+        vec![],
+    );
+    let mut rx = reaction(body);
+    rx.id = 1;
+    rx.trigger = SirTrigger::EveryNs(100_000_000);
+    m.reactions.push(rx);
+    let ll = LlvmBackend::with_target(Target::MetalNrf52840).emit(&m);
+
+    assert!(ll.contains("shl i64"), "fixed div must shift the dividend:\n{}", ll);
+    assert!(ll.contains("sdiv i64"), "signed fixed div:\n{}", ll);
+    assert!(ll.contains("icmp eq i64") && ll.contains("call void @__silica_overflow_trap()"), "div-by-zero must trap:\n{}", ll);
+    assert_no_c_isms(&ll);
+}
+
+#[test]
+fn fixed_cast_shifts_the_binary_point() {
+    // FixedCast → sign-aware shift in a 64-bit intermediate, then narrow.
+    let body = vec![SirStmt::Assign {
+        target: SirPlace::Var("out".into()),
+        value: SirExpr::FixedCast {
+            inner: Box::new(SirExpr::Load("a".into())),
+            shift: -16,
+            to_width: 32,
+            signed: false,
+        },
+    }];
+    let ll = LlvmBackend::with_target(Target::MetalNrf52840)
+        .emit(&module(vec![cell("a", SirType::U32, 0), cell("out", SirType::U32, 0)], body));
+    assert!(ll.contains("lshr i64") && ll.contains(", 16"), "fixed cast must shift the binary point:\n{}", ll);
+    assert!(!ll.contains("; unsupported expr in llvm canary: FixedCast"), "FixedCast should be lowered:\n{}", ll);
+    assert_no_c_isms(&ll);
+}

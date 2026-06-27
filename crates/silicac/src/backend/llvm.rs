@@ -69,7 +69,17 @@ fn expr_has_arith_trap(e: &SirExpr) -> bool {
         SirExpr::Arith { mode, lhs, rhs, .. } => {
             *mode == OverflowMode::Trap || expr_has_arith_trap(lhs) || expr_has_arith_trap(rhs)
         }
-        SirExpr::Not(i) | SirExpr::Cast { inner: i, .. } => expr_has_arith_trap(i),
+        // Fixed-point (P6-2): a Trap mode traps on range, and a Div always traps on
+        // divide-by-zero — both route to `@__silica_overflow_trap`.
+        SirExpr::FixedArith { op, mode, lhs, rhs, .. } => {
+            *mode == OverflowMode::Trap
+                || *op == FixedArithOp::Div
+                || expr_has_arith_trap(lhs)
+                || expr_has_arith_trap(rhs)
+        }
+        SirExpr::Not(i) | SirExpr::Cast { inner: i, .. } | SirExpr::FixedCast { inner: i, .. } => {
+            expr_has_arith_trap(i)
+        }
         SirExpr::BinOp(_, l, r) => expr_has_arith_trap(l) || expr_has_arith_trap(r),
         _ => false,
     }
@@ -1998,6 +2008,13 @@ impl LlvmBackend {
                 self.inst(&format!("{} = icmp uge i32 {}, {}", t, c, cap));
                 self.convert(&t, 1, want, false)
             }
+            // Fixed-point mul/div + rescale cast (§4.3, P6-2).
+            SirExpr::FixedArith { op, mode, frac_bits, width, signed, lhs, rhs } => {
+                self.emit_fixed_arith(*op, *mode, *frac_bits, *width as u32, *signed, lhs, rhs, want)
+            }
+            SirExpr::FixedCast { inner, shift, to_width, signed } => {
+                self.emit_fixed_cast(inner, *shift, *to_width as u32, *signed, want)
+            }
             other => {
                 self.inst(&format!("; unsupported expr in llvm canary: {}", expr_kind(other)));
                 "0".into()
@@ -2152,6 +2169,120 @@ impl LlvmBackend {
         let val = self.fresh();
         self.inst(&format!("{} = extractvalue {{ i{w}, i1 }} {}, 0", val, agg, w = width));
         (agg, ov, val)
+    }
+
+    /// Emit a conditional trap: if `cond` (an i1), go to the safe-state trap
+    /// (`@__silica_overflow_trap` on metal, `llvm.trap` on host) + `unreachable`;
+    /// else fall through.  Shared by the fixed-point trap/div-by-zero paths (P6-2).
+    fn emit_trap_if(&mut self, cond: &str) {
+        let trap = self.fresh_label("trap");
+        let cont = self.fresh_label("cont");
+        self.inst(&format!("br i1 {}, label %{}, label %{}", cond, trap, cont));
+        self.label(&trap);
+        if self.target == Target::MetalNrf52840 {
+            self.inst("call void @__silica_overflow_trap()");
+        } else {
+            self.declare("declare void @llvm.trap()");
+            self.inst("call void @llvm.trap()");
+        }
+        self.inst("unreachable");
+        self.label(&cont);
+    }
+
+    /// Fixed-point mul/div with rescale (§4.3 P0-3c, P6-2): compute in a 64-bit
+    /// (sign-aware) intermediate so a width≤32 product/quotient can't overflow it,
+    /// rescale by `frac`, then apply the overflow mode at `width`.  Mirrors the C
+    /// `fixmul`/`fixdiv` helpers; the result is returned at `want` bits.
+    fn emit_fixed_arith(
+        &mut self,
+        op: FixedArithOp,
+        mode: OverflowMode,
+        frac: u8,
+        width: u32,
+        signed: bool,
+        lhs: &SirExpr,
+        rhs: &SirExpr,
+        want: u32,
+    ) -> String {
+        let a = self.emit_expr(lhs, width);
+        let b = self.emit_expr(rhs, width);
+        // Widen both operands to a 64-bit intermediate (sign-aware).
+        let a64 = self.convert(&a, width, 64, signed);
+        let b64 = self.convert(&b, width, 64, signed);
+        let raw = match op {
+            FixedArithOp::Mul => {
+                let p = self.fresh();
+                self.inst(&format!("{} = mul i64 {}, {}", p, a64, b64));
+                let r = self.fresh();
+                let sh = if signed { "ashr" } else { "lshr" };
+                self.inst(&format!("{} = {} i64 {}, {}", r, sh, p, frac));
+                r
+            }
+            FixedArithOp::Div => {
+                // Divide-by-zero → safe-state trap (regardless of mode).
+                let z = self.fresh();
+                self.inst(&format!("{} = icmp eq i64 {}, 0", z, b64));
+                self.emit_trap_if(&z);
+                let an = self.fresh();
+                self.inst(&format!("{} = shl i64 {}, {}", an, a64, frac));
+                let r = self.fresh();
+                let d = if signed { "sdiv" } else { "udiv" };
+                self.inst(&format!("{} = {} i64 {}, {}", r, d, an, b64));
+                r
+            }
+        };
+        // Apply the overflow mode at `width` on the 64-bit raw value.
+        let (lo, hi): (i128, i128) = if signed {
+            (-(1i128 << (width - 1)), (1i128 << (width - 1)) - 1)
+        } else {
+            (0, (1i128 << width) - 1)
+        };
+        let narrowed = match mode {
+            OverflowMode::Wrap => self.convert(&raw, 64, width, signed),
+            OverflowMode::Trap => {
+                let (lt, gt) = if signed { ("slt", "sgt") } else { ("ult", "ugt") };
+                let below = self.fresh();
+                self.inst(&format!("{} = icmp {} i64 {}, {}", below, lt, raw, lo));
+                let above = self.fresh();
+                self.inst(&format!("{} = icmp {} i64 {}, {}", above, gt, raw, hi));
+                let ov = self.fresh();
+                self.inst(&format!("{} = or i1 {}, {}", ov, below, above));
+                self.emit_trap_if(&ov);
+                self.convert(&raw, 64, width, signed)
+            }
+            OverflowMode::Saturate => {
+                let (lt, gt) = if signed { ("slt", "sgt") } else { ("ult", "ugt") };
+                let above = self.fresh();
+                self.inst(&format!("{} = icmp {} i64 {}, {}", above, gt, raw, hi));
+                let c1 = self.fresh();
+                self.inst(&format!("{} = select i1 {}, i64 {}, i64 {}", c1, above, hi, raw));
+                let below = self.fresh();
+                self.inst(&format!("{} = icmp {} i64 {}, {}", below, lt, c1, lo));
+                let c2 = self.fresh();
+                self.inst(&format!("{} = select i1 {}, i64 {}, i64 {}", c2, below, lo, c1));
+                self.convert(&c2, 64, width, signed)
+            }
+        };
+        self.convert(&narrowed, width, want, signed)
+    }
+
+    /// Fixed-point rescale cast (§4.3 P0-3a, P6-2): shift the binary point in a
+    /// 64-bit sign-aware intermediate, then narrow to the target width.  Mirrors
+    /// the C `FixedCast`.  Returned at `want` bits.
+    fn emit_fixed_cast(&mut self, inner: &SirExpr, shift: i8, to_width: u32, signed: bool, want: u32) -> String {
+        // The inner value's storage width — best-effort from its natural bits.
+        let from = store_bits(self.natural_bits(inner));
+        let v = self.emit_expr(inner, from);
+        let v64 = self.convert(&v, from, 64, signed);
+        let scaled = self.fresh();
+        if shift >= 0 {
+            self.inst(&format!("{} = shl i64 {}, {}", scaled, v64, shift));
+        } else {
+            let sh = if signed { "ashr" } else { "lshr" };
+            self.inst(&format!("{} = {} i64 {}, {}", scaled, sh, v64, -(shift as i32)));
+        }
+        let narrowed = self.convert(&scaled, 64, to_width, signed);
+        self.convert(&narrowed, to_width, want, signed)
     }
 
     /// Convert an SSA value from `from` bits to `to` bits.  Literals (operands
