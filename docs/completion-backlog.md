@@ -320,10 +320,16 @@ more expressive (persistent typestate + match-over-fault-codes). Plan:
       resets to its initial state (sound, not blind). tests/typestate.rs (persists; negative control) +
       examples/typestate_persist.si. cargo test green. NOTE: realized scope is the sound configure-at-
       boot pattern; broader single-owner-firing persistence deferred.
-- [ ] P2-1 Thin SIR→LLVM-IR canary (audit #8) `[llvm]` — `brew install llvm`; backend/llvm.rs emits
-      textual LLVM IR for a SIR subset (sys.start, cell assigns, integer Arith via
-      `llvm.*.with.overflow`+`llvm.trap`, exit, host-io) with NO libc/`__builtin`; `--emit-llvm` flag;
-      hermetic test + harness/llvm_canary.sh (`llvm-as`/`opt -verify` + run). Validates risk #2.
+- [x] P2-1 Thin SIR→LLVM-IR canary (audit #8) `[llvm]` — PR #56. `backend/llvm.rs` (`LlvmBackend`)
+      emits textual LLVM IR for a SIR subset (sys.start, cell globals, `Assign(Var)`, integer `Arith`
+      → `llvm.{u,s}{add,sub,mul}.with.overflow.iN` + `llvm.trap`, wrap → plain `iN`, saturate →
+      `select`, `Cast`/`BinOp`/`Not`, `Exit` → `ret i32`, host-io → raw `svc` syscall) with NO
+      libc/`__builtin`; `--emit-llvm` flag (orthogonal to `--target`). examples/llvm_canary.si (exit
+      42 = 20+22). tests/llvm_canary.rs (5, hermetic shape + no-C-ism) + harness/llvm_canary.sh
+      (`llvm-as` + `opt -verify` + compile/run + libc grep) — **PASS** with Homebrew LLVM 22.1.8.
+      Validates risk #2 / the §6.2 purity guard. NOTE: subset only — non-sys.start reactions, the
+      scheduler/event loop, MMIO, the yields state machine, and metal startup/linker are a full-backend
+      follow-up (each unsupported construct emits a visible `; unsupported` signpost).
 - [ ] P2-4 `match` over an op's fault codes (audit #10b, full sim+metal) `[metal]` — `MatchPat::Ok/Fault`,
       parse `ok`/`fault <code>` arms; new SIR fault-or-value result; exhaustiveness vs
       `op.ret.fault_codes`; sim + metal (yields state machine). Largest/riskiest. tests/match_stmt.rs +

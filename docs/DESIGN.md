@@ -1202,6 +1202,21 @@ already target-neutral and below source sugar, the LLVM backend is a second *con
 IR, validating §6.2's guard. Nothing in the language design above assumes C semantics; this is
 checked in §10's foreclosure audit (LLVM, FFI, multicore all remain reachable).
 
+> **Status (audit #35 P2-1 — the canary is live).** A thin second SIR consumer now exists:
+> `backend/llvm.rs` (`LlvmBackend`) lowers a SIR subset to **textual LLVM IR**, reachable via
+> `silicac --emit-llvm`. It is structurally independent of the C path, so it is the standing proof
+> that SIR is target-neutral and that the §6.2 guard is real rather than cosmetic. Two C-isms are
+> proven *absent* by construction: the overflow trap (§4.3/SIL-004) lowers to
+> `llvm.{u,s}{add,sub,mul}.with.overflow.iN` + `llvm.trap` — **not** `__builtin_*_overflow` — and the
+> emitted module references **no libc / C-runtime symbol** (host-io lowers to a raw `svc` syscall, not
+> `write`/`printf`). Gate: `harness/llvm_canary.sh` runs `llvm-as` + `opt -verify` on the IR, compiles
+> and runs the arithmetic canary (`examples/llvm_canary.si`, exit code 42 = 20 + 22), and greps the IR
+> for any libc/`__builtin` leak; `tests/llvm_canary.rs` asserts the IR shape hermetically (no toolchain
+> needed). Subset today: `on sys.start` reactions, `Assign(Var)`, `Exit`, host-io, and
+> `SirExpr::{Bool,U64,Load,Not,BinOp,Arith,Cast}`; anything else emits a visible `; unsupported`
+> signpost. **Remaining** for a full LLVM backend: reactions beyond `sys.start`, the event loop /
+> scheduler, MMIO register access, the yields state machine, and metal startup/linker emission.
+
 ### 6.4 Generated linker script, vector table, startup, `.data`/`.bss`
 
 The typed hardware model already knows the memory map (flash/RAM origin+size), the IRQ table (from
