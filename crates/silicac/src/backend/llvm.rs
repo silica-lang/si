@@ -62,6 +62,31 @@ fn basepri_byte(prio: u8, max_priority: u8) -> u8 {
     ((max_priority - prio) + 1) << 5
 }
 
+/// True if an expression contains an overflow-trapping arithmetic op (§4.3) —
+/// gates the metal `@__silica_overflow_trap` + `@__drive_safe` emission (P5-2).
+fn expr_has_arith_trap(e: &SirExpr) -> bool {
+    match e {
+        SirExpr::Arith { mode, lhs, rhs, .. } => {
+            *mode == OverflowMode::Trap || expr_has_arith_trap(lhs) || expr_has_arith_trap(rhs)
+        }
+        SirExpr::Not(i) | SirExpr::Cast { inner: i, .. } => expr_has_arith_trap(i),
+        SirExpr::BinOp(_, l, r) => expr_has_arith_trap(l) || expr_has_arith_trap(r),
+        _ => false,
+    }
+}
+
+/// True if any statement in `stmts` (through `if`/critical bodies) holds a
+/// trapping arithmetic op.
+fn stmts_have_arith_trap(stmts: &[SirStmt]) -> bool {
+    crate::backend::c::any_stmt(stmts, &|s| match s {
+        SirStmt::Assign { value, .. } => expr_has_arith_trap(value),
+        SirStmt::Exit(e) => expr_has_arith_trap(e),
+        SirStmt::If { cond, .. } => expr_has_arith_trap(cond),
+        SirStmt::RegWrite { writes, .. } => writes.iter().any(|(_, _, _, v)| expr_has_arith_trap(v)),
+        _ => false,
+    })
+}
+
 /// Bit width of a scalar SIR type, for `iN` selection.  Non-scalars default to
 /// 64 (they are outside the canary subset and never reach storage here).
 fn sir_bits(ty: &SirType) -> u32 {
@@ -296,6 +321,26 @@ impl LlvmBackend {
             }
             if needs_systick {
                 self.emit_systick_handler(uses_now);
+            }
+            // Safe-state runtime (P5-2): emit `@__drive_safe` whenever something
+            // references it (a `Safe` disposition, an overflow trap, or a
+            // `DriveSafe` guard), plus `@__silica_overflow_trap` when arithmetic
+            // can trap.  Mirrors the C gating in `emit_drive_safe`.
+            let has_safe_disp = module
+                .reactions
+                .iter()
+                .any(|r| matches!(r.disposition, SirDisposition::Safe));
+            let has_drive_safe = module
+                .reactions
+                .iter()
+                .any(|r| crate::backend::c::any_stmt(&r.body, &|s| matches!(s, SirStmt::DriveSafe)));
+            let has_arith_trap = module.reactions.iter().any(|r| stmts_have_arith_trap(&r.body))
+                || module.safe_seqs.iter().any(|sq| stmts_have_arith_trap(&sq.body));
+            if has_safe_disp || has_drive_safe || has_arith_trap {
+                self.emit_drive_safe_fn(module);
+            }
+            if has_arith_trap {
+                self.emit_overflow_trap_fn();
             }
             self.emit_default_handlers();
         }
@@ -973,13 +1018,8 @@ impl LlvmBackend {
                 self.inst("ret void");
             }
             SirDisposition::Safe => {
-                // No safe-sequence emission on metal LLVM yet — mask + halt.
-                self.m_asm("cpsid i", "safe disposition → halt");
-                let halt = self.fresh_label("safehalt");
-                self.inst(&format!("br label %{}", halt));
-                self.label(&halt);
-                self.m_asm("wfi", "hold safe");
-                self.inst(&format!("br label %{}", halt));
+                // Drive every device to its safe state, then hold (P5-2).
+                self.emit_drive_safe_and_halt("safe disposition → halt (§5.6)");
             }
         }
     }
@@ -1126,6 +1166,22 @@ impl LlvmBackend {
                 value,
             } => {
                 self.emit_reg_store(*device, *reg_offset, *width, *field_mask, *field_shift, *access, value);
+            }
+            // Multi-field single write (§4.2 P0-2c) → ONE ordered volatile store —
+            // used by safe sequences (`@__drive_safe`) and device ops (P5-2).
+            SirStmt::RegWrite { device, reg_offset, width, writes } => {
+                self.emit_reg_write_multi(*device, *reg_offset, *width, writes);
+            }
+            // §4.1/D07 runtime typestate guard failed (P3-3): drive the system to
+            // its safe state and halt (P5-2).  Host has no safe sequence — it is a
+            // signposted system-integrity fault.
+            SirStmt::DriveSafe => {
+                if self.target == Target::MetalNrf52840 {
+                    self.emit_drive_safe_and_halt("typestate guard → halt (§4.1/D07)");
+                    self.terminated = true;
+                } else {
+                    self.inst("; drive_safe (host): system-integrity fault (§4.1/D07)");
+                }
             }
             SirStmt::Exit(code) => {
                 if self.ret_i32 {
@@ -1317,6 +1373,118 @@ impl LlvmBackend {
         }
     }
 
+    /// Lower a `SirStmt::RegWrite` (multi-field) to ONE ordered volatile store
+    /// (§4.2/§6.2): OR every field into one value; if no field needs a read (all
+    /// w1c/wo) it is a single masked write, else a single read-modify-write over
+    /// the union mask — mirrors the C `emit_mmio_store_multi`.
+    fn emit_reg_write_multi(
+        &mut self,
+        device: usize,
+        reg_offset: u64,
+        width: u8,
+        writes: &[(u64, u8, SirRegAccess, SirExpr)],
+    ) {
+        let w = width as u32;
+        let Some(p) = self.reg_ptr(device, reg_offset) else {
+            self.inst(&format!("; unsupported: device {} has no MMIO base", device));
+            return;
+        };
+        // OR the fields into one combined value; track the union of touched masks.
+        let mut union_mask = 0u64;
+        let mut acc: Option<String> = None;
+        for (mask, shift, _access, value) in writes {
+            union_mask |= *mask;
+            let v = self.emit_expr(value, w);
+            let sh = self.fresh();
+            self.inst(&format!("{} = shl i{} {}, {}", sh, w, v, shift));
+            let term = self.fresh();
+            self.inst(&format!("{} = and i{} {}, {}", term, w, sh, mask));
+            acc = Some(match acc {
+                None => term,
+                Some(prev) => {
+                    let o = self.fresh();
+                    self.inst(&format!("{} = or i{} {}, {}", o, w, prev, term));
+                    o
+                }
+            });
+        }
+        let combined = acc.unwrap_or_else(|| "0".to_string());
+        let single_write = writes
+            .iter()
+            .all(|(_, _, a, _)| matches!(a, SirRegAccess::W1c | SirRegAccess::Wo));
+        if single_write {
+            self.inst(&format!("store volatile i{} {}, ptr {}", w, combined, p));
+        } else {
+            let width_mask: u64 = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+            let notmask = (!union_mask) & width_mask;
+            let old = self.fresh();
+            self.inst(&format!("{} = load volatile i{}, ptr {}", old, w, p));
+            let cleared = self.fresh();
+            self.inst(&format!("{} = and i{} {}, {}", cleared, w, old, notmask));
+            let newv = self.fresh();
+            self.inst(&format!("{} = or i{} {}, {}", newv, w, cleared, combined));
+            self.inst(&format!("store volatile i{} {}, ptr {}", w, newv, p));
+        }
+    }
+
+    /// The metal "drive safe + hold" sequence (§4.3/§5.6, P5-2): mask interrupts
+    /// (so no reaction runs during/after the safe writes), run `@__drive_safe`,
+    /// then spin in `wfi` forever.  Ends the current block in a self-loop; the
+    /// caller decides whether the wider statement stream is terminated.
+    fn emit_drive_safe_and_halt(&mut self, comment: &str) {
+        self.m_asm("cpsid i", comment);
+        self.inst("call void @__drive_safe()");
+        let halt = self.fresh_label("safehalt");
+        self.inst(&format!("br label %{}", halt));
+        self.label(&halt);
+        self.m_asm("wfi", "hold in safe state (§4.3/§5.6)");
+        self.inst(&format!("br label %{}", halt));
+    }
+
+    /// `@__drive_safe` (§5.6, P5-2): drive every device with a declared safe
+    /// sequence to its safe state by running its bounded, non-yielding register
+    /// writes (empty body if none — matching the sim's no-op).  Mirrors the C
+    /// `__drive_safe`.
+    fn emit_drive_safe_fn(&mut self, module: &SirModule) {
+        self.body.clear();
+        self.allocas.clear();
+        self.terminated = false;
+        self.ret_i32 = false;
+        self.vars.retain(|_, v| v.2);
+        for seq in &module.safe_seqs {
+            self.collect_locals(&seq.body);
+        }
+        for seq in &module.safe_seqs {
+            self.inst(&format!("; device {} → safe state '{}'", seq.device, seq.state));
+            for stmt in &seq.body {
+                if self.terminated {
+                    break;
+                }
+                self.emit_stmt(stmt);
+            }
+        }
+        if !self.terminated {
+            self.inst("ret void");
+        }
+        self.functions.push_str("define void @__drive_safe() {\nentry:\n");
+        self.functions.push_str(&self.allocas);
+        self.functions.push_str(&self.body);
+        self.functions.push_str("}\n\n");
+    }
+
+    /// `@__silica_overflow_trap` (§4.3, P5-2): the overflow-trap target on metal —
+    /// drive safe + hold.  Mirrors the C `__silica_overflow_trap` (host uses the
+    /// `llvm.trap` intrinsic inline instead).
+    fn emit_overflow_trap_fn(&mut self) {
+        self.body.clear();
+        self.allocas.clear();
+        self.emit_drive_safe_and_halt("overflow → halt (§4.3/SIL-004)");
+        self.functions.push_str("define void @__silica_overflow_trap() {\nentry:\n");
+        self.functions.push_str(&self.allocas);
+        self.functions.push_str(&self.body);
+        self.functions.push_str("}\n\n");
+    }
+
     /// Emit `e` as an operand of exactly `want` bits, inserting conversions.
     fn emit_expr(&mut self, e: &SirExpr, want: u32) -> String {
         match e {
@@ -1469,8 +1637,14 @@ impl LlvmBackend {
                 let cont = self.fresh_label("cont");
                 self.inst(&format!("br i1 {}, label %{}, label %{}", ov, trap, cont));
                 self.label(&trap);
-                self.declare("declare void @llvm.trap()");
-                self.inst("call void @llvm.trap()");
+                // Metal (P5-2): drive the system to its safe state, then hold.
+                // Host: the LLVM trap intrinsic (proves the trap is not a C-ism).
+                if self.target == Target::MetalNrf52840 {
+                    self.inst("call void @__silica_overflow_trap()");
+                } else {
+                    self.declare("declare void @llvm.trap()");
+                    self.inst("call void @llvm.trap()");
+                }
                 self.inst("unreachable");
                 self.label(&cont);
                 val
