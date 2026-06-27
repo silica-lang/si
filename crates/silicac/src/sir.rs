@@ -53,6 +53,9 @@ pub struct SirModule {
     /// Number of bus transactions to *hang* (wedged bus, never complete); from
     /// `inject bus_hang times <n>`.
     pub bus_hangs: u32,
+    /// True if the SoC declares an `fpu` (§4.1/§4.3, P6-8): the metal reset
+    /// handler enables CP10/CP11 (CPACR) so float instructions don't UsageFault.
+    pub fpu: bool,
 }
 
 /// A board pin binding (`led_user : gpio.pin = gpio_a.pin(5) as output`),
@@ -420,6 +423,14 @@ pub enum SirExpr {
     RingEmpty(String),
     /// `ring.is_full()` — count == cap.
     RingFull(String),
+    /// An IEEE-754 float literal (§4.3, P6-8): the bit pattern + width (32/64).
+    /// A decimal literal in a float context lowers here (it stays a Q16.16 fixed
+    /// raw `U64` in a fixed context).  Carried as bits so the sim's `u64` value
+    /// model is unchanged.
+    FloatLit { bits: u64, width: u8 },
+    /// Float arithmetic (§4.3, P6-8): add/sub/mul/div at `width` (32/64).  IEEE
+    /// semantics — overflow is `inf`, not a trap (unlike integer `Arith`).
+    FloatArith { op: SirBinOp, width: u8, lhs: Box<SirExpr>, rhs: Box<SirExpr> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

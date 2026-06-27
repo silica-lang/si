@@ -664,6 +664,20 @@ impl LlvmBackend {
         self.emit_init_loop("_sdata", "_edata", Some("_sidata"));
         self.emit_init_loop("_sbss", "_ebss", None);
 
+        // Enable the FPU (CPACR CP10/CP11) before any float instruction (§4.3,
+        // P6-8) — an FP op UsageFaults on Cortex-M4F otherwise.
+        if module.fpu {
+            let p = self.fresh();
+            self.inst(&format!("{} = inttoptr i64 3758157192 to ptr", p)); // 0xE000ED88
+            let cur = self.fresh();
+            self.inst(&format!("{} = load volatile i32, ptr {}", cur, p));
+            let set = self.fresh();
+            self.inst(&format!("{} = or i32 {}, 15728640", set, cur)); // 0xF << 20
+            self.inst(&format!("store volatile i32 {}, ptr {} ; CPACR: FPU full access", set, p));
+            self.m_asm("dsb 0xf", "FPU enable ordering");
+            self.m_asm("isb 0xf", "before any FP instruction");
+        }
+
         // Output-pin directions (reuse the MMIO field store).
         for pin in module.pins.iter().filter(|p| p.output) {
             self.emit_reg_store(
@@ -1876,6 +1890,8 @@ impl LlvmBackend {
             SirExpr::Cast { to_width, .. } => *to_width as u32,
             SirExpr::RegLoad { width, .. } => *width as u32,
             SirExpr::Now => 64,
+            // Float values carry their IEEE bits in an iN of the float width (P6-8).
+            SirExpr::FloatLit { width, .. } | SirExpr::FloatArith { width, .. } => *width as u32,
             _ => 64,
         }
     }
@@ -2232,6 +2248,32 @@ impl LlvmBackend {
             SirExpr::FixedCast { inner, shift, to_width, signed } => {
                 self.emit_fixed_cast(inner, *shift, *to_width as u32, *signed, want)
             }
+            // Float (§4.3, P6-8): values flow as their IEEE bits in an `iN`; a
+            // literal is just the bit pattern, and arithmetic bitcasts to
+            // `float`/`double`, computes (fadd/fsub/fmul/fdiv), and bitcasts back.
+            SirExpr::FloatLit { bits, width } => self.convert(&bits.to_string(), *width as u32, want, false),
+            SirExpr::FloatArith { op, width, lhs, rhs } => {
+                let w = *width as u32;
+                let a = self.emit_expr(lhs, w);
+                let b = self.emit_expr(rhs, w);
+                let fty = if *width == 32 { "float" } else { "double" };
+                let af = self.fresh();
+                self.inst(&format!("{} = bitcast i{} {} to {}", af, w, a, fty));
+                let bf = self.fresh();
+                self.inst(&format!("{} = bitcast i{} {} to {}", bf, w, b, fty));
+                let fop = match op {
+                    SirBinOp::Add => "fadd",
+                    SirBinOp::Sub => "fsub",
+                    SirBinOp::Mul => "fmul",
+                    SirBinOp::Div => "fdiv",
+                    _ => "fadd",
+                };
+                let rf = self.fresh();
+                self.inst(&format!("{} = {} {} {}, {}", rf, fop, fty, af, bf));
+                let ri = self.fresh();
+                self.inst(&format!("{} = bitcast {} {} to i{}", ri, fty, rf, w));
+                self.convert(&ri, w, want, false)
+            }
             other => {
                 self.inst(&format!("; unsupported expr in llvm canary: {}", expr_kind(other)));
                 "0".into()
@@ -2538,6 +2580,8 @@ fn const_init(e: &SirExpr) -> String {
     match e {
         SirExpr::U64(n) => format!("{}", n),
         SirExpr::Bool(b) => (if *b { "1" } else { "0" }).into(),
+        // A float cell stores the IEEE bit pattern in its iN slot (P6-8).
+        SirExpr::FloatLit { bits, .. } => format!("{}", bits),
         _ => "0".into(),
     }
 }
@@ -2582,5 +2626,7 @@ fn expr_kind(e: &SirExpr) -> &'static str {
         SirExpr::RingLen(_) => "RingLen",
         SirExpr::RingEmpty(_) => "RingEmpty",
         SirExpr::RingFull(_) => "RingFull",
+        SirExpr::FloatLit { .. } => "FloatLit",
+        SirExpr::FloatArith { .. } => "FloatArith",
     }
 }

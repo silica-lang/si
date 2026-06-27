@@ -224,6 +224,12 @@ fn run(cfg: &Config) -> Result<(), String> {
             }
             cmd.arg(flag);
         }
+        // Float/FPU (§4.3, P6-8): target the hardware FPU (hard-float ABI) so float
+        // ops become vadd.f32/… and don't pull soft-float libcalls that -nostdlib
+        // can't satisfy.  Only when the SoC declares an FPU and we're on metal.
+        if cfg.target == Target::MetalNrf52840 && sir.fpu {
+            cmd.arg("-mfpu=fpv4-sp-d16").arg("-mfloat-abi=hard");
+        }
         if let Some(o) = &opt_override {
             cmd.arg(o);
         }

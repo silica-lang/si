@@ -1,0 +1,38 @@
+// Runtime float arithmetic on the nRF52840-DK's Cortex-M4F (audit P6-8, §4.3).
+//
+//   silicac --sim                                   examples/float_nrf52840.si
+//   silicac --target metal-nrf52840 --emit-llvm     examples/float_nrf52840.si -o flt
+//   ./harness/float_metal.sh                          # sim ≡ metal(LLVM) on Renode
+//
+// Float is opt-in and FPU-gated (§4.1): the SoC declares `fpu`, so `float` cells +
+// `+ - * /` on floats are allowed.  The metal reset handler enables CP10/CP11
+// (CPACR) so the FP instructions don't UsageFault.  Decimal literals in a float
+// context (`1.5`, `2.0`) are float; they stay Q16.16 fixed in a fixed context.
+// (Values are IEEE bit patterns end to end — the cell read back is the bits.)
+
+board nrf52840_dk {
+  soc nrf52840 {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+    fpu                       // Cortex-M4F single-precision FPU
+  }
+}
+
+program app {
+  use board nrf52840_dk as dev
+
+  cell acc : float = 0.0
+  cell out : float = 0.0
+
+  every 100ms {
+    acc = acc + 1.5           // float add  (type-directed: acc is float)
+    out = acc * 2.0           // float mul
+  }
+}
+
+sim app_sim for app {
+  run until 350ms             // 3 ticks → acc = 4.5, out = 9.0
+}
