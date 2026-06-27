@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Metal LLVM `now()`/SysTick gate (§4.5, audit P5-1): prove the LLVM backend's
-# SysTick time base actually advances `now()`.  Builds an uptime program ENTIRELY
-# through the LLVM backend (no C), boots it on Renode, and checks the `stamp`
-# cell — set to `now()` on each 100ms tick — reads back ≈ the elapsed wall time
-# (the sim oracle), NOT a raw cycle counter or zero.  Proves SysTick + the
-# SysTick_Handler + `@__uptime_ns` + the metal `now()` load are all wired.
+# Metal LLVM `now()` time-base gate (§4.5, audit P5-1/P6-6): prove the LLVM
+# backend's TIMER2 time base actually advances `now()`.  Builds an uptime program
+# ENTIRELY through the LLVM backend (no C), boots it on Renode, and checks the
+# `stamp` cell — set to `now()` on each 100ms tick — reads back ≈ the elapsed wall
+# time (the sim oracle), NOT a raw cycle counter or zero.  Proves the TIMER2 tick,
+# the TIMER2_IRQHandler, and the µs-resolution `now()` CAPTURE read are all wired.
 #
 #   RENODE=/path/to/renode ./harness/now_uptime.sh
 #
@@ -28,19 +28,25 @@ SIM_STAMP="$(echo "$SIM" | sed -n 's/.*cell stamp = \([0-9][0-9]*\).*/\1/p' | ta
 echo "sim final stamp (ns): ${SIM_STAMP:-<none>}"
 if [[ -z "$SIM_STAMP" ]]; then echo "FAIL: sim produced no stamp"; exit 1; fi
 
-echo "== build uptime via the LLVM backend (no C) =="
-cargo run -q --bin silicac -- --target metal-nrf52840 --emit-llvm "$EX" -o "$WORK/up" 2>"$WORK/emit.log" \
-  || { echo "FAIL: --emit-llvm errored"; cat "$WORK/emit.log"; exit 1; }
-grep -q 'define void @SysTick_Handler()' "$WORK/up.ll" || { echo "FAIL: no SysTick handler in IR"; exit 1; }
-grep -q '@llvm.readcyclecounter' "$WORK/up.ll" && { echo "FAIL: metal now() still uses readcyclecounter"; exit 1; }
-llc "$WORK/up.ll" -filetype=obj -o "$WORK/up.o" 2>"$WORK/llc.log" || { echo "FAIL: llc"; cat "$WORK/llc.log"; exit 1; }
-arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -nostdlib -nostartfiles -T "$WORK/up.ld" "$WORK/up.o" -o "$WORK/up.elf" 2>"$WORK/link.log" \
-  || { echo "FAIL: link"; cat "$WORK/link.log"; exit 1; }
+echo "== build uptime (${BUILD:-llvm} backend) =="
+if [[ "${BUILD:-llvm}" == "c" ]]; then
+  cargo run -q --bin silicac -- --target metal-nrf52840 "$EX" -o "$WORK/up.elf" 2>"$WORK/emit.log" \
+    || { echo "FAIL: C metal build errored"; cat "$WORK/emit.log"; exit 1; }
+else
+  cargo run -q --bin silicac -- --target metal-nrf52840 --emit-llvm "$EX" -o "$WORK/up" 2>"$WORK/emit.log" \
+    || { echo "FAIL: --emit-llvm errored"; cat "$WORK/emit.log"; exit 1; }
+  grep -q 'define void @TIMER2_IRQHandler()' "$WORK/up.ll" || { echo "FAIL: no TIMER2 tick handler in IR"; exit 1; }
+  grep -q 'define void @SysTick_Handler()' "$WORK/up.ll" && { echo "FAIL: SysTick not retired (P6-6)"; exit 1; }
+  grep -q '@llvm.readcyclecounter' "$WORK/up.ll" && { echo "FAIL: metal now() still uses readcyclecounter"; exit 1; }
+  llc "$WORK/up.ll" -filetype=obj -o "$WORK/up.o" 2>"$WORK/llc.log" || { echo "FAIL: llc"; cat "$WORK/llc.log"; exit 1; }
+  arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -nostdlib -nostartfiles -T "$WORK/up.ld" "$WORK/up.o" -o "$WORK/up.elf" 2>"$WORK/link.log" \
+    || { echo "FAIL: link"; cat "$WORK/link.log"; exit 1; }
+fi
 
 STAMP_ADDR="$(arm-none-eabi-nm "$WORK/up.elf" | awk '$3=="stamp"{print "0x"$1}')"
 [[ -n "$STAMP_ADDR" ]] || { echo "FAIL: no stamp symbol in ELF"; exit 1; }
 
-echo "== run on metal (Renode, SysTick/NVIC pinned to 64MHz) =="
+echo "== run on metal (Renode, NVIC pinned to 64MHz) =="
 # Run to 350ms (ticks at 100/200/300ms); read the low word of the i64 stamp cell.
 cat > "$RESC" <<RESC
 mach create "dk"
@@ -58,11 +64,11 @@ METAL_STAMP=$(( RAW ))
 echo "metal stamp @350ms (ns): $METAL_STAMP  (expect ≈ $SIM_STAMP ± 3ms)"
 
 echo "== compare =="
-# A SysTick-driven uptime should match the sim's 300ms stamp within a few ticks.
+# A TIMER2-driven µs now() should match the sim's 300ms stamp near-exactly.
 # (A broken base reads ~0; a cycle counter would read a wildly different magnitude.)
 LO=$(( SIM_STAMP - 3000000 )); HI=$(( SIM_STAMP + 3000000 ))
 if (( METAL_STAMP >= LO && METAL_STAMP <= HI )); then
-  echo "PASS: LLVM-built now() tracks SysTick uptime — metal stamp ≈ sim (sim ≡ metal(LLVM), P5-1)."
+  echo "PASS: LLVM-built now() tracks the TIMER2 µs time base — metal stamp ≈ sim (sim ≡ metal(LLVM), P5-1/P6-6)."
   exit 0
 else
   echo "FAIL: metal stamp $METAL_STAMP outside [$LO, $HI] (sim $SIM_STAMP)"

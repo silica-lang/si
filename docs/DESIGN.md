@@ -866,20 +866,20 @@ monotonic clock; arithmetic is defined so only sensible combinations type-check.
 > `instant + instant`, `now() + <bare int>`, scaling an instant, comparing an instant to a
 > non-instant, and assigning an instant to a non-instant cell. A duration literal (`500ms`) is kept
 > type-distinct from a bare integer (`5`) via a dedicated `DurationLit` AST node, so the canonical
-> `now() + 500ms` (ok) vs `now() + 5` (error) distinction holds. **Remaining:** the `rounded` modes
-> below (D15) are not yet enforced; metal `now()` is still at 1 ms (SysTick base) resolution.
+> `now() + 500ms` (ok) vs `now() + 5` (error) distinction holds. Since P6-6 metal `now()` is **1 µs**
+> resolution (a live TIMER2 CAPTURE read; SysTick retired). **Remaining:** the `rounded` modes below
+> (D15) are not yet enforced.
 
 > **Status (implemented — `every` on a hardware TIMER, audit #35 P1-4).** `every` no longer runs on a
 > 1 ms-quantized SysTick prescaler; it is lowered onto **nRF52840 TIMER1** (1 MHz, free-running 32-bit
 > counter, one CC compare channel per `every` reaction, dispatched from `TIMER1_IRQHandler`, re-armed
 > `CC += period`). Period→ticks is **exact-or-error** at 1 µs resolution (`backend::c::timer_plan`):
 > a sub-µs period, a period beyond the 32-bit counter, or more than 4 `every` reactions is a compile
-> error — but `every 1500us` (rejected by the old 1 ms grid) now just works. SysTick is retained only
-> for `now()`/`within`-deadline bookkeeping and the watchdog feed cadence. Validated on Renode
-> (`metal_vs_sim`, `bus_parity`, `deadline_reset`, `watchdog_reset` all PASS); `examples/
-> every_timer_nrf52840.si` runs two fine-grained periods on two compare channels. **Remaining
-> (deferred):** re-basing `now()`/deadlines onto the TIMER for sub-ms resolution (and fully retiring
-> SysTick) — the chosen P1-4 scope keeps them on SysTick.
+> error — but `every 1500us` (rejected by the old 1 ms grid) now just works. (Since P6-6 the `now()`/
+> `within`-deadline/await/watchdog bookkeeping also runs on a hardware TIMER — TIMER2 — and SysTick is
+> fully retired; see the P6-6 note in §6.3.) Validated on Renode (`metal_vs_sim`, `bus_parity`,
+> `deadline_reset`, `watchdog_reset` all PASS); `examples/every_timer_nrf52840.si` runs two fine-grained
+> periods on two compare channels.
 
 **Depth.** v1 ships *unit-safety* (the above). The representation is chosen so that **deadline /
 WCET annotations attach later without redesign**: a reaction may already be written `on x within
@@ -1427,6 +1427,22 @@ checked in §10's foreclosure audit (LLVM, FFI, multicore all remain reachable).
 > `harness/bus_arbitration.sh` runs two contending reactions on Renode: both reads complete (mid 0/0 →
 > post 1/1), priority-ordered, on C **and** `BUILD=llvm` — `sim ≡ metal`; the single-bus gates are
 > undisturbed.
+
+> **TIMER-rebased `now()`/deadlines, SysTick retired (audit P6-6).** SysTick had quietly accreted four
+> jobs — the `now()` uptime base, the `within`-deadline countdown (P5-4), the await re-check (P6-5), and
+> the watchdog wake cadence — all at 1 ms resolution. P6-6 moves every one onto a dedicated **TIMER2** (a
+> free-running 1 MHz/1 µs 32-bit counter; TIMER0/IRQ8 collides with the bus, TIMER1 drives `every`) and
+> retires SysTick entirely (no handler, no SCS programming, vector slot 15 → default). `now()` gains **µs
+> resolution**: it reads the live counter through a CAPTURE channel (`TASKS_CAPTURE[1]`→`CC[1]`) and
+> combines it with a software wrap high word into 64-bit ns — `now_ns = ((high << 32) | capture) * 1000`.
+> A 1 ms TIMER2 COMPARE interrupt (auto-rearm `CC[0] += 1000`) maintains that high word on a 32-bit wrap
+> (which it always catches — the wrap is every ~4295 s), runs the deadline/await countdowns exactly as the
+> SysTick handler did, and — firing every 1 ms — serves as the watchdog wake so `wfi` can't oversleep the
+> timeout. The one Renode capability risk (does the emulator model TIMER CAPTURE→CC?) was **verified up
+> front** with a bare-metal probe before any codegen — it does, monotonically. `harness/now_uptime.sh`
+> confirms `now()` reads exactly 300000000 ns at the 300 ms tick on C **and** `BUILD=llvm`, and the whole
+> metal gate suite re-greened on the TIMER2 base. (A sub-1 ms `now()` wrap-lag glitch once per ~71 min is
+> accepted; the next tick corrects it.)
 
 ### 6.4 Generated linker script, vector table, startup, `.data`/`.bss`
 

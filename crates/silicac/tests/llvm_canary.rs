@@ -612,13 +612,14 @@ fn metal_single_consumer_bus_keeps_simple_owner_path() {
     assert!(!ll.contains("__bus_waiting"), "single-consumer bus must NOT emit arbitration:\n{}", ll);
 }
 
-// ─── P5-1: metal SysTick + now() uptime ───────────────────────────────────────
+// ─── P5-1/P6-6: metal TIMER2 system tick + µs now() ───────────────────────────
 
 #[test]
-fn metal_now_reads_systick_uptime_not_cycle_counter() {
-    // On metal, `now()` reads a SysTick-driven `@__uptime_ns` (1 ms base), NOT the
-    // host `llvm.readcyclecounter`: Reset_Handler programs SysTick, a
-    // SysTick_Handler advances the uptime, and vector slot 15 points at it.
+fn metal_now_reads_timer2_capture_not_cycle_counter() {
+    // On metal (P6-6), `now()` reads the live 1 µs TIMER2 counter via CAPTURE +
+    // a software wrap high word, NOT the host `llvm.readcyclecounter` and NOT the
+    // retired SysTick `@__uptime_ns`: Reset_Handler programs TIMER2, a
+    // TIMER2_IRQHandler maintains the high word, and vector slot 26 points at it.
     let body = vec![SirStmt::Assign {
         target: SirPlace::Var("stamp".into()),
         value: SirExpr::Now,
@@ -630,31 +631,35 @@ fn metal_now_reads_systick_uptime_not_cycle_counter() {
     m.reactions.push(rx);
     let ll = LlvmBackend::with_target(Target::MetalNrf52840).emit(&m);
 
-    // The uptime global + handler that advances it by 1 ms.
-    assert!(ll.contains("@__uptime_ns = global i64 0"), "no uptime global:\n{}", ll);
-    assert!(ll.contains("define void @SysTick_Handler()"), "no SysTick handler:\n{}", ll);
-    assert!(ll.contains("add i64") && ll.contains("1000000"), "handler must add 1ms:\n{}", ll);
-    // SysTick programmed in the reset (RVR/CSR at the SCS).
-    assert!(ll.contains("; SYST_RVR") && ll.contains("; SYST_CSR: ENABLE|TICKINT|CLKSOURCE"), "SysTick not programmed:\n{}", ll);
-    // now() reads the uptime, never the cycle counter, on metal.
-    assert!(ll.contains("load volatile i64, ptr @__uptime_ns"), "now() must read uptime:\n{}", ll);
+    // The wrap high word + the TIMER2 tick handler that maintains it (no SysTick).
+    assert!(ll.contains("@__now_high = global i32 0"), "no wrap high-word global:\n{}", ll);
+    assert!(ll.contains("define void @TIMER2_IRQHandler()"), "no TIMER2 tick handler:\n{}", ll);
+    assert!(!ll.contains("@SysTick_Handler"), "SysTick must be retired (P6-6):\n{}", ll);
+    assert!(!ll.contains("@__uptime_ns"), "the SysTick uptime accumulator must be gone:\n{}", ll);
+    // TIMER2 programmed in the reset (CC[0] = 1ms tick, COMPARE[0] interrupt).
+    assert!(ll.contains("CC[0] = 1ms tick"), "TIMER2 tick not programmed:\n{}", ll);
+    assert!(ll.contains("INTENSET COMPARE[0]"), "TIMER2 COMPARE[0] interrupt not enabled:\n{}", ll);
+    // now() captures the live counter (TASKS_CAPTURE[1] + CC[1]) and scales µs→ns,
+    // never the cycle counter, on metal.
+    assert!(ll.contains("TASKS_CAPTURE[1]") && ll.contains("CC[1] (live us)"), "now() must capture the live counter:\n{}", ll);
+    assert!(ll.contains("mul i64") && ll.contains("1000 ; us -> ns"), "now() must scale us→ns:\n{}", ll);
     assert!(!ll.contains("readcyclecounter"), "metal now() must not use the cycle counter:\n{}", ll);
-    // Vector slot 15 = SysTick.
-    assert!(ll.contains("ptr @SysTick_Handler"), "SysTick not vectored:\n{}", ll);
+    // Vector slot 26 (IRQ 10) = TIMER2; slot 15 (SysTick) is the default handler.
+    assert!(ll.contains("ptr @TIMER2_IRQHandler"), "TIMER2 not vectored:\n{}", ll);
     assert_no_c_isms(&ll);
 }
 
 #[test]
 fn host_now_still_uses_cycle_counter() {
     // The host path is unchanged: now() stays the LLVM cycle-counter intrinsic
-    // (the P5-1 SysTick lowering is metal-only).
+    // (the metal TIMER2 lowering is metal-only).
     let body = vec![SirStmt::Assign {
         target: SirPlace::Var("stamp".into()),
         value: SirExpr::Now,
     }];
     let ll = LlvmBackend::new().emit(&module(vec![cell("stamp", SirType::Instant, 0)], body));
     assert!(ll.contains("call i64 @llvm.readcyclecounter()"), "host now() must keep the cycle counter:\n{}", ll);
-    assert!(!ll.contains("@__uptime_ns"), "host must not emit the metal uptime global:\n{}", ll);
+    assert!(!ll.contains("@__now_high"), "host must not emit the metal wrap high word:\n{}", ll);
 }
 
 // ─── P5-2: drive_safe + overflow-trap safe-state + Safe disposition ────────────
@@ -893,14 +898,15 @@ fn metal_deadline_and_watchdog_are_wired() {
     assert!(ll.contains("@__deadline_1 = global i32 0"), "no deadline countdown:\n{}", ll);
     assert!(ll.contains("@__deadline_missed = global i32 0"), "no deadline-missed flag:\n{}", ll);
     assert!(ll.contains("store i32 30, ptr @__deadline_1"), "deadline not armed on fire:\n{}", ll);
-    // SysTick decrements the deadline and latches the miss.
-    assert!(ll.contains("load i32, ptr @__rf_1_state"), "SysTick must check the frame state:\n{}", ll);
+    // The TIMER2 tick decrements the deadline and latches the miss.
+    assert!(ll.contains("load i32, ptr @__rf_1_state"), "the tick must check the frame state:\n{}", ll);
     assert!(ll.contains("store i32 1, ptr @__deadline_missed"), "overrun must latch the miss:\n{}", ll);
     // Watchdog configured in the reset + fed (0xAAAA = 43690), gated on the miss.
     assert!(ll.contains("WDT RLR: reload") && ll.contains("WDT CR: start"), "watchdog not configured:\n{}", ll);
     assert!(ll.contains("store volatile i32 43690") && ll.contains("feed on clean idle"), "no gated feed:\n{}", ll);
     assert!(ll.contains("load i32, ptr @__deadline_missed"), "feed not gated on the deadline:\n{}", ll);
-    assert!(ll.contains("ptr @SysTick_Handler"), "SysTick must be vectored (watchdog needs it):\n{}", ll);
+    assert!(ll.contains("ptr @TIMER2_IRQHandler"), "TIMER2 tick must be vectored (deadline/watchdog need it):\n{}", ll);
+    assert!(!ll.contains("@SysTick_Handler"), "SysTick must be retired (P6-6):\n{}", ll);
     assert_no_c_isms(&ll);
 }
 
@@ -1151,9 +1157,10 @@ fn metal_await_lowers_to_a_frame_suspend_not_a_busy_wait() {
     assert!(ll.contains("define void @__react_1_run()"), "no segment dispatcher:\n{}", ll);
     // The await terminator arms the suspend (within 300ms → 300 ticks).
     assert!(ll.contains("store i32 1, ptr @__rf_1_await") && ll.contains("store i32 300, ptr @__rf_1_await_deadline"), "await must arm + suspend:\n{}", ll);
-    // SysTick re-checks the suspended await and re-enters the dispatcher.
-    assert!(ll.contains("load i32, ptr @__rf_1_await") && ll.contains("call void @__react_1_run()"), "no SysTick await re-check:\n{}", ll);
-    assert!(ll.contains("ptr @SysTick_Handler"), "SysTick must be vectored:\n{}", ll);
+    // The TIMER2 tick re-checks the suspended await and re-enters the dispatcher.
+    assert!(ll.contains("load i32, ptr @__rf_1_await") && ll.contains("call void @__react_1_run()"), "no tick await re-check:\n{}", ll);
+    assert!(ll.contains("ptr @TIMER2_IRQHandler"), "TIMER2 tick must be vectored:\n{}", ll);
+    assert!(!ll.contains("@SysTick_Handler"), "SysTick must be retired (P6-6):\n{}", ll);
     // It is NOT the old busy-recheck wfi loop on metal.
     let from = ll.find("define void @__react_1_run()").unwrap();
     let react = &ll[from..from + ll[from..].find("\n}").unwrap()];
