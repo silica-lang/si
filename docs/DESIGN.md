@@ -497,9 +497,15 @@ statically-proven fraction; the runtime check is the sound fallback, never silen
 
 > **Status (implemented — static half).** Devices declare `states { … }`; an op may be guarded
 > `when <state>` and transitions with `become <state>`. The resolver tracks each device's provable
-> state through a reaction's straight-line flow (reset at every event boundary, since typestate is
-> not carried across one): a `when S` op call when a dominating `become S` has not run is a compile
-> error; a `when`/`become` naming an undeclared state is rejected at the device. **Remaining:** the
+> state through a reaction's straight-line flow: a `when S` op call when a dominating `become S` has
+> not run is a compile error; a `when`/`become` naming an undeclared state is rejected at the device.
+> **Persistent across reactions (audit #35 P2-2).** State established during `on sys.start` — the
+> boot-time writer that runs exactly once before the scheduler — now **persists** into every later
+> reaction (`persistent_states`), so a device configured at boot (`power_on()` → `become ready`) is
+> provably `ready` in a separate `every`/`on` reaction's `read() when ready`. This is sound (sys.start
+> precedes all event/timer reactions) and is the canonical "configure at boot, use everywhere" driver
+> pattern; a device *not* initialised at boot still resets to its declared initial state per reaction
+> (so the check stays honest). `tests/typestate.rs`, `examples/typestate_persist.si`. **Remaining:** the
 > *runtime-precondition* lowering for the unprovable cases (across a `yields` / dynamic ref →
 > Layer-3 fault) and the Layer-3 **site map** (per-call-site debug info so the decoder can name
 > "handler X touched device Y outside its valid state") are follow-ups; today the unprovable case is

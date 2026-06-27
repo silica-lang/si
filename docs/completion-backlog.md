@@ -314,9 +314,12 @@ more expressive (persistent typestate + match-over-fault-codes). Plan:
       `escape_audit` bin + harness/escape_hatch_audit.sh report per-file; tests/escape_hatch.rs gates
       the std lib at ≤3 and locks the baseline. Corpus total 11 (9 casts, 2 wrap/sat), std=1. cargo
       test green (35 binaries). Validates risk #4; a live agent eval (risk #5) is future work.
-- [ ] P2-3 Persistent cross-reaction typestate for single-owner devices (audit #10a) — device-ownership
-      pre-pass (analog of analyze_cells, keyed by device id; single_owner = touched by 1 reaction);
-      carry a single-owner device's end-state across reactions instead of clearing it. tests/typestate.rs.
+- [x] P2-3 Persistent cross-reaction typestate (audit #10a) — PR #55. State established in `on sys.start`
+      (the boot-time single state-writer, runs once before the scheduler) persists into every later
+      reaction via `persistent_states` (seed instead of clear); a device not initialised at boot still
+      resets to its initial state (sound, not blind). tests/typestate.rs (persists; negative control) +
+      examples/typestate_persist.si. cargo test green. NOTE: realized scope is the sound configure-at-
+      boot pattern; broader single-owner-firing persistence deferred.
 - [ ] P2-1 Thin SIR→LLVM-IR canary (audit #8) `[llvm]` — `brew install llvm`; backend/llvm.rs emits
       textual LLVM IR for a SIR subset (sys.start, cell assigns, integer Arith via
       `llvm.*.with.overflow`+`llvm.trap`, exit, host-io) with NO libc/`__builtin`; `--emit-llvm` flag;
