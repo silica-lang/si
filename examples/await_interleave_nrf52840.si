@@ -1,0 +1,47 @@
+// `await` TRUE frame suspend on the nRF52840-DK (audit P6-5, §5.2) — the proof
+// that the awaiting reaction yields the scheduler, so a PEER reaction runs DURING
+// the suspension and sets the awaited condition.  (The bus analogue is
+// bus_parity.sh.)
+//
+//   silicac --sim                                   examples/await_interleave_nrf52840.si
+//   silicac --target metal-nrf52840 --emit-llvm     examples/await_interleave_nrf52840.si -o awi
+//   ./harness/await_interleave.sh                    # sim ≡ metal(LLVM) on Renode
+//
+// The worker fires at 100ms and awaits `ready` — which starts 0.  Only the setter
+// (a separate `every 130ms` reaction) sets it.  Worker and setter are BOTH driven
+// by TIMER1, so under the old bounded-`wfi` lowering the worker would block its own
+// IRQ context and the setter could never run → the await would time out → `done`
+// stays 0.  With a true frame suspend the worker RETURNS, the setter runs at 130ms
+// during the suspension, sets `ready`, and SysTick resumes the worker → `done` > 0.
+
+board nrf52840_dk {
+  soc nrf52840 {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+}
+
+program app {
+  use board nrf52840_dk as dev
+
+  cell ready : u32 = 0        // ONLY the setter sets this — never preset
+  cell done  : u32 = 0
+
+  // Worker: suspends on the await until the setter (a peer) makes it true.
+  every 100ms on fault skip {
+    await ready == 1 within 300ms else fault not_ready
+    done = done + 1
+  }
+
+  // Setter: a peer reaction that runs DURING the worker's suspension.
+  every 130ms {
+    ready = 1
+  }
+}
+
+sim app_sim for app {
+  run until 400ms            // worker fires at 100ms; setter sets ready at 130ms
+}

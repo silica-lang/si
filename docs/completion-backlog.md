@@ -500,11 +500,19 @@ Renode path can't be validated or a genuine design fork is the user's call (P6-7
       (33) + harness/print_value.sh. **PASS** (host) — LLVM binary and sim both print 42 for
       print(40+2). Host-only (no metal host_io until semihosting, P6-7). NOTE: `SirExpr::Bytes` as a
       standalone operand never arises from source (literals → HostIoPrintStr), so it stays a signpost.
-- [ ] P6-5 `await` full D2-style frame suspend (both backends) `[metal]`. Generalize the bus-only
-      yielding state machine to await; resolver `body_yields` includes Await; TIMER recheck-channel
-      resume; await deadline separate from the watchdog. examples/await_interleave_nrf52840.si +
-      harness/await_interleave.sh (a higher-priority reaction runs DURING the await). PAUSE if true
-      suspend can't be shown.
+- [x] P6-5 `await` full D2-style frame suspend (both backends) `[metal]` — PR #76. await now reuses the
+      bus state machine: the body is segmented at each top-level await; the terminator arms
+      `__rf_N.__await`/`__await_deadline` (1 ms ticks) and returns; the SysTick handler re-checks each
+      suspended await (resume / fault→frame-disposition / wait). The `__await` flag keeps it distinct
+      from a bus suspend (bus IRQ resumes those), so the bus path is untouched and an await suspend does
+      not gate the watchdog feed. `reaction.yields` stays BusXfer-only; the dispatch routes
+      `yields || has_await` to the yielding emitter; the resolver rejects nested await (top-level only).
+      examples/await_interleave_nrf52840.si + tests/await.rs + tests/llvm_canary.rs + harness/
+      await_interleave.sh. **Renode PASS** (C and BUILD=llvm) — a peer reaction runs DURING the await
+      suspension → done=3 = sim; bus_parity/bus_refire/deadline_reset/watchdog_reset/poll_await all
+      still PASS. sim ≡ metal. NOTE: 1 ms SysTick recheck cadence; resumed body runs in SysTick context
+      (shared cells stay protected by BASEPRI criticals) — a PendSV priority-preserving resume is a
+      follow-up. poll unchanged.
 - [ ] P6-6 TIMER-rebase `now()`/deadlines, retire SysTick (both backends) `[metal]`. now()/deadlines on
       the 1 MHz TIMER (64-bit ns extension; preserve the watchdog wake cadence; CC budget). Public
       change: now() 1 ms → 1 µs; update tests + re-validate all metal gates.

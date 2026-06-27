@@ -709,32 +709,9 @@ fn metal_poll_lowers_to_a_bounded_spin_with_fault_disposition() {
     assert_no_c_isms(&ll);
 }
 
-#[test]
-fn metal_await_lowers_to_a_recheck_loop_with_wfi() {
-    let await_s = SirStmt::Await {
-        cond: SirExpr::BinOp(
-            SirBinOp::EqEq,
-            Box::new(SirExpr::Load("ready".into())),
-            Box::new(SirExpr::U64(1)),
-        ),
-        fault_code: "not_ready".into(),
-        within_ns: 50_000_000,
-        recheck_ns: 6_250_000,
-    };
-    let mut m = module(
-        vec![cell("ready", SirType::U32, 1), cell("done", SirType::U32, 0)],
-        vec![],
-    );
-    m.reactions.push(poll_reaction(await_s, SirDisposition::Skip));
-    let ll = LlvmBackend::with_target(Target::MetalNrf52840).emit(&m);
-
-    assert!(!ll.contains("; unsupported in llvm canary: Await"), "await still unsupported:\n{}", ll);
-    assert!(ll.contains("%__faulted = alloca i8"), "no fault flag:\n{}", ll);
-    // await yields to ISRs between re-checks: a wfi inside the wait loop.
-    assert!(ll.contains("wfi") && ll.contains("re-checks"), "await must wfi between checks:\n{}", ll);
-    assert!(ll.contains("store i8 1, ptr %__faulted"), "bound elapse must set faulted:\n{}", ll);
-    assert_no_c_isms(&ll);
-}
+// (await on metal is now a true frame suspend — see
+// `metal_await_lowers_to_a_frame_suspend_not_a_busy_wait` (P6-5); the old
+// bounded-`wfi`-recheck shape it replaced is no longer emitted.)
 
 #[test]
 fn metal_poll_retry_disposition_wraps_the_body_in_a_retry_loop() {
@@ -1036,4 +1013,57 @@ fn dynamic_host_io_print_emits_decimal_itoa_not_libc() {
     assert!(ll.contains("svc #0x80"), "must write via the raw syscall:\n{}", ll);
     assert!(!ll.contains("; unsupported in llvm canary: dynamic host_io.print"), "should be lowered:\n{}", ll);
     assert_no_c_isms(&ll); // no @printf etc.
+}
+
+// ─── P6-5: await full D2 frame suspend ────────────────────────────────────────
+
+#[test]
+fn metal_await_lowers_to_a_frame_suspend_not_a_busy_wait() {
+    // An await reaction → the IRQ-driven segment state machine: it suspends via
+    // `@__rf_N_await` + `@__rf_N_await_deadline` and is resumed by the SysTick
+    // re-check (which re-enters `@__react_N_run`), NOT the bounded wfi busy-wait.
+    let mut m = module(
+        vec![cell("ready", SirType::U32, 0), cell("done", SirType::U32, 0)],
+        vec![],
+    );
+    let mut rx = reaction(vec![
+        SirStmt::Await {
+            cond: SirExpr::BinOp(
+                SirBinOp::EqEq,
+                Box::new(SirExpr::Load("ready".into())),
+                Box::new(SirExpr::U64(1)),
+            ),
+            fault_code: "not_ready".into(),
+            within_ns: 300_000_000,
+            recheck_ns: 1_000_000,
+        },
+        SirStmt::Assign {
+            target: SirPlace::Var("done".into()),
+            value: SirExpr::BinOp(
+                SirBinOp::Add,
+                Box::new(SirExpr::Load("done".into())),
+                Box::new(SirExpr::U64(1)),
+            ),
+        },
+    ]);
+    rx.id = 1;
+    rx.trigger = SirTrigger::EveryNs(100_000_000);
+    rx.disposition = SirDisposition::Skip;
+    m.reactions.push(rx);
+    let ll = LlvmBackend::with_target(Target::MetalNrf52840).emit(&m);
+
+    // Suspend state + the segment dispatcher.
+    assert!(ll.contains("@__rf_1_await = global i32 0"), "no await suspend flag:\n{}", ll);
+    assert!(ll.contains("@__rf_1_await_deadline = global i32 0"), "no await deadline:\n{}", ll);
+    assert!(ll.contains("define void @__react_1_run()"), "no segment dispatcher:\n{}", ll);
+    // The await terminator arms the suspend (within 300ms → 300 ticks).
+    assert!(ll.contains("store i32 1, ptr @__rf_1_await") && ll.contains("store i32 300, ptr @__rf_1_await_deadline"), "await must arm + suspend:\n{}", ll);
+    // SysTick re-checks the suspended await and re-enters the dispatcher.
+    assert!(ll.contains("load i32, ptr @__rf_1_await") && ll.contains("call void @__react_1_run()"), "no SysTick await re-check:\n{}", ll);
+    assert!(ll.contains("ptr @SysTick_Handler"), "SysTick must be vectored:\n{}", ll);
+    // It is NOT the old busy-recheck wfi loop on metal.
+    let from = ll.find("define void @__react_1_run()").unwrap();
+    let react = &ll[from..from + ll[from..].find("\n}").unwrap()];
+    assert!(!react.contains("wfi"), "await must suspend (return), not wfi-spin:\n{}", react);
+    assert_no_c_isms(&ll);
 }
