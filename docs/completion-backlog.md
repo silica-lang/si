@@ -456,10 +456,13 @@ implements every feature, so each gate is `sim ≡ metal(LLVM)` on Renode, the s
       + busy-wait-has-no-wfi) + new harness/poll_await.sh (the FIRST Renode gate for poll/await — the C
       path only had sim + codegen tests). **Renode PASS** — both poll & await pass when satisfied
       (done=3) and fault→skip on timeout (done=0); sim ≡ metal(LLVM). C path unchanged.
-- [ ] P5-4 `within`-deadline + watchdog (P4 follow-up) `[metal]`. Extends P5-1's SysTick handler.
-      `@__deadline_N`/`@__deadline_missed` globals; arm on the yielding trigger entry; decrement+latch
-      in the SysTick handler; configure the watchdog (CR/RLR/KR, feed 0xAAAA) in reset; gate the idle
-      feed on `!__deadline_missed && all-idle` (mirror c.rs). Reuse examples/{deadline,bus_watchdog}_
-      nrf52840.si; add `BUILD=llvm` to harness/{deadline_reset,watchdog_reset}.sh + a canary.
+- [x] P5-4 `within`-deadline + watchdog (P4 follow-up) `[metal]` — PR #71. Extends P5-1's SysTick.
+      `@__deadline_N`/`@__deadline_missed` globals (yielding reactions, gated on a watchdog); armed on
+      the yielding trigger entry; the SysTick handler disarms an idle reaction and decrements+latches a
+      missed deadline; the reset configures+starts the watchdog (CR/RLR/KR, 0xAAAA feed); the idle loop
+      feeds it only on a clean return to idle (`!__deadline_missed && all frame states 0`). Mirrors
+      c.rs. Reuses examples/{deadline,bus_watchdog}_nrf52840.si; tests/llvm_canary.rs (26) + harness/
+      {deadline_reset,watchdog_reset}.sh gain `BUILD=llvm`. **Renode PASS** — deadline tight=1/loose=0;
+      watchdog wedged=1/healthy=0; sim ≡ metal(LLVM). C path unchanged. **Metal LLVM runtime complete.**
 ## Completed log
 _(append `item — PR #NN — date` here as items land)_

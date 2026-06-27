@@ -22,6 +22,13 @@ RENODE="${RENODE:-renode}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
+# BUILD=llvm (audit P5-4): build the firmware ENTIRELY through the LLVM backend.
+if [[ "${BUILD:-c}" == "llvm" ]]; then
+  if [[ -d /opt/homebrew/opt/llvm/bin ]]; then PATH="/opt/homebrew/opt/llvm/bin:$PATH"; fi
+  if [[ -d "$HOME/arm-gnu-toolchain-15.2/Payload/bin" ]]; then PATH="$HOME/arm-gnu-toolchain-15.2/Payload/bin:$PATH"; fi
+  for t in llc arm-none-eabi-gcc; do command -v "$t" >/dev/null 2>&1 || { echo "SKIP: '$t' not found (need LLVM + ARM toolchain for BUILD=llvm)"; exit 0; }; done
+fi
+
 # Control: same program with a budget LARGER than the bus latency.
 CTRL="$WORK/deadline_loose.si"
 sed 's/within 30ms/within 80ms/' "$EX" > "$CTRL"
@@ -37,7 +44,14 @@ run_missed() {
   local src="$1"
   local elf="$WORK/$(basename "$src" .si).elf"
   local resc="$WORK/run.resc"
-  (cd "$REPO" && cargo run -q -- --target metal-nrf52840 "$src" -o "$elf")
+  if [[ "${BUILD:-c}" == "llvm" ]]; then
+    local stem="$WORK/$(basename "$src" .si)"
+    (cd "$REPO" && cargo run -q --bin silicac -- --target metal-nrf52840 --emit-llvm "$src" -o "$stem")
+    llc "$stem.ll" -filetype=obj -o "$stem.o" || { echo "FAIL: llc" >&2; exit 1; }
+    arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -nostdlib -nostartfiles -T "$stem.ld" "$stem.o" -o "$elf" || { echo "FAIL: link" >&2; exit 1; }
+  else
+    (cd "$REPO" && cargo run -q -- --target metal-nrf52840 "$src" -o "$elf")
+  fi
   local flag; flag="$(addr "$elf" __deadline_missed)"
   if [[ -z "$flag" ]]; then
     echo "FAIL: no __deadline_missed symbol in $elf" >&2

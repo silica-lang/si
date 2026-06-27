@@ -1325,6 +1325,20 @@ checked in §10's foreclosure audit (LLVM, FFI, multicore all remain reachable).
 > poll_await.sh` — the **first** Renode gate for these (the C path only ever validated them in sim + a
 > codegen test) — boots both, built only through LLVM: each passes when the condition is satisfied
 > (`done` advances) and faults into `skip` on timeout (`done` stays 0). `sim ≡ metal(LLVM)`.
+>
+> **`within`-deadline + watchdog (audit P5-4 — the metal LLVM runtime is complete).** The last runtime
+> piece, building on P5-1's SysTick. A yielding reaction's `within` deadline (enforced only when a
+> watchdog exists — the reset mechanism) arms a per-reaction countdown (`@__deadline_N`, in 1 ms ticks)
+> on the trigger entry; the SysTick handler ticks each one down, disarming a reaction back at idle and
+> latching `@__deadline_missed` if one is still in flight when its countdown elapses. The reset
+> configures + starts the watchdog over its declared CR/RLR/KR (reload = timeout ms, `0xAAAA` feed), and
+> the idle loop feeds it **only on a clean return to idle** — no yielding reaction mid-transaction *and*
+> no deadline missed — so a hung or merely-too-slow handler stops the feed and the watchdog resets.
+> Mirrors the C startup/SysTick/idle emission. `BUILD=llvm harness/deadline_reset.sh` (a tight
+> `within 30ms` overruns a 50 ms bus → `__deadline_missed`=1; `within 80ms` completes → 0) and
+> `BUILD=llvm harness/watchdog_reset.sh` (a wedged bus → the mock WDT fires; a healthy one → fed) both
+> pass on Renode. **Every remaining runtime feature now runs on metal built only through the LLVM
+> backend, matching the simulator** — the metal LLVM runtime is complete.
 
 ### 6.4 Generated linker script, vector table, startup, `.data`/`.bss`
 
