@@ -401,6 +401,8 @@ impl LlvmBackend {
             if has_arith_trap {
                 self.emit_overflow_trap_fn();
             }
+            // Layer-3 fault decoder is the HardFault vector target (P6-3).
+            self.emit_fault_decoder(module);
             self.emit_default_handlers();
         }
 
@@ -1325,15 +1327,89 @@ impl LlvmBackend {
         self.functions.push_str("}\n\n");
     }
 
-    /// `@__default_handler` + `@HardFault_Handler`: bare infinite-loop stubs for
-    /// the vector table.
+    /// `@__default_handler`: the bare infinite-loop stub for unused vectors.
+    /// (`@HardFault_Handler` is the Layer-3 fault decoder — `emit_fault_decoder`.)
     fn emit_default_handlers(&mut self) {
-        for name in ["__default_handler", "HardFault_Handler"] {
-            self.functions.push_str(&format!(
-                "define void @{n}() {{\nentry:\n  br label %loop\nloop:\n  call void asm sideeffect \"wfi\", \"~{{memory}}\"()\n  br label %loop\n}}\n\n",
-                n = name
+        self.functions.push_str(
+            "define void @__default_handler() {\nentry:\n  br label %loop\nloop:\n  call void asm sideeffect \"wfi\", \"~{memory}\"()\n  br label %loop\n}\n\n",
+        );
+    }
+
+    /// The Layer-3 fault decoder (§5.4, P6-3): an address-ownership table + a
+    /// `@HardFault_Handler` that reads SCB CFSR/BFAR, finds the owning region, and
+    /// records `{addr, owner-index, cfsr, pending}` to fixed RAM (read back by the
+    /// host decoder).  Mirrors the C `emit_fault_decoder` (no on-device strings —
+    /// the host renders labels from indices).
+    fn emit_fault_decoder(&mut self, module: &SirModule) {
+        let owners = crate::layer3::ownership_map(module);
+        // Owner tables (constants) + the fault record (external-linkage globals so
+        // `nm` finds them) — index → label is a comment for the host decoder.
+        if owners.is_empty() {
+            self.globals.push_str("@__owner_start = constant [1 x i32] [i32 0]\n@__owner_end = constant [1 x i32] [i32 0]\n");
+        } else {
+            let starts: Vec<String> = owners.iter().map(|r| format!("i32 {}", r.start as u32)).collect();
+            let ends: Vec<String> = owners.iter().map(|r| format!("i32 {}", r.end as u32)).collect();
+            self.globals.push_str(&format!(
+                "@__owner_start = constant [{n} x i32] [{s}]\n@__owner_end = constant [{n} x i32] [{e}]\n",
+                n = owners.len(), s = starts.join(", "), e = ends.join(", ")
             ));
+            for (i, r) in owners.iter().enumerate() {
+                self.globals.push_str(&format!("; owner[{}] = {} [0x{:08x}, 0x{:08x})\n", i, r.label, r.start, r.end));
+            }
         }
+        self.globals.push_str(
+            "@__fault_addr = global i32 0\n@__fault_owner = global i32 -1\n@__fault_cfsr = global i32 0\n@__fault_pending = global i32 0\n",
+        );
+
+        self.body.clear();
+        self.allocas.clear();
+        // cfsr = *SCB_CFSR (0xE000ED28); record it.
+        let cp = self.fresh();
+        self.inst(&format!("{} = inttoptr i64 3758157096 to ptr", cp));
+        let cfsr = self.fresh();
+        self.inst(&format!("{} = load volatile i32, ptr {}", cfsr, cp));
+        self.inst(&format!("store volatile i32 {}, ptr @__fault_cfsr", cfsr));
+        // BFAR is valid only when CFSR.BFARVALID (bit 15) is set.
+        let bv = self.fresh();
+        self.inst(&format!("{} = and i32 {}, 32768", bv, cfsr));
+        let valid = self.fresh();
+        self.inst(&format!("{} = icmp ne i32 {}, 0", valid, bv));
+        let hasaddr = self.fresh_label("hasaddr");
+        let record = self.fresh_label("record");
+        self.inst(&format!("br i1 {}, label %{}, label %{}", valid, hasaddr, record));
+        self.label(&hasaddr);
+        let bp = self.fresh();
+        self.inst(&format!("{} = inttoptr i64 3758157112 to ptr", bp));
+        let a = self.fresh();
+        self.inst(&format!("{} = load volatile i32, ptr {}", a, bp));
+        self.inst(&format!("store volatile i32 {}, ptr @__fault_addr", a));
+        // Find the owning region (regions are non-overlapping; first/only match).
+        for (i, r) in owners.iter().enumerate() {
+            let ge = self.fresh();
+            self.inst(&format!("{} = icmp uge i32 {}, {}", ge, a, r.start as u32));
+            let lt = self.fresh();
+            self.inst(&format!("{} = icmp ult i32 {}, {}", lt, a, r.end as u32));
+            let inr = self.fresh();
+            self.inst(&format!("{} = and i1 {}, {}", inr, ge, lt));
+            let own = self.fresh_label("own");
+            let next = self.fresh_label("nextown");
+            self.inst(&format!("br i1 {}, label %{}, label %{}", inr, own, next));
+            self.label(&own);
+            self.inst(&format!("store volatile i32 {}, ptr @__fault_owner", i));
+            self.inst(&format!("br label %{}", next));
+            self.label(&next);
+        }
+        self.inst(&format!("br label %{}", record));
+        self.label(&record);
+        self.inst("store volatile i32 1, ptr @__fault_pending");
+        let halt = self.fresh_label("fhalt");
+        self.inst(&format!("br label %{}", halt));
+        self.label(&halt);
+        self.m_asm("wfi", "halt; safe-state drive is a later phase (§5.6)");
+        self.inst(&format!("br label %{}", halt));
+        self.functions.push_str("define void @HardFault_Handler() {\nentry:\n");
+        self.functions.push_str(&self.body);
+        self.functions.push_str("}\n\n");
     }
 
     /// The Cortex-M vector table (P4-1): system slots + external IRQ slots up to

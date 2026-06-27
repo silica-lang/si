@@ -486,9 +486,13 @@ Renode path can't be validated or a genuine design fork is the user's call (P6-7
       FixedArith. examples/fixed_nrf52840.si (runtime operand, constant divisor) + tests/llvm_canary.rs
       (31) + harness/fixed_metal.sh (`opt -O2` folds the scale constants like the C `-Os`; runtime
       divisor would need libgcc either way). **Renode PASS** — 3·n=18 / n÷4=1 = sim; sim ≡ metal(LLVM).
-- [ ] P6-3 LLVM HardFault fault-decoder parity (Layer-3 region map) `[metal]`. Port c.rs
-      emit_fault_decoder (owner table + CFSR/BFAR decode + fault record). Reuse layer3::ownership_map +
-      examples/fault_nrf52840.si + harness/fault_decode_metal.sh + canary. (Finer per-site map deferred.)
+- [x] P6-3 LLVM HardFault fault-decoder parity (Layer-3 region map) `[metal]` — PR #74. Port of c.rs
+      emit_fault_decoder: @__owner_start/@__owner_end ownership table (layer3::ownership_map, no on-device
+      strings) + a @HardFault_Handler that reads SCB CFSR/BFAR, finds the owner on a valid BFAR, records
+      {addr,owner,cfsr,pending}. Replaced the bare wfi HardFault stub. Reuse examples/fault_nrf52840.si +
+      tests/llvm_canary.rs (32) + harness/fault_decode_metal.sh. **Renode PASS** — decoder+tables link
+      and coexist with a live program; address→owner decode validated by sim + canary (a precise BFAR
+      fault can't be injected on Renode, as for the C Layer-3). Finer per-call-site map stays deferred.
 - [ ] P6-4 Dynamic `Bytes` / `host_io.print` on host. Lower SirExpr::Bytes + dynamic HostIoPrint via a
       private constant + emit_write. Host canary only (host-io has no metal target — see P6-7).
 - [ ] P6-5 `await` full D2-style frame suspend (both backends) `[metal]`. Generalize the bus-only
