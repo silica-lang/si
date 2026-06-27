@@ -309,17 +309,27 @@ more expressive (persistent typestate + match-over-fault-codes). Plan:
 `~/.claude/plans/as-an-embedded-firmware-functional-pebble.md`. Each item is its own branch
 (`feat/p2-<id>`, **independent off `main`**) + PR targeting `main` (not auto-merged).
 
-- [ ] P2-2 Escape-hatch / idiom-corpus metric (audit #9) — AST-based counter over std+examples
-      (`ExprKind::Cast` + wrap/sat BinOps; `.raw`/`.le`/`.be` future-proofed at 0); report per-file +
-      totals; gate std-lib escape-hatch count below a threshold. tests/escape_hatch.rs +
-      harness/escape_hatch_audit.sh. Validates risk #4. (baseline: 11 total, std=1.)
-- [ ] P2-3 Persistent cross-reaction typestate for single-owner devices (audit #10a) — device-ownership
-      pre-pass (analog of analyze_cells, keyed by device id; single_owner = touched by 1 reaction);
-      carry a single-owner device's end-state across reactions instead of clearing it. tests/typestate.rs.
-- [ ] P2-1 Thin SIR→LLVM-IR canary (audit #8) `[llvm]` — `brew install llvm`; backend/llvm.rs emits
-      textual LLVM IR for a SIR subset (sys.start, cell assigns, integer Arith via
-      `llvm.*.with.overflow`+`llvm.trap`, exit, host-io) with NO libc/`__builtin`; `--emit-llvm` flag;
-      hermetic test + harness/llvm_canary.sh (`llvm-as`/`opt -verify` + run). Validates risk #2.
+- [x] P2-2 Escape-hatch / idiom-corpus metric (audit #9) — PR #54. `metrics::count_escape_hatches`
+      (token-based, comment-safe) counts `as <type>` casts + wrap/sat ops (`.raw`/`.le`/`.be` at 0);
+      `escape_audit` bin + harness/escape_hatch_audit.sh report per-file; tests/escape_hatch.rs gates
+      the std lib at ≤3 and locks the baseline. Corpus total 11 (9 casts, 2 wrap/sat), std=1. cargo
+      test green (35 binaries). Validates risk #4; a live agent eval (risk #5) is future work.
+- [x] P2-3 Persistent cross-reaction typestate (audit #10a) — PR #55. State established in `on sys.start`
+      (the boot-time single state-writer, runs once before the scheduler) persists into every later
+      reaction via `persistent_states` (seed instead of clear); a device not initialised at boot still
+      resets to its initial state (sound, not blind). tests/typestate.rs (persists; negative control) +
+      examples/typestate_persist.si. cargo test green. NOTE: realized scope is the sound configure-at-
+      boot pattern; broader single-owner-firing persistence deferred.
+- [x] P2-1 Thin SIR→LLVM-IR canary (audit #8) `[llvm]` — PR #56. `backend/llvm.rs` (`LlvmBackend`)
+      emits textual LLVM IR for a SIR subset (sys.start, cell globals, `Assign(Var)`, integer `Arith`
+      → `llvm.{u,s}{add,sub,mul}.with.overflow.iN` + `llvm.trap`, wrap → plain `iN`, saturate →
+      `select`, `Cast`/`BinOp`/`Not`, `Exit` → `ret i32`, host-io → raw `svc` syscall) with NO
+      libc/`__builtin`; `--emit-llvm` flag (orthogonal to `--target`). examples/llvm_canary.si (exit
+      42 = 20+22). tests/llvm_canary.rs (5, hermetic shape + no-C-ism) + harness/llvm_canary.sh
+      (`llvm-as` + `opt -verify` + compile/run + libc grep) — **PASS** with Homebrew LLVM 22.1.8.
+      Validates risk #2 / the §6.2 purity guard. NOTE: subset only — non-sys.start reactions, the
+      scheduler/event loop, MMIO, the yields state machine, and metal startup/linker are a full-backend
+      follow-up (each unsupported construct emits a visible `; unsupported` signpost).
 - [x] P2-4 `match` over an op's fault codes (audit #10b, full sim+metal) `[metal]` — PR #57.
       `MatchPat::Ok(Option<Ident>)`/`Fault(Ident)`; parse `ok`/`ok v`/`fault <code>` arms. The op runs
       without propagating; `BusXfer` gains `code_dst` (the outcome code index: `0` = ok, `1+i` = the

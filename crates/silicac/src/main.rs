@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 const USAGE: &str =
-    "usage: silicac <input.si> [-o <output>] [--emit-c] [--sim] [--target host|metal-nrf52840] [--cc <compiler>] [--opt <level>] [--std <dir>]";
+    "usage: silicac <input.si> [-o <output>] [--emit-c] [--emit-llvm] [--sim] [--target host|metal-nrf52840] [--cc <compiler>] [--opt <level>] [--std <dir>]";
 
 /// `-dumpbase` for the metal stack-accounting dumps (`silica_stack.{su,ci}`).
 const STACK_DUMP_BASE: &str = "silica_stack";
@@ -41,6 +41,8 @@ struct Config {
     input: PathBuf,
     output: PathBuf,
     emit_c: bool,
+    /// `--emit-llvm` — emit textual LLVM IR via the canary backend (§6.3/§12).
+    emit_llvm: bool,
     sim: bool,
     target: Target,
     cc: Option<String>,
@@ -54,6 +56,7 @@ impl Config {
         let mut input: Option<PathBuf> = None;
         let mut output: Option<PathBuf> = None;
         let mut emit_c = false;
+        let mut emit_llvm = false;
         let mut sim = false;
         let mut target = Target::Host;
         let mut cc: Option<String> = None;
@@ -68,6 +71,7 @@ impl Config {
                     output = Some(PathBuf::from(args.get(i).ok_or("-o requires a value")?));
                 }
                 "--emit-c" => emit_c = true,
+                "--emit-llvm" => emit_llvm = true,
                 "--sim" => sim = true,
                 "--target" => {
                     i += 1;
@@ -107,7 +111,7 @@ impl Config {
         });
         let std_dir = std_dir.unwrap_or_else(silicac::default_std_dir);
 
-        Ok(Config { input, output, emit_c, sim, target, cc, std_dir, opt })
+        Ok(Config { input, output, emit_c, emit_llvm, sim, target, cc, std_dir, opt })
     }
 }
 
@@ -149,6 +153,19 @@ fn run(cfg: &Config) -> Result<(), String> {
     if cfg.sim {
         let result = sim::run(&sir);
         print!("{}", result.render(&sir));
+        return Ok(());
+    }
+
+    // ── 5a′. LLVM-IR canary path (§6.3/§12) — a second SIR consumer ────────────
+    // Writes textual LLVM IR.  Orthogonal to `--target`: it lowers the SIR
+    // subset to `.ll`, proving SIR is target-neutral and the overflow trap is a
+    // first-class `llvm.*` intrinsic (not a C `__builtin`).
+    if cfg.emit_llvm {
+        let ll = backend::llvm::LlvmBackend::new().emit(&sir);
+        let ll_path = cfg.output.with_extension("ll");
+        std::fs::write(&ll_path, &ll)
+            .map_err(|e| format!("cannot write '{}': {}", ll_path.display(), e))?;
+        eprintln!("silicac: wrote LLVM IR to '{}'", ll_path.display());
         return Ok(());
     }
 

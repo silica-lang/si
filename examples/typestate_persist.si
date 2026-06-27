@@ -1,0 +1,38 @@
+// Persistent typestate (§4.1/D07, audit #35 P2-2): a device configured in
+// `on sys.start` carries its state to every later reaction — the canonical
+// "configure at boot, use everywhere" pattern.  Under reaction-local typestate
+// the `read()` below was a compile error; now `sys.start`'s `power_on()` (which
+// `become ready`) proves the sensor is `ready` in the periodic reaction.
+//
+//   silicac --sim examples/typestate_persist.si
+
+device sensor {
+  regs {
+    CTRL : reg32 at 0x00 access rw { enable: bit[0] }
+    DATA : reg32 at 0x04 access ro {}
+  }
+  states { off, ready }
+  ops {
+    op power_on() -> () { CTRL.enable = 1  become ready }
+    op read()     when ready -> u32 { return DATA }
+  }
+}
+
+board demo {
+  soc s {
+    memory { flash : region at 0x0 size 256K   ram : region at 0x2000_0000 size 64K }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+  s0 : sensor at 0x40000000
+}
+
+program app {
+  use board demo as b
+  let dev = b.s0
+  cell last : u32 = 0
+
+  on sys.start { dev.power_on() }          // becomes `ready` — persists below
+  every 100ms  { last = dev.read() }       // provably `ready` across reactions
+}
+
+sim app_sim for app { run until 250ms }
