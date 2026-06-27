@@ -564,3 +564,14 @@ Renode path can't be validated or a genuine design fork is the user's call (P6-7
       deadline_reset/watchdog_reset) still PASS on both backends.
 ## Completed log
 _(append `item — PR #NN — date` here as items land)_
+
+Cluster P6 — fully landed on `main`:
+- P6-1 Rings on the LLVM backend — PR #72 — 2026-06-27
+- P6-2 Fixed-point on the LLVM backend — PR #73 — 2026-06-27
+- P6-3 LLVM HardFault Layer-3 fault-decoder parity — PR #74 — 2026-06-27
+- P6-4 Dynamic `host_io.print` (host) — PR #75 — 2026-06-27
+- P6-5 `await` full D2-style frame suspend (both backends) — PR #76 — 2026-06-27
+- P6-8 Runtime float arithmetic on metal (front-to-back) — PR #77 — 2026-06-27
+- P6-7 Metal semihosting (`host_io` on metal, both backends) — PR #78 — 2026-06-27
+- P6-9 Multi-consumer bus arbitration (priority-ordered, implicit) — PR #81 — 2026-06-27 _(recreated from #79, which auto-closed when its stacked base branch was deleted)_
+- P6-6 TIMER-rebase `now()`/deadlines onto TIMER2, retire SysTick — PR #80 — 2026-06-27
