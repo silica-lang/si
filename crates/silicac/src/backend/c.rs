@@ -658,6 +658,11 @@ impl CBackend {
         // DSB so the kick is committed before its completion IRQ is enabled (P1-1).
         out.push("__DSB();".into());
         out.push(format!("__bus_owner = (int32_t){}; /* this reaction now owns the bus */", n));
+        // Discard any stale completion-IRQ pending from the *previous* transaction (the
+        // controller's IRQ line is level) before arming this one, else the fresh kick would
+        // immediately re-take the prior pending and resume before this transfer completes
+        // (audit P3-1 — without this a yielding `every` reaction fires only once on metal).
+        out.push("__bus_irq_clear_pending();".into());
         out.push("__bus_irq_enable();".into());
         out
     }
@@ -1428,9 +1433,16 @@ impl CBackend {
             self.line("static volatile int32_t __bus_owner = -1;");
             self.line("#define __NVIC_ISER0 (*(volatile uint32_t *)0xE000E100UL)");
             self.line("#define __NVIC_ICER0 (*(volatile uint32_t *)0xE000E180UL)");
+            self.line("#define __NVIC_ICPR0 (*(volatile uint32_t *)0xE000E280UL)");
             self.line("#define __BUS_IRQN 8U                /* nRF52840 SPI0/TWI0 line; the mock controller raises it (E1) */");
             self.line("static inline void __bus_irq_enable(void)  { __NVIC_ISER0 = (1UL << __BUS_IRQN); }");
             self.line("static inline void __bus_irq_disable(void) { __NVIC_ICER0 = (1UL << __BUS_IRQN); }");
+            // The completion line is *level* (the controller holds it asserted until the next
+            // transaction begins).  Across re-fires this leaves a stale NVIC pending after the
+            // handler disables the line; arming the next transaction would then take it
+            // spuriously (before the new transfer completes).  Clear pending at each kick so a
+            // fresh transaction only fires on its own completion (§5.2, audit P3-1).
+            self.line("static inline void __bus_irq_clear_pending(void) { __NVIC_ICPR0 = (1UL << __BUS_IRQN); }");
             self.line("");
         }
         self.line("/* BASEPRI access for priority-ceiling critical sections (§5.5). */");

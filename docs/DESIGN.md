@@ -787,8 +787,9 @@ disposition validation, while the value stays one regular shape to handle.
 > outcome flows through ONE `BusXfer` (`code_dst`: `0` = ok, `1 + i` = the i-th declared fault code),
 > dispatched by the if-chain on both consumers: the **sim** maps an injected `bus_fault <code>` to the
 > arm; **metal** decodes the controller's named SR error bits (nak/arblost/timeout) into the same arm
-> — `harness/fault_match.sh` is the Renode parity gate (every code → its own arm, no cross-talk).
-> examples/fault_match.si, tests/match_stmt.rs.
+> — `harness/fault_match.sh` is the Renode parity gate. Since the P3-1 multi-fire fix it drives all
+> four outcomes across four consecutive fires in **one boot** (nak→timeout→arblost→ok), each to its own
+> arm. examples/fault_match.si, tests/match_stmt.rs.
 >
 > **Composed-op match (P3-2).** `match` now also works one composition hop up: a `match
 > sensor.read_temp()` where `read_temp` is a **composed** op whose body wraps a single bus transaction
@@ -797,6 +798,14 @@ disposition validation, while the value stays one regular shape to handle.
 > Fault codes + exhaustiveness come from that transaction (the leaf controller's runtime codes); a
 > *multi-transaction* composed op is rejected with a clear error. examples/fault_match_composed.si.
 > **Remaining:** value patterns are integer/bool only; `match` over a multi-transaction composed op.
+>
+> **Status (P3-1 — yielding reactions re-fire on metal).** A yielding `every` reaction now fires
+> repeatedly on metal. The bus completion line is *level* (held asserted until the next transaction),
+> so after `__BUS_IRQHandler` disabled the NVIC line a stale **pending** survived; the next kick's
+> `__bus_irq_enable()` re-took it spuriously and resumed before the new transfer completed — so the
+> reaction fired only once. Fix: each kick clears the bus IRQ's NVIC pending (`__bus_irq_clear_pending`,
+> ICPR) before arming. Gate: `harness/bus_refire.sh` (≥3 fires in one boot → counter == 3);
+> `harness/bus_parity.sh` unchanged. (§5.2)
 
 **Layer 2 — propagation through the reactive model: fault disposition.** Fallibility composes
 *within* a handler (via `?`), but a handler has **no caller to unwind to** — it was invoked by an
