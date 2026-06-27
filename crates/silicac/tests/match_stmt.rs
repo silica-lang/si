@@ -205,6 +205,23 @@ fn a_duplicate_fault_arm_is_rejected() {
 }
 
 #[test]
+fn metal_kick_clears_stale_bus_pending_before_arming() {
+    // P3-1: a yielding `every` reaction must re-fire on metal.  The completion
+    // IRQ line is level, so each kick must clear any stale NVIC pending from the
+    // previous transaction before enabling — else the next kick re-takes the old
+    // pending spuriously and the reaction fires only once.
+    let sir = compile(&rprogram(ALL_ARMS, ""));
+    let out = c::CBackend::with_target(Target::MetalNrf52840).emit(&sir);
+    assert!(out.contains("__bus_irq_clear_pending"), "missing clear-pending helper:\n{}", out);
+    // The clear must precede the enable within the kick sequence.
+    let kick = out.find("__bus_owner = (int32_t)").expect("bus kick present");
+    let tail = &out[kick..];
+    let clear = tail.find("__bus_irq_clear_pending()").expect("clear-pending in kick");
+    let enable = tail.find("__bus_irq_enable()").expect("enable in kick");
+    assert!(clear < enable, "clear-pending must precede enable in the kick");
+}
+
+#[test]
 fn metal_decodes_each_fault_code_from_the_sr_bits() {
     let sir = compile(&rprogram(ALL_ARMS, ""));
     let out = c::CBackend::with_target(Target::MetalNrf52840).emit(&sir);

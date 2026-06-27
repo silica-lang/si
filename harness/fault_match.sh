@@ -12,11 +12,11 @@
 # Requires: cargo, arm-none-eabi-gcc/nm, and a Renode binary (set $RENODE or have
 # `renode` on PATH).  Loads harness/MockBusController.cs @ 0x4000_3000, IRQ→NVIC#8.
 #
-# Each metal outcome is exercised on a FRESH boot (the reaction's first fire),
-# driving one outcome via the mock's FaultBits and reading the cells back.  This
-# isolates exactly what P2-4 adds — the SR→fault-code decode + match dispatch —
-# from the (orthogonal, pre-existing) re-fire path of a yielding `every`
-# reaction, which is not what this gate measures.
+# Since the P3-1 multi-fire re-arm fix, the metal side drives all FOUR outcomes
+# across four consecutive fires in ONE boot (nak → timeout → arblost → ok),
+# mirroring the sim's injected sequence — the stronger parity check P2-4 had to
+# sidestep (fresh boot per outcome) when a yielding `every` reaction could fire
+# only once on metal.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -48,9 +48,11 @@ fi
 echo "cells: reads=$R naks=$N timeouts=$T arblosts=$A"
 
 echo "== run on metal (Renode, mock bus @ 0x4000_3000, IRQ→NVIC#8) =="
-# Each block: machine Reset → set the mock's FaultBits → run past the first fire
-# (1000ms) + bus latency (5ms) → dump all four cells.  The expected arm must read
-# 1 and the other three 0 (no cross-talk).
+# ONE boot, FOUR consecutive fires (the reaction re-arms each time since P3-1):
+# set the mock's FaultBits between fires so fire 1 NAKs (0x2), fire 2 times out
+# (0x8), fire 3 arbitration-losts (0x4), fire 4 succeeds (0x0).  Each fires at
+# 1000/2000/3000/4000ms and completes 5ms later.  Read all four cells at the end:
+# every arm must have fired exactly once.
 cat > "$RESC" <<RESC
 i @$REPO/harness/MockBusController.cs
 mach create "dk"
@@ -60,29 +62,14 @@ machine LoadPlatformDescriptionFromString "mockBus: Mocks.MockBusController @ sy
 nvic Frequency 64000000
 sysbus LoadELF @$ELF
 mach set "dk"
-mockBus FaultBits 0
-emulation RunFor "1.0100"
-sysbus ReadDoubleWord $R
-sysbus ReadDoubleWord $N
-sysbus ReadDoubleWord $T
-sysbus ReadDoubleWord $A
-machine Reset
 mockBus FaultBits 2
 emulation RunFor "1.0100"
-sysbus ReadDoubleWord $R
-sysbus ReadDoubleWord $N
-sysbus ReadDoubleWord $T
-sysbus ReadDoubleWord $A
-machine Reset
 mockBus FaultBits 8
-emulation RunFor "1.0100"
-sysbus ReadDoubleWord $R
-sysbus ReadDoubleWord $N
-sysbus ReadDoubleWord $T
-sysbus ReadDoubleWord $A
-machine Reset
+emulation RunFor "1.0000"
 mockBus FaultBits 4
-emulation RunFor "1.0100"
+emulation RunFor "1.0000"
+mockBus FaultBits 0
+emulation RunFor "1.0000"
 sysbus ReadDoubleWord $R
 sysbus ReadDoubleWord $N
 sysbus ReadDoubleWord $T
@@ -94,28 +81,18 @@ mapfile -t RAW < <(
   "$RENODE" --console --disable-xwt --plain -e "include @$RESC" 2>&1 \
     | tr -d '\r' | grep -E '^0x[0-9A-Fa-f]{8}'
 )
-if [[ ${#RAW[@]} -ne 16 ]]; then
-  echo "FAIL: expected 16 memory samples from Renode (4 cells × 4 outcomes), got ${#RAW[@]}: ${RAW[*]:-<none>}"; exit 1
+if [[ ${#RAW[@]} -ne 4 ]]; then
+  echo "FAIL: expected 4 memory samples from Renode, got ${#RAW[@]}: ${RAW[*]:-<none>}"; exit 1
 fi
-
-# Each row is (reads, naks, timeouts, arblosts) for one driven outcome.
-# Expected identity matrix: ok→reads, nak→naks, timeout→timeouts, arblost→arblosts.
-declare -a NAMES=(ok nak timeout arblost)
-declare -a EXPECT=("1 0 0 0" "0 1 0 0" "0 0 1 0" "0 0 0 1")
-fail=0
-for i in 0 1 2 3; do
-  base=$(( i * 4 ))
-  got="$(( RAW[base] )) $(( RAW[base+1] )) $(( RAW[base+2] )) $(( RAW[base+3] ))"
-  echo "metal ${NAMES[$i]}-outcome: reads/naks/timeouts/arblosts = $got"
-  if [[ "$got" != "${EXPECT[$i]}" ]]; then
-    echo "  FAIL: expected ${EXPECT[$i]} (only the ${NAMES[$i]} arm should fire)"; fail=1
-  fi
-done
+R_N=$(( RAW[0] )); N_N=$(( RAW[1] )); T_N=$(( RAW[2] )); A_N=$(( RAW[3] ))
+echo "metal (4 fires, one boot): reads=$R_N naks=$N_N timeouts=$T_N arblosts=$A_N"
 
 echo "== compare =="
-if (( fail == 0 )); then
-  echo "PASS: metal decoded ok + every declared fault code to the same arm the sim did (match-over-fault-codes parity)."
+# Every declared fault code + ok dispatched to its own arm exactly once, across
+# four re-fires in a single boot.
+if (( R_N == 1 && N_N == 1 && T_N == 1 && A_N == 1 )); then
+  echo "PASS: metal decoded ok + every declared fault code to the same arm the sim did, across re-fires (match-over-fault-codes parity)."
   exit 0
 else
-  echo "FAIL: metal fault-code dispatch did not match the expected per-outcome arms."; exit 1
+  echo "FAIL: expected reads=1 naks=1 timeouts=1 arblosts=1; got reads=$R_N naks=$N_N timeouts=$T_N arblosts=$A_N"; exit 1
 fi

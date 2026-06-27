@@ -346,5 +346,38 @@ more expressive (persistent typestate + match-over-fault-codes). Plan:
       the decode on each reaction's first fire; multi-fire re-arm + match over a composed op are
       follow-ups.
 
+### Cluster P3 — P2 follow-ups
+The deferred `NOTE:`/`Remaining` items from Cluster P2 (PRs #54–#57). Plan:
+`~/.claude/plans/as-an-embedded-firmware-functional-pebble.md`. Each item is its own branch
+(`feat/p3-<id>`, **independent off `main`**) + PR targeting `main` (not auto-merged). Order:
+smallest/highest-value → largest. (The first feature PR also introduces this section.)
+
+- [x] P3-1 Multi-fire re-arm of a yielding `every` reaction (P2-4 follow-up) `[metal]` — PR #59.
+      Root cause (Renode access log): the completion IRQ line is **level** (held asserted until the next
+      transaction); after `__BUS_IRQHandler` disabled NVIC#8 a stale **pending** survived, and the next
+      kick's `__bus_irq_enable()` re-took it spuriously — resuming before the new transfer completed, so
+      the reaction fired only ONCE. Fix: each kick clears the bus IRQ pending (`__bus_irq_clear_pending`
+      → NVIC ICPR) before arming (`emit_bus_kick_metal`). Also added `default-run = "silicac"` so
+      `cargo run` in the harnesses isn't ambiguous after P2-2's `escape_audit` bin. New
+      harness/bus_refire.sh (3 fires/one boot → reads==3); harness/fault_match.sh tightened to **true
+      multi-fire** (nak→timeout→arblost→ok in one boot, all PASS); tests/match_stmt.rs
+      (clear-before-enable). **Renode: PASS**; bus_parity.sh still PASS.
+- [ ] P3-2 `match` over a composed (inlined) op (P2-4 follow-up) — lift the primitive-bus-op restriction
+      (`resolver.rs` lower_result_match): inline a composed op's body in a "catch" context so an inner
+      fault sets the match `code_dst` (mapped to the composed op's declared fault codes). + richer value
+      patterns if cheap. tests/match_stmt.rs (composed device) + sim/metal.
+- [ ] P3-3 Broader typestate: runtime-precondition lowering (P2-3 follow-up) `[metal]` — the unprovable
+      `when <state>` case (across a `yields`/dynamic ref) becomes a runtime Layer-3 fault instead of a
+      conservative compile error; + single-owner-firing persistence + Layer-3 site map. tests/typestate.rs
+      + sim/metal Layer-3 decode.
+- [ ] P3-4a Fuller LLVM backend — extended scalar subset (P2-1 follow-up) `[llvm]` — add `Now`/`RegLoad`/
+      signed saturate/full `BinOp`/`Not`, `If` control flow, and non-`sys.start` reaction bodies as
+      functions (no scheduler yet). tests/llvm_canary.rs + `opt -verify`.
+- [ ] P3-4b Fuller LLVM backend — MMIO register access (P2-1 follow-up) `[llvm]` — `SirPlace::Reg` store +
+      `RegLoad` -> `volatile` load/store at the absolute MMIO address. `opt -verify` + `llc` to object.
+- [ ] P3-4c Fuller LLVM backend — yields state machine + metal startup/linker (P2-1 follow-up) `[metal]` —
+      a real program links via the LLVM backend and runs on Renode (the genuine second-backend proof).
+      Largest; re-implements much of the C metal backend in LLVM IR; PAUSE & report if Renode can't validate.
+
 ## Completed log
 _(append `item — PR #NN — date` here as items land)_
