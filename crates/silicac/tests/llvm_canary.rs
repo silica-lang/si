@@ -1067,3 +1067,48 @@ fn metal_await_lowers_to_a_frame_suspend_not_a_busy_wait() {
     assert!(!react.contains("wfi"), "await must suspend (return), not wfi-spin:\n{}", react);
     assert_no_c_isms(&ll);
 }
+
+// ─── P6-8: runtime float arithmetic on metal ──────────────────────────────────
+
+#[test]
+fn metal_float_lowers_to_hardware_fp_with_fpu_enable() {
+    // Float values flow as IEEE bits in an iN; arithmetic bitcasts to `float`,
+    // computes (fadd), bitcasts back. The reset handler enables the FPU (CPACR).
+    let mut m = module(vec![cell("acc", SirType::F32, 0)], vec![]);
+    m.fpu = true;
+    let mut rx = reaction(vec![SirStmt::Assign {
+        target: SirPlace::Var("acc".into()),
+        value: SirExpr::FloatArith {
+            op: SirBinOp::Add,
+            width: 32,
+            lhs: Box::new(SirExpr::Load("acc".into())),
+            rhs: Box::new(SirExpr::FloatLit { bits: 1069547520, width: 32 }), // 1.5f
+        },
+    }]);
+    rx.id = 1;
+    rx.trigger = SirTrigger::EveryNs(100_000_000);
+    m.reactions.push(rx);
+    let ll = LlvmBackend::with_target(Target::MetalNrf52840).emit(&m);
+
+    // A float cell stores its IEEE bit pattern in an i32 slot.
+    assert!(ll.contains("@acc = global i32"), "float cell should store i32 bits:\n{}", ll);
+    // Arithmetic: bitcast to float, fadd, bitcast back.
+    assert!(ll.contains("bitcast i32") && ll.contains("to float"), "no bitcast to float:\n{}", ll);
+    assert!(ll.contains("fadd float"), "no hardware float add:\n{}", ll);
+    assert!(ll.contains("bitcast float") && ll.contains("to i32"), "no bitcast back to bits:\n{}", ll);
+    // The literal 1.5f appears as its bit pattern.
+    assert!(ll.contains("1069547520"), "float literal bits missing:\n{}", ll);
+    // The FPU is enabled in the reset handler (CPACR CP10/CP11).
+    assert!(ll.contains("CPACR"), "FPU (CPACR) not enabled:\n{}", ll);
+    assert!(!ll.contains("; unsupported expr in llvm canary: FloatArith"), "FloatArith should be lowered:\n{}", ll);
+    assert_no_c_isms(&ll);
+}
+
+#[test]
+fn host_float_path_has_no_fpu_enable() {
+    // The FPU (CPACR) enable is metal-only; the host module never emits it.
+    let mut m = module(vec![cell("acc", SirType::F32, 0)], vec![]);
+    m.fpu = true;
+    let ll = LlvmBackend::new().emit(&m);
+    assert!(!ll.contains("CPACR"), "host must not emit the metal FPU enable:\n{}", ll);
+}

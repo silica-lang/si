@@ -518,8 +518,17 @@ Renode path can't be validated or a genuine design fork is the user's call (P6-7
       change: now() 1 ms → 1 µs; update tests + re-validate all metal gates.
 - [ ] P6-7 Metal semihosting (`host_io` on metal, both backends) `[metal]`. BKPT 0xAB ABI. **PAUSE
       candidate** — first verify Renode semihosting capture; report if unavailable.
-- [ ] P6-8 Runtime float arithmetic on metal (front-to-back). Float SIR literal+arith, sim float oracle,
-      resolver, C+LLVM emission, FPU enable (CPACR). **PAUSE** to confirm the sim float value model.
+- [x] P6-8 Runtime float arithmetic on metal (front-to-back) `[metal]` — PR #77. Float was storage-only
+      (math silently miscompiled to integer). Now front-to-back: SIR `FloatLit`/`FloatArith`; resolver
+      types it type-directed (a decimal/int literal is float in a float context — `3.5` stays Q16.16
+      fixed elsewhere — and `+ - * /` route to FloatArith on a float operand); sim reinterprets the u64
+      bits as f32/f64; both backends enable the FPU (CPACR) in reset + emit hardware float (LLVM: IEEE
+      bits in iN + bitcast around fadd/fmul, `llc -mcpu=cortex-m4 -float-abi=hard`; C: plain ops,
+      `-mfpu=fpv4-sp-d16 -mfloat-abi=hard`) — no soft-float libcalls. Surface syntax: type-directed
+      `+ - * /` (user-chosen). examples/float_nrf52840.si + tests/fpu.rs (7) + tests/llvm_canary.rs (35)
+      + harness/float_metal.sh. **Renode PASS** (C and LLVM) — acc=4.5/out=9.0 bit-exact = sim; sim ≡
+      metal. NOTE: float compares, int↔float conversion, and f64 on the single-precision M4F are
+      follow-ups; mixing int+float operands without a cast is unsupported.
 - [ ] P6-9 Multi-consumer bus arbitration / bounded per-bus wait queue (front-to-back). Per-bus owner +
       queue in SIR, resolver contention, sim oracle, both backends. **PAUSE** to confirm the arbitration
       policy.

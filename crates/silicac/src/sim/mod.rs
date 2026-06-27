@@ -1025,6 +1025,13 @@ impl<'m> Sim<'m> {
                 let b = self.eval_expr(rhs, frame);
                 self.eval_arith(*op, *mode, *width, *signed, a, b)
             }
+            // Float (§4.3, P6-8): values carry IEEE bit patterns in the u64 model.
+            SirExpr::FloatLit { bits, .. } => *bits,
+            SirExpr::FloatArith { op, width, lhs, rhs } => {
+                let a = self.eval_expr(lhs, frame);
+                let b = self.eval_expr(rhs, frame);
+                eval_float(*op, *width, a, b)
+            }
             // `now()` — current virtual time in ns since boot (§4.5).
             SirExpr::Now => self.now,
             // Explicit cast (§4.3): a narrowing cast truncates to `to_width`
@@ -1227,5 +1234,34 @@ fn trigger_desc(trigger: &SirTrigger) -> String {
         SirTrigger::SysStart => "sys.start".into(),
         SirTrigger::EveryNs(ns) => format!("every {}ns", ns),
         SirTrigger::Event(e) => format!("event#{}", e),
+    }
+}
+
+/// Evaluate float arithmetic (§4.3, P6-8) on IEEE bit patterns: reinterpret the
+/// `u64` operands as `f32`/`f64`, apply the op, and return the result's bits.
+/// IEEE semantics (overflow → inf), so no trap — unlike integer `eval_arith`.
+fn eval_float(op: SirBinOp, width: u8, a: u64, b: u64) -> u64 {
+    if width == 32 {
+        let x = f32::from_bits(a as u32);
+        let y = f32::from_bits(b as u32);
+        let r = match op {
+            SirBinOp::Add => x + y,
+            SirBinOp::Sub => x - y,
+            SirBinOp::Mul => x * y,
+            SirBinOp::Div => x / y,
+            _ => x,
+        };
+        r.to_bits() as u64
+    } else {
+        let x = f64::from_bits(a);
+        let y = f64::from_bits(b);
+        let r = match op {
+            SirBinOp::Add => x + y,
+            SirBinOp::Sub => x - y,
+            SirBinOp::Mul => x * y,
+            SirBinOp::Div => x / y,
+            _ => x,
+        };
+        r.to_bits()
     }
 }

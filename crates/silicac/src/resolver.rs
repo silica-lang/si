@@ -209,6 +209,13 @@ pub struct Resolver {
     /// Fractional bits of the enclosing fixed-point target, if any (§4.3 P0-3b):
     /// the scale a decimal/voltage literal (`0.5`, `3v3`) adopts.
     arith_frac: Option<u8>,
+    /// Float width (32/64) of the enclosing target, if it is a `float` (P6-8):
+    /// a decimal/int literal in this context lowers to a `FloatLit` and `+ - * /`
+    /// route to `FloatArith`.  `None` outside a float context.
+    arith_float: Option<u8>,
+    /// Set once any built board declares an `fpu` (P6-8) — survives the
+    /// `board_ctx.take()` so the metal reset handler can enable CPACR.
+    any_fpu: bool,
     /// The board context for the program *currently* being resolved.
     board_ctx: Option<BoardContext>,
     /// Per-program board context, so a `sim` block resolves against its own
@@ -258,6 +265,8 @@ impl Resolver {
             arith_width: 32,
             arith_signed: false,
             arith_frac: None,
+            arith_float: None,
+            any_fpu: false,
             dev_types: HashMap::new(),
             board_ctx: None,
             program_ctx: HashMap::new(),
@@ -339,6 +348,7 @@ impl Resolver {
                 watchdog_timeout_ns: self.watchdog_timeout_ns,
                 watchdog_device: self.watchdog_device,
                 bus_hangs: self.bus_hangs,
+                fpu: self.any_fpu,
             })
         } else {
             Err(self.errors)
@@ -839,6 +849,7 @@ impl Resolver {
 
         let _ = use_span;
         let fpu = board.soc.as_ref().map(|s| s.fpu).unwrap_or(false);
+        self.any_fpu |= fpu; // P6-8: survives board_ctx.take() for the CPACR enable
         let ctx = BoardContext { pins, instances, fpu };
         self.boards_built.insert(board_name.to_string(), ctx.clone());
         self.board_ctx = Some(ctx);
@@ -1381,6 +1392,20 @@ impl Resolver {
     /// `fixed<I,F>`) to a rescaling `FixedArith` node (§4.3 P0-3c).  Add/sub on
     /// fixed stay raw integer arithmetic at the storage width.
     fn make_binop_typed(&self, op: BinOp, l: SirExpr, r: SirExpr, lhs: &Expr, rhs: &Expr, scope: &Scope) -> SirExpr {
+        // Float operands (P6-8) take precedence: `+ - * /` route to FloatArith
+        // (IEEE, no overflow trap).  Detect via either operand's type or the
+        // enclosing float context (so `x * 2.0` with `x` float works).
+        let float_w = match (self.expr_sirtype(lhs, scope), self.expr_sirtype(rhs, scope)) {
+            (SirType::F32, _) | (_, SirType::F32) => Some(32u8),
+            (SirType::F64, _) | (_, SirType::F64) => Some(64u8),
+            _ => self.arith_float,
+        };
+        if let Some(width) = float_w {
+            if let Some(fop) = float_binop(op) {
+                return SirExpr::FloatArith { op: fop, width, lhs: Box::new(l), rhs: Box::new(r) };
+            }
+            // comparisons on floats fall through to the raw BinOp path below.
+        }
         let fixed = match (self.expr_sirtype(lhs, scope), self.expr_sirtype(rhs, scope)) {
             (SirType::Fixed { int_bits, frac_bits, signed }, _)
             | (_, SirType::Fixed { int_bits, frac_bits, signed }) => Some((int_bits, frac_bits, signed)),
@@ -1408,9 +1433,9 @@ impl Resolver {
         self.make_binop(op, l, r)
     }
 
-    /// Save the current arithmetic context (width, signed, fixed-frac).
-    fn save_arith(&self) -> (u8, bool, Option<u8>) {
-        (self.arith_width, self.arith_signed, self.arith_frac)
+    /// Save the current arithmetic context (width, signed, fixed-frac, float).
+    fn save_arith(&self) -> (u8, bool, Option<u8>, Option<u8>) {
+        (self.arith_width, self.arith_signed, self.arith_frac, self.arith_float)
     }
     /// Raw fixed-point value of a decimal/voltage literal at the enclosing scale
     /// (default Q16.16): `round(mantissa * 2^F / 10^scale)` (§4.3 P0-3b).
@@ -1426,16 +1451,23 @@ impl Resolver {
         self.arith_width = w;
         self.arith_signed = s;
         self.arith_frac = sirtype_frac(ty);
+        self.arith_float = match ty {
+            SirType::F32 => Some(32),
+            SirType::F64 => Some(64),
+            _ => None,
+        };
     }
     fn set_arith(&mut self, w: u8, s: bool, frac: Option<u8>) {
         self.arith_width = w;
         self.arith_signed = s;
         self.arith_frac = frac;
+        self.arith_float = None;
     }
-    fn restore_arith(&mut self, saved: (u8, bool, Option<u8>)) {
+    fn restore_arith(&mut self, saved: (u8, bool, Option<u8>, Option<u8>)) {
         self.arith_width = saved.0;
         self.arith_signed = saved.1;
         self.arith_frac = saved.2;
+        self.arith_float = saved.3;
     }
 
     fn make_binop(&self, op: BinOp, l: SirExpr, r: SirExpr) -> SirExpr {
@@ -1455,6 +1487,28 @@ impl Resolver {
 
     /// The `(width_bits, signed)` overflow context implied by an assignment
     /// target — a register field's width, or a cell/local's declared type.
+    /// Float width (32/64) of an assignment place, if it is a `float` (P6-8) —
+    /// so a decimal/int literal in the RHS lowers to a `FloatLit` and `+ - * /`
+    /// route to `FloatArith`.
+    fn place_float(&self, place: &SirPlace, scope: &Scope, vars: &[SirVar]) -> Option<u8> {
+        if let SirPlace::Var(name) = place {
+            let ty = vars
+                .iter()
+                .find(|v| &v.name == name)
+                .map(|v| &v.ty)
+                .or_else(|| match scope.lookup(name) {
+                    Some(Binding::Local(_, ty)) | Some(Binding::Cell(_, ty)) => Some(ty),
+                    _ => None,
+                });
+            return match ty {
+                Some(SirType::F32) => Some(32),
+                Some(SirType::F64) => Some(64),
+                _ => None,
+            };
+        }
+        None
+    }
+
     fn place_ctx(&self, place: &SirPlace, scope: &Scope, vars: &[SirVar]) -> (u8, bool, Option<u8>) {
         match place {
             SirPlace::Reg { width, .. } => (*width, false, None),
@@ -2206,6 +2260,7 @@ impl Resolver {
                     let (w, s, frac) = self.place_ctx(&place, scope, vars);
                     let saved = self.save_arith();
                     self.set_arith(w, s, frac);
+                    self.arith_float = self.place_float(&place, scope, vars); // P6-8
                     let value = self.lower_expr_emit(rhs, scope, vars, out);
                     self.restore_arith(saved);
                     out.push(SirStmt::Assign { target: place, value });
@@ -2216,9 +2271,10 @@ impl Resolver {
                     let (w, s, frac) = self.place_ctx(&place, scope, vars);
                     let saved = self.save_arith();
                     self.set_arith(w, s, frac);
+                    self.arith_float = self.place_float(&place, scope, vars); // P6-8
                     let lhs_val = self.lower_expr(lhs, scope);
                     let rhs_val = self.lower_expr_emit(rhs, scope, vars, out);
-                    let combined = self.make_binop(*op, lhs_val, rhs_val);
+                    let combined = self.make_binop_typed(*op, lhs_val, rhs_val, lhs, rhs, scope);
                     self.restore_arith(saved);
                     out.push(SirStmt::Assign { target: place, value: combined });
                 }
@@ -2668,10 +2724,23 @@ impl Resolver {
     fn lower_expr(&mut self, expr: &Expr, scope: &Scope) -> SirExpr {
         match &expr.kind {
             ExprKind::BoolLit(b) => SirExpr::Bool(*b),
-            ExprKind::IntLit(n) | ExprKind::DurationLit(n) => SirExpr::U64(*n),
-            // A decimal/voltage literal adopts the enclosing fixed-point scale
-            // (default Q16.16): raw = round(mantissa * 2^F / 10^scale) (§4.3 P0-3b).
-            ExprKind::FixedLit(mantissa, scale) => SirExpr::U64(self.fixed_lit_raw(*mantissa, *scale)),
+            // In a float context an integer literal is a float (P6-8); a duration
+            // literal is always ns (u64).
+            ExprKind::IntLit(n) => match self.arith_float {
+                Some(w) => SirExpr::FloatLit { bits: float_bits(*n as f64, w), width: w },
+                None => SirExpr::U64(*n),
+            },
+            ExprKind::DurationLit(n) => SirExpr::U64(*n),
+            // A decimal/voltage literal is a float in a float context (P6-8);
+            // otherwise it adopts the enclosing fixed-point scale (default Q16.16):
+            // raw = round(mantissa * 2^F / 10^scale) (§4.3 P0-3b).
+            ExprKind::FixedLit(mantissa, scale) => match self.arith_float {
+                Some(w) => {
+                    let v = (*mantissa as f64) / 10f64.powi(*scale as i32);
+                    SirExpr::FloatLit { bits: float_bits(v, w), width: w }
+                }
+                None => SirExpr::U64(self.fixed_lit_raw(*mantissa, *scale)),
+            },
             ExprKind::StringLit(s) => SirExpr::Bytes(s.as_bytes().to_vec()),
             ExprKind::Ident(ident) => match scope.lookup(&ident.name) {
                 Some(Binding::Local(name, _)) | Some(Binding::Cell(name, _)) => SirExpr::Load(name.clone()),
@@ -3129,6 +3198,29 @@ fn if_contains_yield(stmts: &[SirStmt]) -> bool {
         SirStmt::Critical { body, .. } => if_contains_yield(body),
         _ => false,
     })
+}
+
+/// Map a surface binary operator to its float arithmetic op (P6-8).  Only the
+/// plain `+ - * /` lower to float math (IEEE has no wrap/saturate); comparisons
+/// and wrap/sat variants return `None` (handled on the raw path).
+fn float_binop(op: BinOp) -> Option<SirBinOp> {
+    match op {
+        BinOp::Add => Some(SirBinOp::Add),
+        BinOp::Sub => Some(SirBinOp::Sub),
+        BinOp::Mul => Some(SirBinOp::Mul),
+        BinOp::Div => Some(SirBinOp::Div),
+        _ => None,
+    }
+}
+
+/// IEEE-754 bit pattern of `v` at `width` (32/64) — the value a `FloatLit`
+/// carries (P6-8).  The sim's `u64` value model stores this pattern directly.
+fn float_bits(v: f64, width: u8) -> u64 {
+    if width == 32 {
+        (v as f32).to_bits() as u64
+    } else {
+        v.to_bits()
+    }
 }
 
 /// True if a (possibly nested) statement list contains a yielding bus transfer.

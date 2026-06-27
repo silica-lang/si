@@ -1298,6 +1298,25 @@ impl CBackend {
         match expr {
             SirExpr::Bool(b) => if *b { "1U".into() } else { "0U".into() },
             SirExpr::U64(n) => format!("{}ULL", n),
+            // Float (§4.3, P6-8): a literal as a typed C constant (round-trips via
+            // Rust's shortest-exact formatting), arithmetic as plain C float ops.
+            SirExpr::FloatLit { bits, width } => {
+                if *width == 32 {
+                    format!("((float){})", f32::from_bits(*bits as u32))
+                } else {
+                    format!("((double){})", f64::from_bits(*bits))
+                }
+            }
+            SirExpr::FloatArith { op, lhs, rhs, .. } => {
+                let o = match op {
+                    SirBinOp::Add => "+",
+                    SirBinOp::Sub => "-",
+                    SirBinOp::Mul => "*",
+                    SirBinOp::Div => "/",
+                    _ => "+",
+                };
+                format!("({} {} {})", self.emit_expr(lhs), o, self.emit_expr(rhs))
+            }
             SirExpr::Bytes(bytes) => {
                 // Bytes as a cast-to-const-pointer string literal.
                 let escaped = c_escape_bytes(bytes);
@@ -1768,6 +1787,13 @@ impl CBackend {
         self.line("while (dst < &_edata) { *dst++ = *src++; }");
         self.line("/* zero .bss */");
         self.line("for (dst = &_sbss; dst < &_ebss; ) { *dst++ = 0U; }");
+        // Enable the FPU (CP10/CP11 full access) before any float instruction runs
+        // (§4.3, P6-8) — otherwise an FP op UsageFaults on Cortex-M4F.
+        if module.fpu {
+            self.line("/* enable the FPU: CPACR CP10/CP11 full access (§4.3) */");
+            self.line("*(volatile uint32_t *)0xE000ED88UL |= (0xFUL << 20);");
+            self.line("__DSB(); __ISB();");
+        }
         self.emit_newline();
 
         // Device init: output-pin directions (§6.4).
@@ -2339,6 +2365,14 @@ fn expr_to_c_literal(expr: &SirExpr) -> String {
     match expr {
         SirExpr::Bool(b) => if *b { "1U".into() } else { "0U".into() },
         SirExpr::U64(n) => format!("{}ULL", n),
+        // Float cell initializer (P6-8): a typed C float constant.
+        SirExpr::FloatLit { bits, width } => {
+            if *width == 32 {
+                format!("((float){})", f32::from_bits(*bits as u32))
+            } else {
+                format!("((double){})", f64::from_bits(*bits))
+            }
+        }
         _ => "0".into(),
     }
 }

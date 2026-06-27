@@ -74,3 +74,56 @@ fn integers_are_unaffected_without_an_fpu() {
     // No false positives: a plain integer cell compiles on an FPU-less SoC.
     let _ = compile(&program(false, "cell reading : u32 = 0"));
 }
+
+#[test]
+fn float_arithmetic_computes_in_the_simulator() {
+    // P6-8: `+ - * /` on floats compute IEEE values (carried as bit patterns in
+    // the sim's u64 model).  3 ticks: acc = 0+1.5*3 = 4.5; out = acc*2 = 9.0.
+    let src = r#"
+board dk {
+  soc s {
+    memory { flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K }
+    clocks { sysclk : clock_source = 64MHz }
+    fpu
+  }
+}
+program app {
+  use board dk as b
+  cell acc : float = 0.0
+  cell out : float = 0.0
+  every 100ms { acc = acc + 1.5  out = acc * 2.0 }
+}
+sim s for app { run until 350ms }
+"#;
+    let sir = compile(src);
+    let trace = silicac::sim::run(&sir).render(&sir);
+    // 4.5f = 0x40900000 = 1083179008; 9.0f = 0x41100000 = 1091567616 (IEEE bits).
+    assert!(trace.contains("cell acc = 1083179008"), "float add wrong:\n{}", trace);
+    assert!(trace.contains("cell out = 1091567616"), "float mul wrong:\n{}", trace);
+}
+
+#[test]
+fn decimal_literal_is_float_in_a_float_context_fixed_otherwise() {
+    // The SAME literal `2.5` is a float (bits 0x40200000 = 1075838976) assigned to
+    // a float cell, but a Q16.16 fixed raw (163840) assigned to a fixed cell.
+    let src = r#"
+board dk {
+  soc s {
+    memory { flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K }
+    clocks { sysclk : clock_source = 64MHz }
+    fpu
+  }
+}
+program app {
+  use board dk as b
+  cell f : float       = 0.0
+  cell q : fixed<16,16> = 0
+  on sys.start { f = 2.5  q = 2.5 }
+}
+sim s for app { run until 1ms }
+"#;
+    let sir = compile(src);
+    let trace = silicac::sim::run(&sir).render(&sir);
+    assert!(trace.contains("cell f = 1075838976"), "decimal should be float in a float cell:\n{}", trace);
+    assert!(trace.contains("cell q = 163840"), "decimal should be Q16.16 in a fixed cell:\n{}", trace);
+}

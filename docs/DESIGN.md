@@ -1387,6 +1387,20 @@ checked in §10's foreclosure audit (LLVM, FFI, multicore all remain reachable).
 > *during* the suspension and sets the awaited condition, so the worker resumes (`done`=3 = sim) where
 > the old busy-wait would have deadlocked. `poll` stays a non-yielding busy-wait; a priority-preserving
 > resume (PendSV instead of SysTick-context) is a further follow-up.
+>
+> **Runtime float arithmetic (audit P6-8).** `float` was storage-only — float math *silently miscompiled*
+> to integer + Q16.16-mangled literals. Now it computes, front-to-back: new SIR `FloatLit`/`FloatArith`;
+> the resolver types it (a decimal/int literal is a float in a float context via the existing arith
+> context — `3.5` stays Q16.16 fixed elsewhere — and `+ - * /` route to `FloatArith` when an operand is
+> float, type-directed like fixed-point); the sim reinterprets the `u64` model's bits as `f32`/`f64`. On
+> metal both backends enable the **FPU** (CPACR CP10/CP11) in the reset handler and emit hardware float:
+> the LLVM backend keeps values as IEEE bits in an `iN` and `bitcast`s to `float`/`double` around
+> `fadd`/`fmul`/… (so cell storage/loads are unchanged), built with `llc -mcpu=cortex-m4
+> -float-abi=hard`; the C backend emits plain float ops with `-mfpu=fpv4-sp-d16 -mfloat-abi=hard`. Both
+> avoid soft-float libcalls (`__addsf3`) that `-nostdlib` couldn't satisfy. `harness/float_metal.sh`
+> runs `acc += 1.5; out = acc*2` on the M4F: `acc=4.5`, `out=9.0` **bit-exact** with the sim, `sim ≡
+> metal(LLVM)`. (Float comparisons, int↔float conversions, and `f64` on the single-precision M4F are
+> follow-ups; mixing int and float operands without a cast is unsupported.)
 
 ### 6.4 Generated linker script, vector table, startup, `.data`/`.bss`
 
