@@ -493,8 +493,13 @@ Renode path can't be validated or a genuine design fork is the user's call (P6-7
       tests/llvm_canary.rs (32) + harness/fault_decode_metal.sh. **Renode PASS** — decoder+tables link
       and coexist with a live program; address→owner decode validated by sim + canary (a precise BFAR
       fault can't be injected on Renode, as for the C Layer-3). Finer per-call-site map stays deferred.
-- [ ] P6-4 Dynamic `Bytes` / `host_io.print` on host. Lower SirExpr::Bytes + dynamic HostIoPrint via a
-      private constant + emit_write. Host canary only (host-io has no metal target — see P6-7).
+- [x] P6-4 Dynamic `host_io.print` (host) — PR #75. `host_io.print(<value>)` was unimplemented on ALL
+      backends (sim no-op, C TODO, LLVM `; unsupported`); now all three print the runtime value as
+      unsigned decimal. LLVM host: inline udiv/urem itoa into a stack buffer + raw write syscall (no
+      libc); sim: to_string; C: equivalent inline itoa. examples/print_value.si + tests/llvm_canary.rs
+      (33) + harness/print_value.sh. **PASS** (host) — LLVM binary and sim both print 42 for
+      print(40+2). Host-only (no metal host_io until semihosting, P6-7). NOTE: `SirExpr::Bytes` as a
+      standalone operand never arises from source (literals → HostIoPrintStr), so it stays a signpost.
 - [ ] P6-5 `await` full D2-style frame suspend (both backends) `[metal]`. Generalize the bus-only
       yielding state machine to await; resolver `body_yields` includes Await; TIMER recheck-channel
       resume; await deadline separate from the watchdog. examples/await_interleave_nrf52840.si +

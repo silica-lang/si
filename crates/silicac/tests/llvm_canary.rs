@@ -1016,3 +1016,24 @@ fn metal_emits_the_layer3_fault_decoder() {
     assert!(ll.contains("ptr @HardFault_Handler"), "HardFault not vectored:\n{}", ll);
     assert_no_c_isms(&ll);
 }
+
+// ─── P6-4: dynamic host_io.print (host) ───────────────────────────────────────
+
+#[test]
+fn dynamic_host_io_print_emits_decimal_itoa_not_libc() {
+    // host_io.print(<value>) → an inline unsigned-decimal conversion (udiv/urem)
+    // + the raw write syscall; never a libc printf/itoa, never `; unsupported`.
+    let m = SirModule {
+        vars: vec![cell("answer", SirType::U32, 0)],
+        reactions: vec![reaction(vec![SirStmt::Intrinsic(SirIntrinsic::HostIoPrint(
+            SirExpr::Load("answer".into()),
+        ))])],
+        ..Default::default()
+    };
+    let ll = LlvmBackend::new().emit(&m);
+    assert!(ll.contains("udiv i64") && ll.contains("urem i64"), "no decimal itoa:\n{}", ll);
+    assert!(ll.contains("add i64") && ll.contains(", 48"), "digits must be ASCII ('0'=48):\n{}", ll);
+    assert!(ll.contains("svc #0x80"), "must write via the raw syscall:\n{}", ll);
+    assert!(!ll.contains("; unsupported in llvm canary: dynamic host_io.print"), "should be lowered:\n{}", ll);
+    assert_no_c_isms(&ll); // no @printf etc.
+}

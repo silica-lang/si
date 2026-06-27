@@ -1680,9 +1680,9 @@ impl LlvmBackend {
         match intr {
             SirIntrinsic::HostIoPrintStr(s) => self.emit_write(s.as_bytes()),
             SirIntrinsic::HostIoPrint(SirExpr::Bytes(b)) => self.emit_write(b),
-            SirIntrinsic::HostIoPrint(_) => {
-                self.inst("; unsupported in llvm canary: dynamic host_io.print");
-            }
+            // A runtime value (P6-4): convert to unsigned decimal then write —
+            // matching the simulator's `host_io.print(<value>)` oracle.
+            SirIntrinsic::HostIoPrint(e) => self.emit_print_decimal(e),
             // Stdout is unbuffered through the raw syscall — flush is a no-op.
             SirIntrinsic::HostIoFlush => self.inst("; host_io.flush: no-op (unbuffered syscall)"),
         }
@@ -1712,6 +1712,62 @@ impl LlvmBackend {
             r,
             g,
             bytes.len()
+        ));
+    }
+
+    /// `host_io.print(<value>)` (P6-4): convert the runtime value to unsigned
+    /// decimal into a stack buffer (digits filled from the end), then write the
+    /// digit run via the raw syscall — matching the sim's decimal oracle.  No libc
+    /// `printf`/`itoa`.  Host-only (metal returns before this).
+    fn emit_print_decimal(&mut self, expr: &SirExpr) {
+        let v0 = self.emit_expr(expr, 64);
+        let tag = self.fresh_label("dec");
+        let buf = format!("%{}.buf", tag);
+        let vslot = format!("%{}.v", tag);
+        let islot = format!("%{}.i", tag);
+        self.allocas.push_str(&format!("  {} = alloca [24 x i8]\n", buf));
+        self.allocas.push_str(&format!("  {} = alloca i64\n", vslot));
+        self.allocas.push_str(&format!("  {} = alloca i64\n", islot));
+        self.inst(&format!("store i64 {}, ptr {}", v0, vslot));
+        self.inst(&format!("store i64 24, ptr {}", islot)); // fill from the end
+        let loop_l = format!("{}.loop", tag);
+        let done_l = format!("{}.done", tag);
+        self.inst(&format!("br label %{}", loop_l));
+        self.label(&loop_l);
+        let v = self.fresh();
+        self.inst(&format!("{} = load i64, ptr {}", v, vslot));
+        let i = self.fresh();
+        self.inst(&format!("{} = load i64, ptr {}", i, islot));
+        let i1 = self.fresh();
+        self.inst(&format!("{} = sub i64 {}, 1", i1, i));
+        let d = self.fresh();
+        self.inst(&format!("{} = urem i64 {}, 10", d, v));
+        let c = self.fresh();
+        self.inst(&format!("{} = add i64 {}, 48", c, d)); // '0'
+        let c8 = self.fresh();
+        self.inst(&format!("{} = trunc i64 {} to i8", c8, c));
+        let slot = self.fresh();
+        self.inst(&format!("{} = getelementptr [24 x i8], ptr {}, i64 0, i64 {}", slot, buf, i1));
+        self.inst(&format!("store i8 {}, ptr {}", c8, slot));
+        let vn = self.fresh();
+        self.inst(&format!("{} = udiv i64 {}, 10", vn, v));
+        self.inst(&format!("store i64 {}, ptr {}", vn, vslot));
+        self.inst(&format!("store i64 {}, ptr {}", i1, islot));
+        let nz = self.fresh();
+        self.inst(&format!("{} = icmp ne i64 {}, 0", nz, vn));
+        self.inst(&format!("br i1 {}, label %{}, label %{}", nz, loop_l, done_l));
+        self.label(&done_l);
+        let ifin = self.fresh();
+        self.inst(&format!("{} = load i64, ptr {}", ifin, islot));
+        let ptr = self.fresh();
+        self.inst(&format!("{} = getelementptr [24 x i8], ptr {}, i64 0, i64 {}", ptr, buf, ifin));
+        let len = self.fresh();
+        self.inst(&format!("{} = sub i64 24, {}", len, ifin));
+        let w = self.fresh();
+        self.inst(&format!(
+            "{} = call i64 asm sideeffect \"svc #0x80\", \
+             \"={{x0}},{{x16}},{{x0}},{{x1}},{{x2}},~{{memory}}\"(i64 4, i64 1, ptr {}, i64 {})",
+            w, ptr, len
         ));
     }
 

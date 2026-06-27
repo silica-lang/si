@@ -1365,6 +1365,14 @@ checked in §10's foreclosure audit (LLVM, FFI, multicore all remain reachable).
 > program on Renode. (A precise BFAR fault can't be injected on Renode — CFSR is hardware-managed and
 > unmapped reads don't fault the core — the same reason the C Layer-3 has no on-metal fault-injection
 > gate; the *finer* per-call-site map remains deferred.)
+>
+> **Dynamic `host_io.print` (audit P6-4).** `host_io.print(<value>)` (a non-literal argument) was
+> unimplemented on every backend — the sim no-op'd it, the C backend left a `TODO`, the LLVM backend
+> signposted it. All three now agree: print the runtime value as **unsigned decimal**. The LLVM host path
+> converts via an inline `udiv`/`urem` itoa into a stack buffer + the raw `write` syscall (no libc); the
+> sim formats with `to_string`; the C backend emits an equivalent inline itoa. `harness/print_value.sh`
+> confirms the LLVM host binary and the sim both print `42` for `host_io.print(40+2)`. Host-only — there
+> is no metal `host_io` target until semihosting (P6-7).
 
 ### 6.4 Generated linker script, vector table, startup, `.data`/`.bss`
 
