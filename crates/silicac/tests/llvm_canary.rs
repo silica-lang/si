@@ -359,7 +359,10 @@ fn metal_emits_a_freestanding_reset_handler_not_main() {
         .emit(&module(vec![cell("value", SirType::U32, 7)], body));
     assert!(ll.contains("target triple = \"thumbv7em-none-eabi\""), "no metal triple:\n{}", ll);
     assert!(ll.contains("@__vectors") && ll.contains("section \".vectors\""), "no vector table:\n{}", ll);
-    assert!(ll.contains("[ptr @_estack, ptr @Reset_Handler]"), "vector table contents:\n{}", ll);
+    // The table starts with the initial SP + reset vector (no `every` here, so it
+    // is the 16-entry system table — no external IRQ slots).
+    assert!(ll.contains("@__vectors = constant [16 x ptr]"), "system-only vector table:\n{}", ll);
+    assert!(ll.contains("ptr @_estack,") && ll.contains("ptr @Reset_Handler,"), "vector table contents:\n{}", ll);
     assert!(ll.contains("define void @Reset_Handler()"), "no Reset_Handler:\n{}", ll);
     assert!(ll.contains("store i32 42, ptr @value"), "sys.start body not in reset:\n{}", ll);
     assert!(ll.contains("wfi"), "reset handler must idle:\n{}", ll);
@@ -376,4 +379,37 @@ fn host_emit_is_unchanged_by_the_metal_path() {
     let ll = LlvmBackend::new().emit(&module(vec![], body));
     assert!(ll.contains("define i32 @main()"), "host still emits main:\n{}", ll);
     assert!(!ll.contains("@Reset_Handler"), "host must not emit a reset handler:\n{}", ll);
+}
+
+// ─── P4-1: metal scheduler (every → TIMER1) ───────────────────────────────────
+
+#[test]
+fn metal_every_emits_a_timer_handler_and_full_vector_table() {
+    // A periodic reaction → TIMER1 program in Reset_Handler + a TIMER1_IRQHandler
+    // that calls the reaction fn; the vector table extends to the TIMER1 slot.
+    let mut m = module(
+        vec![cell("lit", SirType::Bool, 0)],
+        vec![SirStmt::Assign { target: SirPlace::Var("lit".into()), value: SirExpr::Bool(true) }],
+    );
+    let mut rx = reaction(vec![SirStmt::Assign {
+        target: SirPlace::Var("lit".into()),
+        value: SirExpr::Not(Box::new(SirExpr::Load("lit".into()))),
+    }]);
+    rx.id = 1;
+    rx.trigger = SirTrigger::EveryNs(500_000_000);
+    m.reactions.push(rx);
+    let ll = LlvmBackend::with_target(Target::MetalNrf52840).emit(&m);
+
+    // Reset_Handler does real startup: a .data copy loop + interrupts enabled.
+    assert!(ll.contains("define void @Reset_Handler()"), "no reset handler:\n{}", ll);
+    assert!(ll.contains("icmp ult ptr") && ll.contains("@_edata"), "no .data copy loop:\n{}", ll);
+    assert!(ll.contains("cpsie i"), "interrupts not enabled:\n{}", ll);
+    // TIMER1 wired: handler re-arms CC and calls the periodic reaction.
+    assert!(ll.contains("define void @TIMER1_IRQHandler()"), "no TIMER1 handler:\n{}", ll);
+    assert!(ll.contains("call void @__reaction_1()"), "TIMER1 must call the reaction:\n{}", ll);
+    // Full vector table reaching the TIMER1 slot (16+9 = index 25 → 26 entries).
+    assert!(ll.contains("@__vectors = constant [26 x ptr]"), "vector table not extended to TIMER1:\n{}", ll);
+    assert!(ll.contains("ptr @TIMER1_IRQHandler"), "TIMER1 not vectored:\n{}", ll);
+    assert!(ll.contains("define void @__default_handler()"), "no default handler:\n{}", ll);
+    assert_no_c_isms(&ll);
 }

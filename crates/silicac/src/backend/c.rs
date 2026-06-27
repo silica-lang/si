@@ -1923,7 +1923,7 @@ fn reaction_fn_name(id: usize) -> String {
 /// matching the `SR { done:bit[0], nak:bit[1], arblost:bit[2], timeout:bit[3] }`
 /// fields of `std/i2c_controller.si`.  `None` for a code with no decodable SR
 /// bit (it then falls through to the `match`'s `_` arm on metal).
-fn i2c_fault_bit(code: &str) -> Option<u32> {
+pub fn i2c_fault_bit(code: &str) -> Option<u32> {
     match code {
         "nak" => Some(0x2),
         "arblost" => Some(0x4),
@@ -2526,7 +2526,7 @@ pub fn timer_plan(module: &SirModule) -> Result<Option<TimerPlan>, String> {
 
 /// The abstract priority of the module's periodic (`every`) reactions, used to
 /// set the TIMER IRQ priority for the ceiling protocol (§5.5).
-fn timer_priority(module: &SirModule) -> Option<u8> {
+pub fn timer_priority(module: &SirModule) -> Option<u8> {
     module
         .reactions
         .iter()
