@@ -1265,10 +1265,17 @@ checked in §10's foreclosure audit (LLVM, FFI, multicore all remain reachable).
 > against the *generated* linker script (the same `emit_linker_script`, now also dropping `.ARM.exidx`)
 > and **boots on Renode**: `harness/llvm_metal.sh` takes `examples/boot_nrf52840.si` all the way — SIR →
 > LLVM IR → `llc` → object → ELF → Renode → reads the cell back as **42**, with the C backend not
-> involved anywhere. This is the genuine second-backend proof for the metal direction. **Remaining:**
-> the metal *scheduler* that wires `every`/`on` (TIMER/GPIOTE/NVIC) to *call* the per-reaction
-> functions, and the yields state machine — the periodic/event/bus runtime — are the next LLVM step;
-> today only `sys.start` runs on metal via LLVM.
+> involved anywhere. This is the genuine second-backend proof for the metal direction.
+>
+> **Scheduler — `every` (audit P4-1).** `@Reset_Handler` now does real startup (`.data` copy / `.bss`
+> zero, output-pin directions + input pull-ups) before `sys.start`, programs **TIMER1** (one compare
+> channel per `every`, reusing `c::timer_plan`), enables interrupts, and idles; a `@TIMER1_IRQHandler`
+> clears the COMPARE event, re-arms `CC += period`, and calls the periodic `@__reaction_N`. The full
+> Cortex-M **vector table** (system slots + external IRQ slots to `16+IRQn`) + `@__default_handler`/
+> `@HardFault_Handler` stubs are emitted. `harness/llvm_metal_sched.sh` boots an LLVM-built blink on
+> Renode and confirms the LED toggles on its TIMER period — `sim ≡ metal(LLVM)`. **Remaining:**
+> `on <pin>.falling` → GPIOTE/NVIC + BASEPRI critical sections (P4-2), and the yields state machine +
+> bus IRQ (P4-3) — the event/bus runtime.
 
 ### 6.4 Generated linker script, vector table, startup, `.data`/`.bss`
 

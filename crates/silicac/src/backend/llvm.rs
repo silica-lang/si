@@ -48,6 +48,20 @@ use crate::sir::*;
 /// LLVM target triple for the metal direction (Cortex-M4F, Thumb).
 const METAL_TRIPLE: &str = "thumbv7em-none-eabi";
 
+// nRF52840 peripheral/NVIC addresses mirrored from the C metal backend (§4.1/§4.5).
+const GPIOTE_BASE: u64 = 0x4000_6000;
+const GPIOTE_IRQN: usize = 6;
+const BUS_IRQN: usize = 8;
+const NVIC_ISER0: u64 = 0xE000_E100;
+const NVIC_IPR0: u64 = 0xE000_E400;
+
+/// Map an abstract reaction priority to a hardware BASEPRI/NVIC byte (§5.5),
+/// mirroring `CBackend::basepri_byte`: 3 NVIC priority bits (top of the byte),
+/// level starting at 1 so a ceiling is never 0.
+fn basepri_byte(prio: u8, max_priority: u8) -> u8 {
+    ((max_priority - prio) + 1) << 5
+}
+
 /// Bit width of a scalar SIR type, for `iN` selection.  Non-scalars default to
 /// 64 (they are outside the canary subset and never reach storage here).
 fn sir_bits(ty: &SirType) -> u32 {
@@ -198,19 +212,24 @@ impl LlvmBackend {
             .collect();
 
         let metal = self.target == Target::MetalNrf52840;
+        // Metal `every` → TIMER1 plan (P4-1).  A planning error degrades to "no
+        // timer" here (the C build path is the authoritative validator).
+        let timer = if metal {
+            crate::backend::c::timer_plan(module).unwrap_or(None)
+        } else {
+            None
+        };
         if metal {
-            // Metal (P3-4c): `Reset_Handler` runs `sys.start` then idles; no
-            // `@main`, no host syscalls.  A `.vectors` table + `_estack` make it
-            // boot under the generated linker script.
-            self.lower_reset_handler(&sys);
+            // Metal: `Reset_Handler` does real startup (.data/.bss/pins) + runs
+            // `sys.start` + programs TIMER1, then idles.  No `@main`/syscalls.
+            self.lower_reset_handler(module, &sys, timer.as_ref());
         } else {
             // Host: `@main` runs every `on sys.start` body, in order.
             self.lower_function("i32 @main()", true, &sys);
         }
 
-        // Every non-`sys.start` reaction lowers to its own `void` function (no
-        // scheduler yet — wiring `every`/`on` to a timer/IRQ is the remaining
-        // P3-4c work).  This proves the backend lowers bodies beyond `sys.start`.
+        // Every non-`sys.start` reaction lowers to its own `void @__reaction_N`
+        // function; on metal the TIMER1 handler (P4-1) / GPIOTE (P4-2) call them.
         for r in &module.reactions {
             if !matches!(r.trigger, SirTrigger::SysStart) {
                 let sig = format!("void @__reaction_{}()", r.id);
@@ -218,18 +237,29 @@ impl LlvmBackend {
             }
         }
 
+        if metal {
+            if let Some(plan) = &timer {
+                self.emit_timer_handler(plan);
+            }
+            self.emit_default_handlers();
+        }
+
         // Assemble the module.
         let mut out = String::new();
-        out.push_str("; Silica LLVM-IR backend (audit #35 P2-1 + P3-4a/b/c, DESIGN §6.3/§12)\n");
+        out.push_str("; Silica LLVM-IR backend (audit #35 P2-1 + P3-4 + P4, DESIGN §6.3/§12)\n");
         out.push_str("; A second, structurally independent SIR consumer — proves SIR is\n");
         out.push_str("; target-neutral and the overflow trap is not a C-ism.\n\n");
         if metal {
             out.push_str(&format!("target triple = \"{}\"\n\n", METAL_TRIPLE));
-            // The stack top + the vector table the Cortex-M core reads on reset:
-            // [0] = initial SP (= address of `_estack`, a linker symbol), [1] =
-            // the reset vector.  `KEEP(*(.vectors))` places it at flash base.
+            // Linker-provided symbols (addresses): stack top + .data/.bss bounds.
             out.push_str("@_estack = external global i8\n");
-            out.push_str("@__vectors = constant [2 x ptr] [ptr @_estack, ptr @Reset_Handler], section \".vectors\", align 4\n\n");
+            for s in ["_sidata", "_sdata", "_edata", "_sbss", "_ebss"] {
+                out.push_str(&format!("@{} = external global i8\n", s));
+            }
+            out.push('\n');
+            // The Cortex-M vector table (placed at flash base by the linker).
+            out.push_str(&self.emit_vector_table(timer.is_some(), false, false));
+            out.push('\n');
         }
         if !self.globals.is_empty() {
             out.push_str(&self.globals);
@@ -276,12 +306,76 @@ impl LlvmBackend {
         self.functions.push_str("}\n\n");
     }
 
-    /// Metal entry (P3-4c): lower the `sys.start` bodies into `@Reset_Handler`,
-    /// which runs them then **idles** in a `wfi` loop — a bare-metal reset
-    /// handler must never return (there is no caller).  The cell writes land in
-    /// RAM; the linker script + `.vectors` table make the core boot straight into
-    /// this on reset.
-    fn lower_reset_handler(&mut self, bodies: &[&[SirStmt]]) {
+    // ── Metal helpers (P3-4c/P4) ──────────────────────────────────────────────
+
+    /// `*(volatile u32 *)addr = val` via `inttoptr`.
+    fn m_store32(&mut self, addr: u64, val: &str, comment: &str) {
+        let p = self.fresh();
+        self.inst(&format!("{} = inttoptr i64 {} to ptr", p, addr));
+        self.inst(&format!("store volatile i32 {}, ptr {} ; {}", val, p, comment));
+    }
+
+    /// `*(volatile u8 *)addr = val` (for NVIC IPR priority bytes).
+    fn m_store8(&mut self, addr: u64, val: u8, comment: &str) {
+        let p = self.fresh();
+        self.inst(&format!("{} = inttoptr i64 {} to ptr", p, addr));
+        self.inst(&format!("store volatile i8 {}, ptr {} ; {}", val, p, comment));
+    }
+
+    /// A side-effecting inline-asm with a memory clobber (barriers / cps).
+    fn m_asm(&mut self, asm: &str, comment: &str) {
+        self.inst(&format!("call void asm sideeffect \"{}\", \"~{{memory}}\"() ; {}", asm, comment));
+    }
+
+    /// Emit a word loop `for (d = @dst_start; d < @dst_end; d += 4) *d = src? *src++ : 0`
+    /// — the reset handler's `.data` copy (`src = Some`) and `.bss` zero (`None`).
+    fn emit_init_loop(&mut self, dst_start: &str, dst_end: &str, src_start: Option<&str>) {
+        let tag = self.fresh_label("init");
+        let dst_addr = format!("%{}.d", tag);
+        self.allocas.push_str(&format!("  {} = alloca ptr\n", dst_addr));
+        self.inst(&format!("store ptr @{}, ptr {}", dst_start, dst_addr));
+        let src_addr = src_start.map(|s| {
+            let sa = format!("%{}.s", tag);
+            self.allocas.push_str(&format!("  {} = alloca ptr\n", sa));
+            self.inst(&format!("store ptr @{}, ptr {}", s, sa));
+            sa
+        });
+        let cond = format!("{}.cond", tag);
+        let body = format!("{}.body", tag);
+        let done = format!("{}.done", tag);
+        self.inst(&format!("br label %{}", cond));
+        self.label(&cond);
+        let dcur = self.fresh();
+        self.inst(&format!("{} = load ptr, ptr {}", dcur, dst_addr));
+        let c = self.fresh();
+        self.inst(&format!("{} = icmp ult ptr {}, @{}", c, dcur, dst_end));
+        self.inst(&format!("br i1 {}, label %{}, label %{}", c, body, done));
+        self.label(&body);
+        let word = if let Some(sa) = &src_addr {
+            let scur = self.fresh();
+            self.inst(&format!("{} = load ptr, ptr {}", scur, sa));
+            let wv = self.fresh();
+            self.inst(&format!("{} = load i32, ptr {}", wv, scur));
+            let sn = self.fresh();
+            self.inst(&format!("{} = getelementptr i32, ptr {}, i64 1", sn, scur));
+            self.inst(&format!("store ptr {}, ptr {}", sn, sa));
+            wv
+        } else {
+            "0".to_string()
+        };
+        self.inst(&format!("store i32 {}, ptr {}", word, dcur));
+        let dn = self.fresh();
+        self.inst(&format!("{} = getelementptr i32, ptr {}, i64 1", dn, dcur));
+        self.inst(&format!("store ptr {}, ptr {}", dn, dst_addr));
+        self.inst(&format!("br label %{}", cond));
+        self.label(&done);
+    }
+
+    /// Metal entry (P3-4c + P4-1): `@Reset_Handler` does real startup — `.data`
+    /// copy, `.bss` zero, output-pin directions + input pull-ups, the `sys.start`
+    /// bodies, then programs TIMER1 (`every`), enables interrupts, and idles
+    /// (`wfi`).  A bare-metal reset handler never returns.
+    fn lower_reset_handler(&mut self, module: &SirModule, bodies: &[&[SirStmt]], plan: Option<&crate::backend::c::TimerPlan>) {
         self.body.clear();
         self.allocas.clear();
         self.terminated = false;
@@ -290,6 +384,31 @@ impl LlvmBackend {
         for b in bodies {
             self.collect_locals(b);
         }
+
+        // .data (flash LMA → RAM VMA) + .bss zero.
+        self.emit_init_loop("_sdata", "_edata", Some("_sidata"));
+        self.emit_init_loop("_sbss", "_ebss", None);
+
+        // Output-pin directions (reuse the MMIO field store).
+        for pin in module.pins.iter().filter(|p| p.output) {
+            self.emit_reg_store(
+                pin.device,
+                pin.dir_reg_offset,
+                pin.dir_reg_width,
+                1u64 << pin.index,
+                pin.index,
+                SirRegAccess::Rw,
+                &SirExpr::Bool(true),
+            );
+        }
+        // Input pull-ups (nRF PIN_CNF at base + 0x700 + 4*pin = 0xC).
+        for pin in module.pins.iter().filter(|p| !p.output && p.pull_up) {
+            if let Some(&base) = self.device_bases.get(&pin.device) {
+                self.m_store32(base + 0x700 + 4 * pin.index as u64, "12", "PIN_CNF: input pull-up");
+            }
+        }
+
+        // sys.start bodies.
         for b in bodies {
             for stmt in b.iter() {
                 if self.terminated {
@@ -298,17 +417,136 @@ impl LlvmBackend {
                 self.emit_stmt(stmt);
             }
         }
-        if !self.terminated {
-            let idle = self.fresh_label("idle");
-            self.inst(&format!("br label %{}", idle));
-            self.label(&idle);
-            self.inst("call void asm sideeffect \"wfi\", \"\"()");
-            self.inst(&format!("br label %{}", idle));
+
+        // Program TIMER1 for `every` (§4.5 P1-4) + enable its NVIC line.
+        if let Some(plan) = plan {
+            let max_p = module.reactions.iter().map(|r| r.priority).max().unwrap_or(0);
+            self.m_store32(crate::backend::c::TIMER_BASE + 0x504, "0", "TIMER1 MODE = Timer");
+            self.m_store32(crate::backend::c::TIMER_BASE + 0x508, "3", "BITMODE = 32-bit");
+            self.m_store32(crate::backend::c::TIMER_BASE + 0x510, &crate::backend::c::TIMER_PRESCALER.to_string(), "PRESCALER → 1MHz");
+            self.m_store32(crate::backend::c::TIMER_BASE + 0x00C, "1", "TASKS_CLEAR");
+            let mut intenset = 0u64;
+            for (idx, (_id, ticks)) in plan.channels.iter().enumerate() {
+                self.m_store32(crate::backend::c::TIMER_BASE + 0x540 + 4 * idx as u64, &ticks.to_string(), "CC[i] = period");
+                intenset |= 1u64 << (16 + idx);
+            }
+            self.m_store32(crate::backend::c::TIMER_BASE + 0x304, &intenset.to_string(), "INTENSET COMPARE[..]");
+            let prio = crate::backend::c::timer_priority(module).map(|p| basepri_byte(p, max_p)).unwrap_or(0);
+            self.m_store8(NVIC_IPR0 + crate::backend::c::TIMER_IRQN as u64, prio, "NVIC IPR TIMER1");
+            self.m_store32(NVIC_ISER0, &(1u64 << crate::backend::c::TIMER_IRQN).to_string(), "NVIC ISER enable TIMER1");
+            self.m_store32(crate::backend::c::TIMER_BASE, "1", "TASKS_START");
         }
+
+        // Enable interrupts, then idle forever.
+        self.m_asm("cpsie i", "enable IRQs");
+        let idle = self.fresh_label("idle");
+        self.inst(&format!("br label %{}", idle));
+        self.label(&idle);
+        self.m_asm("wfi", "idle");
+        self.inst(&format!("br label %{}", idle));
+
         self.functions.push_str("define void @Reset_Handler() {\nentry:\n");
         self.functions.push_str(&self.allocas);
         self.functions.push_str(&self.body);
         self.functions.push_str("}\n\n");
+    }
+
+    /// `@TIMER1_IRQHandler` (P4-1): per `every` channel, if its COMPARE event
+    /// fired, clear it, re-arm `CC[i] += period`, and call the reaction fn —
+    /// mirrors the C `TIMER1_IRQHandler`.
+    fn emit_timer_handler(&mut self, plan: &crate::backend::c::TimerPlan) {
+        self.body.clear();
+        self.allocas.clear();
+        let base = crate::backend::c::TIMER_BASE;
+        for (idx, (id, ticks)) in plan.channels.iter().enumerate() {
+            let evt = base + 0x140 + 4 * idx as u64;
+            let cc = base + 0x540 + 4 * idx as u64;
+            let ep = self.fresh();
+            self.inst(&format!("{} = inttoptr i64 {} to ptr", ep, evt));
+            let e = self.fresh();
+            self.inst(&format!("{} = load volatile i32, ptr {}", e, ep));
+            let nz = self.fresh();
+            self.inst(&format!("{} = icmp ne i32 {}, 0", nz, e));
+            let fire = self.fresh_label("fire");
+            let skip = self.fresh_label("skip");
+            self.inst(&format!("br i1 {}, label %{}, label %{}", nz, fire, skip));
+            self.label(&fire);
+            self.inst(&format!("store volatile i32 0, ptr {} ; clear EVENTS_COMPARE[{}]", ep, idx));
+            self.m_asm("dsb 0xf", "ordering");
+            let ccp = self.fresh();
+            self.inst(&format!("{} = inttoptr i64 {} to ptr", ccp, cc));
+            let cur = self.fresh();
+            self.inst(&format!("{} = load volatile i32, ptr {}", cur, ccp));
+            let next = self.fresh();
+            self.inst(&format!("{} = add i32 {}, {}", next, cur, ticks));
+            self.inst(&format!("store volatile i32 {}, ptr {} ; CC[{}] += period", next, ccp, idx));
+            self.inst(&format!("call void @__reaction_{}()", id));
+            self.inst(&format!("br label %{}", skip));
+            self.label(&skip);
+        }
+        self.inst("ret void");
+        self.functions.push_str("define void @TIMER1_IRQHandler() {\nentry:\n");
+        self.functions.push_str(&self.allocas);
+        self.functions.push_str(&self.body);
+        self.functions.push_str("}\n\n");
+    }
+
+    /// `@__default_handler` + `@HardFault_Handler`: bare infinite-loop stubs for
+    /// the vector table.
+    fn emit_default_handlers(&mut self) {
+        for name in ["__default_handler", "HardFault_Handler"] {
+            self.functions.push_str(&format!(
+                "define void @{n}() {{\nentry:\n  br label %loop\nloop:\n  call void asm sideeffect \"wfi\", \"~{{memory}}\"()\n  br label %loop\n}}\n\n",
+                n = name
+            ));
+        }
+    }
+
+    /// The Cortex-M vector table (P4-1): system slots + external IRQ slots up to
+    /// the highest used line (index `16 + irq`).  Mirrors the C vector emission.
+    fn emit_vector_table(&self, has_timer: bool, has_gpiote: bool, has_bus: bool) -> String {
+        let mut e: Vec<String> = vec![
+            "ptr @_estack".into(),         // 0 SP
+            "ptr @Reset_Handler".into(),   // 1 reset
+            "ptr @__default_handler".into(), // 2 NMI
+            "ptr @HardFault_Handler".into(), // 3 HardFault
+        ];
+        for _ in 4..=10 {
+            e.push("ptr null".into());
+        }
+        e.push("ptr @__default_handler".into()); // 11 SVCall
+        e.push("ptr null".into()); // 12
+        e.push("ptr null".into()); // 13
+        e.push("ptr @__default_handler".into()); // 14 PendSV
+        e.push("ptr @__default_handler".into()); // 15 SysTick (no now()/SysTick in P4)
+        let max_irq = [
+            has_gpiote.then_some(GPIOTE_IRQN),
+            has_bus.then_some(BUS_IRQN),
+            has_timer.then_some(crate::backend::c::TIMER_IRQN),
+        ]
+        .into_iter()
+        .flatten()
+        .max();
+        if let Some(maxq) = max_irq {
+            for irq in 0..=maxq {
+                let sym = if irq == GPIOTE_IRQN && has_gpiote {
+                    "@GPIOTE_IRQHandler"
+                } else if irq == crate::backend::c::TIMER_IRQN && has_timer {
+                    "@TIMER1_IRQHandler"
+                } else if irq == BUS_IRQN && has_bus {
+                    "@__BUS_IRQHandler"
+                } else {
+                    "@__default_handler"
+                };
+                e.push(format!("ptr {}", sym));
+            }
+        }
+        let n = e.len();
+        format!(
+            "@__vectors = constant [{} x ptr] [\n  {}\n], section \".vectors\", align 4\n",
+            n,
+            e.join(",\n  ")
+        )
     }
 
     /// Walk a body and `alloca` any Assign-target that is not a known global.

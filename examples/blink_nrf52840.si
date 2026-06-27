@@ -1,0 +1,44 @@
+// Periodic blink on the nRF52840-DK — the `every` → hardware-TIMER path, with no
+// button and no shared cell, so it isolates the metal LLVM scheduler (audit P4-1,
+// DESIGN §6.3/§4.5).  LED1 = P0.13.
+//
+//   silicac --sim                                   examples/blink_nrf52840.si
+//   silicac --target metal-nrf52840 --emit-llvm     examples/blink_nrf52840.si -o blink
+//   ./harness/llvm_metal_sched.sh                   # sim ≡ metal(LLVM) on Renode
+//
+// The LLVM backend now emits a real Reset_Handler (.data/.bss init, pin config),
+// programs TIMER1, and a TIMER1_IRQHandler that re-arms and calls the periodic
+// reaction — so the LED actually toggles on the LLVM-built firmware.
+
+board nrf52840_dk {
+  soc nrf52840 {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+
+  gpio0 : nrf_gpio at 0x5000_0000
+  led_user : nrf_gpio.pin = gpio0.pin(13) as output
+}
+
+program blink {
+  use board nrf52840_dk as dev
+
+  let led = dev.led_user
+  cell lit : bool = false
+
+  on sys.start {
+    led.set(false)            // LED off at boot
+  }
+
+  every 500ms {
+    lit = not lit             // toggle (single-owner cell — no critical section)
+    led.set(lit)
+  }
+}
+
+sim blink_demo for blink {
+  run until 3000ms            // toggles at 500/1000/1500/2000/2500/3000ms
+}

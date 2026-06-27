@@ -393,5 +393,29 @@ smallest/highest-value → largest. (The first feature PR also introduces this s
       examples/boot_nrf52840.si + tests/llvm_canary.rs (14) + harness/llvm_metal.sh. **Renode PASS.** NOTE:
       minimal-viable — only `sys.start` runs on metal via LLVM; the metal scheduler (every/on → TIMER/GPIOTE)
       + yields state machine are the next LLVM step (the periodic/event/bus runtime).
+### Cluster P4 — metal LLVM runtime (scheduler + yields)
+Build the metal LLVM runtime on top of P3-4c's boot, replaying the C metal scheduler+yields arc in
+LLVM IR so a real reactive program runs on Renode built **only through LLVM**. Plan:
+`~/.claude/plans/as-an-embedded-firmware-functional-pebble.md`. Stacked branches (feat/p4-1 off main,
+p4-2 off p4-1, p4-3 off p4-2); PRs target `main` (not auto-merged).
+
+- [x] P4-1 Metal LLVM scheduler: reset init + `every` → TIMER1 (P3-4c follow-up) `[metal]` — PR #65.
+      `Reset_Handler` now does real startup (.data copy / .bss zero loops, output-pin directions +
+      input pull-ups) before sys.start; programs TIMER1 (MODE/BITMODE/PRESCALER/CC/INTENSET/START) +
+      NVIC, `cpsie i`, idle. New `@TIMER1_IRQHandler` clears EVENTS_COMPARE, re-arms `CC += period`,
+      calls the periodic `@__reaction_N`. Full Cortex-M vector table (system + IRQ slots to 16+IRQn) +
+      `@__default_handler`/`@HardFault_Handler` stubs. Reuses `c::{TIMER_BASE,timer_plan,timer_priority}`.
+      examples/blink_nrf52840.si + tests/llvm_canary.rs (15) + harness/llvm_metal_sched.sh. **Renode
+      PASS** — LLVM-built blink toggles the LED on its 500ms period, sim ≡ metal(LLVM).
+- [ ] P4-2 Metal LLVM `on <pin>.falling` → GPIOTE/NVIC + BASEPRI critical sections (P3-4c follow-up)
+      `[metal]` — GPIOTE config + `@GPIOTE_IRQHandler` + input pull-ups + vector slot 16+6; lower
+      `SirStmt::Critical` to BASEPRI raise/restore. Gate: BUILD=llvm harness/metal_vs_sim.sh on
+      blink_button (button pressed on Renode) — LED sequence ≡ sim.
+- [ ] P4-3 Metal LLVM yields state machine + bus IRQ (P3-4c follow-up) `[metal]` — segment state
+      machine (split at BusXfer; cross-yield temps + state as globals; `@__react_N_run` switch into
+      per-segment blocks), bus kick/resume/`@__BUS_IRQHandler`, dispositions. Gate: BUILD=llvm
+      harness/bus_parity.sh — button interleaves during the LLVM firmware's bus suspension ≡ sim.
+      Largest; PAUSE & report if Renode can't validate.
+
 ## Completed log
 _(append `item — PR #NN — date` here as items land)_
