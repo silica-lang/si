@@ -312,11 +312,11 @@ impl LlvmBackend {
         };
         // Metal `on <pin>.falling` → GPIOTE channels (P4-2).
         let events = if metal { self.events_of(module) } else { Vec::new() };
-        // Metal SysTick (P5-1): a 1 ms base tick backing `now()` uptime (and,
-        // from P5-4, `within` deadline bookkeeping + the watchdog wake cadence).
-        // Mirrors `c.rs` `needs_systick` — true for now() OR a watchdog.
+        // Metal TIMER2 system tick (P6-6, replaces SysTick): a 1 ms COMPARE that
+        // maintains the `now()` wrap high word + `within` deadline bookkeeping +
+        // await re-checks + the watchdog wake cadence.  Mirrors `c.rs` `needs_tick`.
         let uses_now = metal && crate::backend::c::module_uses_now(module);
-        // P6-5: reactions that suspend on an `await` are resumed by SysTick.
+        // P6-5: reactions that suspend on an `await` are resumed by the tick.
         let await_ids: Vec<usize> = if metal {
             let mut v: Vec<usize> = module
                 .reactions
@@ -329,17 +329,14 @@ impl LlvmBackend {
         } else {
             Vec::new()
         };
-        let needs_systick =
+        let needs_tick =
             metal && (uses_now || module.watchdog_device.is_some() || !await_ids.is_empty());
-        let systick_rvr = if needs_systick {
-            crate::backend::c::systick_reload(module).ok()
-        } else {
-            None
-        };
-        // `now()` reads this SysTick-driven uptime (ns, 1 ms resolution) on metal,
-        // mirroring the C `__uptime_ns` (host keeps `llvm.readcyclecounter`).
+        // `now()` reads the live 1 µs TIMER2 counter via CAPTURE (P6-6), extended to
+        // 64 bits by `@__now_high` (counter wraps) the tick maintains; `@__tick_last`
+        // is the previous tick sample.  Replaces the SysTick `@__uptime_ns` (1 ms).
+        // Host keeps `llvm.readcyclecounter`.
         if uses_now {
-            self.globals.push_str("@__uptime_ns = global i64 0\n");
+            self.globals.push_str("@__now_high = global i32 0\n@__tick_last = global i32 0\n");
         }
         // `within` deadlines (P5-4) — enforced on metal only when a watchdog
         // exists (the reset mechanism), and only for yielding reactions (a
@@ -364,7 +361,7 @@ impl LlvmBackend {
         if metal {
             // Metal: `Reset_Handler` does real startup (.data/.bss/pins + GPIOTE)
             // + runs `sys.start` + programs SysTick/TIMER1, then idles.  No `@main`.
-            self.lower_reset_handler(module, &sys, timer.as_ref(), &events, systick_rvr);
+            self.lower_reset_handler(module, &sys, timer.as_ref(), &events, needs_tick);
         } else {
             // Host: `@main` runs every `on sys.start` body, in order.
             self.lower_function("i32 @main()", true, &sys);
@@ -413,8 +410,8 @@ impl LlvmBackend {
             if has_bus {
                 self.emit_bus_irq_handler(&bus_reactions);
             }
-            if needs_systick {
-                self.emit_systick_handler(uses_now, &await_ids);
+            if needs_tick {
+                self.emit_tick_handler(uses_now, &await_ids);
             }
             // Safe-state runtime (P5-2): emit `@__drive_safe` whenever something
             // references it (a `Safe` disposition, an overflow trap, or a
@@ -460,7 +457,7 @@ impl LlvmBackend {
             }
             out.push('\n');
             // The Cortex-M vector table (placed at flash base by the linker).
-            out.push_str(&self.emit_vector_table(timer.is_some(), !events.is_empty(), has_bus, needs_systick));
+            out.push_str(&self.emit_vector_table(timer.is_some(), !events.is_empty(), has_bus, needs_tick));
             out.push('\n');
         }
         if !self.globals.is_empty() {
@@ -669,7 +666,7 @@ impl LlvmBackend {
         bodies: &[&[SirStmt]],
         plan: Option<&crate::backend::c::TimerPlan>,
         events: &[(usize, u64, u8, u8, Vec<usize>)],
-        systick_rvr: Option<u64>,
+        needs_tick: bool,
     ) {
         self.body.clear();
         self.allocas.clear();
@@ -727,14 +724,22 @@ impl LlvmBackend {
             }
         }
 
-        // Program SysTick (SCS architectural timer, §4.5 P5-1): a 1 ms base tick
-        // for now()/deadline bookkeeping, at the lowest urgency (touches no cells).
-        if let Some(rvr) = systick_rvr {
-            self.m_store32(0xE000_E014, &rvr.to_string(), "SYST_RVR");
-            self.m_store32(0xE000_E018, "0", "SYST_CVR");
-            self.m_asm("dsb 0xf", "ordering");
-            self.m_store32(0xE000_E010, "7", "SYST_CSR: ENABLE|TICKINT|CLKSOURCE");
-            self.m_store8(0xE000_ED23, 0xE0, "SysTick priority: lowest");
+        // Program TIMER2 as the system tick (P6-6, replaces SysTick): a 1 MHz/1 µs
+        // free-running 32-bit counter (so `now()` reads it live via CAPTURE) with a
+        // 1 ms COMPARE[0] interrupt for deadline/await/watchdog bookkeeping, at the
+        // lowest urgency (touches no cells, so it needs no ceiling priority).
+        if needs_tick {
+            let tb = crate::backend::c::TICK_TIMER_BASE;
+            let irqn = crate::backend::c::TICK_TIMER_IRQN as u64;
+            self.m_store32(tb + 0x504, "0", "TIMER2 MODE = Timer");
+            self.m_store32(tb + 0x508, "3", "BITMODE = 32-bit");
+            self.m_store32(tb + 0x510, &crate::backend::c::TIMER_PRESCALER.to_string(), "PRESCALER → 1MHz");
+            self.m_store32(tb + 0x00C, "1", "TASKS_CLEAR");
+            self.m_store32(tb + 0x540, &crate::backend::c::TICK_PERIOD_US.to_string(), "CC[0] = 1ms tick");
+            self.m_store32(tb + 0x304, "65536", "INTENSET COMPARE[0] (bit 16)");
+            self.m_store8(NVIC_IPR0 + irqn, 0xE0, "NVIC IPR TIMER2: lowest");
+            self.m_store32(NVIC_ISER0, &(1u64 << irqn).to_string(), "NVIC ISER enable TIMER2");
+            self.m_store32(tb, "1", "TASKS_START");
         }
 
         // Program TIMER1 for `every` (§4.5 P1-4) + enable its NVIC line.
@@ -1480,18 +1485,65 @@ impl LlvmBackend {
         self.functions.push_str("}\n\n");
     }
 
-    /// `@SysTick_Handler` (P5-1): the 1 ms base tick.  When `now()` is used it
-    /// advances `@__uptime_ns` by 1 ms; P5-4 extends it with `within`-deadline
-    /// countdowns.  Mirrors the C `SysTick_Handler`.
-    fn emit_systick_handler(&mut self, uses_now: bool, await_ids: &[usize]) {
+    /// `@TIMER2_IRQHandler` (P6-6, replaces `@SysTick_Handler`): a 1 ms COMPARE[0]
+    /// tick.  It re-arms the compare, maintains the `now()` wrap high word on a
+    /// 32-bit counter wrap, ticks down `within` deadlines + suspended awaits, and
+    /// (firing every 1 ms) wakes `wfi` for the watchdog feed.  Mirrors the C
+    /// `TIMER2_IRQHandler`.
+    fn emit_tick_handler(&mut self, uses_now: bool, await_ids: &[usize]) {
         self.body.clear();
         self.allocas.clear();
+        let tb = crate::backend::c::TICK_TIMER_BASE;
+        // Gate on EVENTS_COMPARE[0]; the handler body runs only when it fired.
+        let evt0 = tb + 0x140;
+        let cc0 = tb + 0x540;
+        let done = self.fresh_label("tickdone");
+        let fire = self.fresh_label("tickfire");
+        let ep = self.fresh();
+        self.inst(&format!("{} = inttoptr i64 {} to ptr", ep, evt0));
+        let e = self.fresh();
+        self.inst(&format!("{} = load volatile i32, ptr {}", e, ep));
+        let nz0 = self.fresh();
+        self.inst(&format!("{} = icmp ne i32 {}, 0", nz0, e));
+        self.inst(&format!("br i1 {}, label %{}, label %{}", nz0, fire, done));
+        self.label(&fire);
+        self.inst(&format!("store volatile i32 0, ptr {} ; clear EVENTS_COMPARE[0]", ep));
+        self.m_asm("dsb 0xf", "ordering");
+        let ccp = self.fresh();
+        self.inst(&format!("{} = inttoptr i64 {} to ptr", ccp, cc0));
+        let cur0 = self.fresh();
+        self.inst(&format!("{} = load volatile i32, ptr {}", cur0, ccp));
+        let next0 = self.fresh();
+        self.inst(&format!("{} = add i32 {}, {}", next0, cur0, crate::backend::c::TICK_PERIOD_US));
+        self.inst(&format!("store volatile i32 {}, ptr {} ; CC[0] += 1ms (re-arm)", next0, ccp));
+        // now() 64-bit extension: sample the counter via CAPTURE[2]; bump the high
+        // word on a 32-bit wrap (the 1 ms tick always catches the ~4295 s wrap).
         if uses_now {
-            let cur = self.fresh();
-            self.inst(&format!("{} = load volatile i64, ptr @__uptime_ns", cur));
-            let next = self.fresh();
-            self.inst(&format!("{} = add i64 {}, 1000000", next, cur));
-            self.inst(&format!("store volatile i64 {}, ptr @__uptime_ns ; +1ms uptime", next));
+            let cap2 = tb + 0x040 + 8;
+            let cc2 = tb + 0x540 + 8;
+            let capp = self.fresh();
+            self.inst(&format!("{} = inttoptr i64 {} to ptr", capp, cap2));
+            self.inst(&format!("store volatile i32 1, ptr {} ; TASKS_CAPTURE[2]", capp));
+            let cc2p = self.fresh();
+            self.inst(&format!("{} = inttoptr i64 {} to ptr", cc2p, cc2));
+            let c = self.fresh();
+            self.inst(&format!("{} = load volatile i32, ptr {}", c, cc2p));
+            let last = self.fresh();
+            self.inst(&format!("{} = load i32, ptr @__tick_last", last));
+            let wrapped = self.fresh();
+            self.inst(&format!("{} = icmp ult i32 {}, {}", wrapped, c, last));
+            let bump = self.fresh_label("wrapbump");
+            let afterbump = self.fresh_label("afterwrap");
+            self.inst(&format!("br i1 {}, label %{}, label %{}", wrapped, bump, afterbump));
+            self.label(&bump);
+            let h = self.fresh();
+            self.inst(&format!("{} = load i32, ptr @__now_high", h));
+            let h1 = self.fresh();
+            self.inst(&format!("{} = add i32 {}, 1", h1, h));
+            self.inst(&format!("store i32 {}, ptr @__now_high", h1));
+            self.inst(&format!("br label %{}", afterbump));
+            self.label(&afterbump);
+            self.inst(&format!("store i32 {}, ptr @__tick_last", c));
         }
         // §4.5/§5.6 (P5-4) — tick down each armed `within` deadline.  A reaction
         // back at idle (frame state 0) disarms; one still in flight when its
@@ -1559,8 +1611,10 @@ impl LlvmBackend {
             self.inst(&format!("br label %{}", acont));
             self.label(&acont);
         }
+        self.inst(&format!("br label %{}", done));
+        self.label(&done);
         self.inst("ret void");
-        self.functions.push_str("define void @SysTick_Handler() {\nentry:\n");
+        self.functions.push_str("define void @TIMER2_IRQHandler() {\nentry:\n");
         self.functions.push_str(&self.allocas);
         self.functions.push_str(&self.body);
         self.functions.push_str("}\n\n");
@@ -1653,7 +1707,7 @@ impl LlvmBackend {
 
     /// The Cortex-M vector table (P4-1): system slots + external IRQ slots up to
     /// the highest used line (index `16 + irq`).  Mirrors the C vector emission.
-    fn emit_vector_table(&self, has_timer: bool, has_gpiote: bool, has_bus: bool, needs_systick: bool) -> String {
+    fn emit_vector_table(&self, has_timer: bool, has_gpiote: bool, has_bus: bool, needs_tick: bool) -> String {
         let mut e: Vec<String> = vec![
             "ptr @_estack".into(),         // 0 SP
             "ptr @Reset_Handler".into(),   // 1 reset
@@ -1667,15 +1721,12 @@ impl LlvmBackend {
         e.push("ptr null".into()); // 12
         e.push("ptr null".into()); // 13
         e.push("ptr @__default_handler".into()); // 14 PendSV
-        e.push(if needs_systick {
-            "ptr @SysTick_Handler".into() // 15 SysTick (P5-1: now()/deadline tick)
-        } else {
-            "ptr @__default_handler".into() // 15 SysTick (unused)
-        });
+        e.push("ptr @__default_handler".into()); // 15 SysTick (retired, P6-6)
         let max_irq = [
             has_gpiote.then_some(GPIOTE_IRQN),
             has_bus.then_some(BUS_IRQN),
             has_timer.then_some(crate::backend::c::TIMER_IRQN),
+            needs_tick.then_some(crate::backend::c::TICK_TIMER_IRQN),
         ]
         .into_iter()
         .flatten()
@@ -1686,6 +1737,8 @@ impl LlvmBackend {
                     "@GPIOTE_IRQHandler"
                 } else if irq == crate::backend::c::TIMER_IRQN && has_timer {
                     "@TIMER1_IRQHandler"
+                } else if irq == crate::backend::c::TICK_TIMER_IRQN && needs_tick {
+                    "@TIMER2_IRQHandler"
                 } else if irq == BUS_IRQN && has_bus {
                     "@__BUS_IRQHandler"
                 } else {
@@ -2433,13 +2486,34 @@ impl LlvmBackend {
                     }
                 }
             }
-            // `now()` — a monotonic counter (§4.5).  Metal (P5-1) reads the
-            // SysTick-driven `@__uptime_ns` (ns, 1 ms resolution); host lowers to
-            // the LLVM cycle-counter intrinsic (i64), never a libc `clock_gettime`.
+            // `now()` — a monotonic counter (§4.5).  Metal (P6-6) reads the live
+            // 1 µs TIMER2 counter via CAPTURE[1], combined with the software wrap
+            // high word into 64-bit ns; host lowers to the LLVM cycle-counter
+            // intrinsic (i64), never a libc `clock_gettime`.
             SirExpr::Now => {
                 if self.target == Target::MetalNrf52840 {
+                    let tb = crate::backend::c::TICK_TIMER_BASE;
+                    let cap = tb + 0x040 + 4; // TASKS_CAPTURE[1]
+                    let cc = tb + 0x540 + 4; // CC[1]
+                    let capp = self.fresh();
+                    self.inst(&format!("{} = inttoptr i64 {} to ptr", capp, cap));
+                    self.inst(&format!("store volatile i32 1, ptr {} ; TASKS_CAPTURE[1]", capp));
+                    let ccp = self.fresh();
+                    self.inst(&format!("{} = inttoptr i64 {} to ptr", ccp, cc));
+                    let lo = self.fresh();
+                    self.inst(&format!("{} = load volatile i32, ptr {} ; CC[1] (live us)", lo, ccp));
+                    let lo64 = self.fresh();
+                    self.inst(&format!("{} = zext i32 {} to i64", lo64, lo));
+                    let hi = self.fresh();
+                    self.inst(&format!("{} = load i32, ptr @__now_high", hi));
+                    let hi64 = self.fresh();
+                    self.inst(&format!("{} = zext i32 {} to i64", hi64, hi));
+                    let hish = self.fresh();
+                    self.inst(&format!("{} = shl i64 {}, 32", hish, hi64));
+                    let us = self.fresh();
+                    self.inst(&format!("{} = or i64 {}, {}", us, hish, lo64));
                     let t = self.fresh();
-                    self.inst(&format!("{} = load volatile i64, ptr @__uptime_ns", t));
+                    self.inst(&format!("{} = mul i64 {}, 1000 ; us -> ns", t, us));
                     self.convert(&t, 64, want, false)
                 } else {
                     self.declare("declare i64 @llvm.readcyclecounter()");

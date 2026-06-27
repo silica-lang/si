@@ -1,14 +1,15 @@
-// SysTick-driven `now()` uptime on the nRF52840-DK — isolates the metal LLVM
-// time base (audit P5-1, DESIGN §6.3/§4.5).  No GPIO, no bus: just `now()`.
+// TIMER2-driven `now()` uptime on the nRF52840-DK — isolates the metal time base
+// (audit P5-1/P6-6, DESIGN §6.3/§4.5).  No GPIO, no bus: just `now()`.
 //
 //   silicac --sim                                   examples/uptime_nrf52840.si
 //   silicac --target metal-nrf52840 --emit-llvm     examples/uptime_nrf52840.si -o uptime
 //   ./harness/now_uptime.sh                          # metal `now()` ≈ elapsed time
 //
-// The LLVM backend now programs SysTick (1 ms base) + a SysTick_Handler that
-// advances `@__uptime_ns`, and lowers `now()` to a load of it (not the host
-// `llvm.readcyclecounter`).  Each 100ms tick stamps the absolute uptime into a
-// readable cell; on metal the cell should read ≈ the elapsed wall time (±1 ms).
+// Since P6-6 both backends program TIMER2 (1 MHz/1 µs free-running) as the system
+// tick — SysTick is retired — and lower `now()` to a live CAPTURE read of that
+// counter (µs resolution), extended to 64 bits by a software wrap high word the
+// 1 ms TIMER2 tick maintains.  Each 100ms tick stamps the absolute uptime into a
+// readable cell; on metal the cell reads ≈ the elapsed wall time (now to ~1 µs).
 
 board nrf52840_dk {
   soc nrf52840 {

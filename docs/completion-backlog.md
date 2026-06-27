@@ -513,9 +513,22 @@ Renode path can't be validated or a genuine design fork is the user's call (P6-7
       still PASS. sim ≡ metal. NOTE: 1 ms SysTick recheck cadence; resumed body runs in SysTick context
       (shared cells stay protected by BASEPRI criticals) — a PendSV priority-preserving resume is a
       follow-up. poll unchanged.
-- [ ] P6-6 TIMER-rebase `now()`/deadlines, retire SysTick (both backends) `[metal]`. now()/deadlines on
-      the 1 MHz TIMER (64-bit ns extension; preserve the watchdog wake cadence; CC budget). Public
-      change: now() 1 ms → 1 µs; update tests + re-validate all metal gates.
+- [x] P6-6 TIMER-rebase `now()`/deadlines, retire SysTick (both backends) `[metal]`. SysTick did four
+      jobs — `now()` uptime, the `within`-deadline countdown (P5-4), the await re-check (P6-5), and the
+      watchdog wake cadence — all migrated onto a dedicated **TIMER2** (1 MHz/1 µs, 32-bit, IRQ10;
+      TIMER0/IRQ8 collides with the bus, TIMER1 drives `every`). `now()` is now **1 µs** (was 1 ms): it
+      reads the live counter via a CAPTURE channel and combines it with a software wrap high word the 1 ms
+      TIMER2 COMPARE tick maintains (64-bit monotonic; the tick always catches the ~4295 s wrap). The same
+      1 ms tick does the deadline/await countdowns and serves as the watchdog wake. SysTick is fully
+      retired (no handler, no SCS RVR/CSR programming, vector slot 15 → default). **Renode capability
+      verified first** (the plan's residual risk): a bare-metal probe confirmed Renode's `NRF52840_Timer`
+      models `TASKS_CAPTURE[n]`→`CC[n]` (monotonic live counter). Both backends mirrored;
+      `systick_reload` deleted. tests/metal_codegen.rs + tests/llvm_canary.rs (SysTick→TIMER2) +
+      harness/now_uptime.sh (µs expectation, C+LLVM switch). **Renode PASS** (C and BUILD=llvm): `now()`
+      reads exactly 300000000 ns at the 300 ms tick = sim; the full metal suite (deadline_reset/
+      watchdog_reset/await_interleave/poll_await/bus_*/float/semihosting/…) re-greened on the TIMER2 base,
+      both backends. Follow-up: a sub-1 ms wrap-lag glitch in `now()` once every ~71 min is accepted (the
+      tick catches it within 1 ms).
 - [x] P6-7 Metal semihosting (`host_io` on metal, both backends) `[metal]` — PR #78. `host_io.print` on
       metal → ARM semihosting (NUL-terminated constant + BKPT 0xAB SYS_WRITE0; runtime value reuses the
       decimal itoa). Both backends (LLVM inline asm; C register-pinned bkpt). The earlier PAUSE is

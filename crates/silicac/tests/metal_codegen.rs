@@ -161,9 +161,36 @@ fn every_emits_timer_handler_and_config() {
     assert!(src.contains("= 500000UL; /* CC[0] = period"), "compare value = 500_000 ticks");
     assert!(src.contains(&format!("0x{:08x}UL = 1UL; /* TASKS_START", 0x4000_9000u64)), "TIMER1 started");
     assert!(src.contains("0xE000E100UL = 0x200UL"), "NVIC ISER0 enables IRQ9 (bit 9 = 0x200)");
-    // No SysTick: BLINK uses neither now() nor a deadline.
-    assert!(!src.contains("void SysTick_Handler(void)"), "SysTick not needed for BLINK");
+    // No tick: BLINK uses neither now() nor a deadline (and SysTick is retired).
+    assert!(!src.contains("void SysTick_Handler(void)"), "SysTick is retired (P6-6)");
+    assert!(!src.contains("void TIMER2_IRQHandler(void)"), "no system tick needed for BLINK");
     assert!(src.contains("cpsie i"), "interrupts enabled");
+}
+
+#[test]
+fn now_lowers_to_timer2_capture_and_retires_systick() {
+    // P6-6: `now()` reads the live 1 µs TIMER2 counter via CAPTURE (not a SysTick
+    // 1 ms accumulator); the 1 ms TIMER2 COMPARE tick maintains the wrap high word;
+    // SysTick is fully retired (no handler, no SCS programming, no vector slot).
+    let src = c::CBackend::with_target(Target::MetalNrf52840).emit(&compile(
+        r#"
+        board b { soc s { memory { flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K } clocks { sysclk : clock_source = 64MHz } } }
+        program p { use board b as dev   cell stamp : instant = 0   every 100ms { stamp = now() } }
+        "#,
+    ));
+    // TIMER2 system tick handler + programming (1 ms COMPARE, IRQ10 → vector 26).
+    assert!(src.contains("void TIMER2_IRQHandler(void)"), "no TIMER2 tick handler:\n{src}");
+    assert!(src.contains("/* CC[0] = 1ms tick */"), "TIMER2 1ms compare not programmed:\n{src}");
+    assert!(src.contains(&format!("0x{:08x}UL = 1UL; /* TASKS_START", 0x4000_a000u64)), "TIMER2 not started:\n{src}");
+    assert!(src.contains("26 TIMER2 (system tick)"), "TIMER2 not in the vector table (IRQ10 → idx 26):\n{src}");
+    // now() captures the live counter (TASKS_CAPTURE[1] → CC[1]) and scales µs→ns.
+    assert!(src.contains("TASKS_CAPTURE[1]") && src.contains("CC[1] (live us)"), "now() must capture the live counter:\n{src}");
+    assert!(src.contains("* UINT64_C(1000); /* us -> ns */"), "now() must scale us→ns:\n{src}");
+    // SysTick is gone: no handler, no SCS RVR/CSR programming, no live vector slot.
+    assert!(!src.contains("void SysTick_Handler(void)"), "SysTick handler must be retired:\n{src}");
+    assert!(!src.contains("/* SYST_RVR */"), "SysTick SCS programming must be gone:\n{src}");
+    assert!(!src.contains("__uptime_ns"), "the SysTick uptime accumulator must be gone:\n{src}");
+    assert!(src.contains("15 SysTick (retired, P6-6)"), "slot 15 must be the default handler:\n{src}");
 }
 
 #[test]
