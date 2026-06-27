@@ -1410,6 +1410,24 @@ checked in §10's foreclosure audit (LLVM, FFI, multicore all remain reachable).
 > `EnableSemihosting` toggle — that was the earlier dead-end) and confirms the captured stream equals
 > the simulator's stdout (`n=1/n=2/n=3`), on C **and** `BUILD=llvm` — `sim ≡ metal`.
 
+> **Multi-consumer bus arbitration (audit P6-9).** Two reactions reading two sensors on the *same* I²C
+> controller used to break silently: the second kick clobbered the single `__bus_owner` and the first
+> read was lost. The bus is now a priority-arbitrated shared resource — **implicit** (no new syntax;
+> sharing one controller auto-serializes) and **priority-ordered**. The arbitration key is already
+> `BusXfer.device`, so no SIR change. The **simulator is the oracle**: a per-controller busy flag + a
+> bounded waiter queue keyed by device — a `BusXfer` on a busy bus joins the queue (`BusBlocked`); on
+> completion the highest-priority waiter is granted the freed bus (`BusGranted`; ties → lowest id). The
+> queue is bounded by construction: §5.1 coalescing gives each reaction ≤1 in-flight activation, so a bus
+> shared by N reactions has ≤ N−1 waiters. Both metal backends mirror it, **gated on contention** (a bus
+> with ≥2 reactions): a standalone `__bus_waiting_N` flag per contender, a claim gated on *free AND no
+> higher-priority waiter* (otherwise the reaction records itself and suspends *without* clobbering the
+> owner/SA-RA-DR-CR), and a bus-IRQ grant chain that, if the owner released the bus, resumes the
+> highest-priority waiter — which re-enters its dispatcher and retries the now-free kick (the bus analogue
+> of P6-5's await re-entry). A single-consumer bus keeps the simpler single-owner path byte-for-byte.
+> `harness/bus_arbitration.sh` runs two contending reactions on Renode: both reads complete (mid 0/0 →
+> post 1/1), priority-ordered, on C **and** `BUILD=llvm` — `sim ≡ metal`; the single-bus gates are
+> undisturbed.
+
 ### 6.4 Generated linker script, vector table, startup, `.data`/`.bss`
 
 The typed hardware model already knows the memory map (flash/RAM origin+size), the IRQ table (from

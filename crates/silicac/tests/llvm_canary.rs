@@ -519,6 +519,99 @@ fn metal_yielding_reaction_emits_segment_machine_and_bus_irq() {
     assert_no_c_isms(&ll);
 }
 
+// ─── P6-9: multi-consumer bus arbitration (priority-ordered, implicit) ─────────
+
+#[test]
+fn metal_shared_bus_arbitrates_priority_ordered() {
+    // TWO reactions issuing a BusXfer on the SAME controller (device 0) contend for
+    // it.  The emitted IR must arbitrate: a standalone `@__bus_waiting_N` flag per
+    // contender, a claim gated on the bus being free AND no higher-priority waiter,
+    // and a grant chain in the IRQ handler that resumes the highest-priority waiter.
+    let busxfer = |dev: usize| SirStmt::BusXfer {
+        device: dev,
+        op: "read_reg".into(),
+        args: vec![SirExpr::U64(0x76), SirExpr::U64(0xFA)],
+        dst: "__bus".into(),
+        propagate: true,
+        fault_codes: vec!["nak".into()],
+        code_dst: None,
+    };
+    let mut m = module(vec![cell("sa", SirType::U32, 0), cell("sb", SirType::U32, 0)], vec![]);
+    // Low-priority `every` (id 1, priority 1) and high-priority `on` (id 2, prio 2).
+    let mut lo = reaction(vec![busxfer(0)]);
+    lo.id = 1;
+    lo.priority = 1;
+    lo.trigger = SirTrigger::EveryNs(1_000_000_000);
+    lo.yields = true;
+    let mut hi = reaction(vec![busxfer(0)]);
+    hi.id = 2;
+    hi.priority = 2;
+    hi.trigger = SirTrigger::EveryNs(2_000_000_000);
+    hi.yields = true;
+    m.reactions.push(lo);
+    m.reactions.push(hi);
+    let reg = |name: &str, off: u64| SirReg {
+        name: name.into(),
+        offset: off,
+        width: 32,
+        access: SirRegAccess::Rw,
+        reset: 0,
+    };
+    m.devices.push(SirDevice {
+        id: 0,
+        name: "i2c0".into(),
+        base_addr: Some(0x4000_3000),
+        kind: SirDeviceKind::Generic,
+        regs: vec![reg("CR", 0x0), reg("SR", 0x4), reg("SA", 0x8), reg("RA", 0xC), reg("DR", 0x10)],
+    });
+    let ll = LlvmBackend::with_target(Target::MetalNrf52840).emit(&m);
+
+    // A standalone waiter flag per contender (declared up front).
+    assert!(ll.contains("@__bus_waiting_1 = global i32 0"), "no waiter flag for reaction 1:\n{}", ll);
+    assert!(ll.contains("@__bus_waiting_2 = global i32 0"), "no waiter flag for reaction 2:\n{}", ll);
+    // The low-priority reaction's claim is gated on the high-priority one not
+    // waiting (priority arbitration): it loads `@__bus_waiting_2`.
+    assert!(ll.contains("load i32, ptr @__bus_waiting_2"), "low-prio claim must check the higher-prio waiter:\n{}", ll);
+    // A waiting reaction records itself (store 1) and, when granted, clears the flag
+    // (store 0) and retries its kick.
+    assert!(ll.contains("store i32 1, ptr @__bus_waiting_1") || ll.contains("store i32 1, ptr @__bus_waiting_2"), "no waiter record:\n{}", ll);
+    // The IRQ handler grants a freed bus, highest-priority first: it resumes both
+    // contenders' dispatchers from the grant chain.
+    assert!(ll.contains("call void @__react_1_run()"), "grant must reach reaction 1:\n{}", ll);
+    assert!(ll.contains("call void @__react_2_run()"), "grant must reach reaction 2:\n{}", ll);
+    assert_no_c_isms(&ll);
+}
+
+#[test]
+fn metal_single_consumer_bus_keeps_simple_owner_path() {
+    // A bus used by ONE reaction must NOT emit any arbitration scaffolding — the
+    // simpler single-owner path stays byte-for-byte (P6-9 is gated on contention).
+    let mut m = module(vec![cell("samples", SirType::U32, 0)], vec![]);
+    let mut rx = reaction(vec![SirStmt::BusXfer {
+        device: 0,
+        op: "read_reg".into(),
+        args: vec![SirExpr::U64(0x76), SirExpr::U64(0xFA)],
+        dst: "__bus".into(),
+        propagate: true,
+        fault_codes: vec!["nak".into()],
+        code_dst: None,
+    }]);
+    rx.id = 1;
+    rx.trigger = SirTrigger::EveryNs(1_000_000_000);
+    rx.yields = true;
+    m.reactions.push(rx);
+    let reg = |name: &str, off: u64| SirReg { name: name.into(), offset: off, width: 32, access: SirRegAccess::Rw, reset: 0 };
+    m.devices.push(SirDevice {
+        id: 0,
+        name: "i2c0".into(),
+        base_addr: Some(0x4000_3000),
+        kind: SirDeviceKind::Generic,
+        regs: vec![reg("CR", 0x0), reg("SR", 0x4), reg("SA", 0x8), reg("RA", 0xC), reg("DR", 0x10)],
+    });
+    let ll = LlvmBackend::with_target(Target::MetalNrf52840).emit(&m);
+    assert!(!ll.contains("__bus_waiting"), "single-consumer bus must NOT emit arbitration:\n{}", ll);
+}
+
 // ─── P5-1: metal SysTick + now() uptime ───────────────────────────────────────
 
 #[test]

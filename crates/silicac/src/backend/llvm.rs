@@ -189,6 +189,10 @@ pub struct LlvmBackend {
     /// backing-store globals (`@__ring_<n>_buf/head/tail/count`) + index math,
     /// mirroring the C backend's `ring_info`.
     ring_info: HashMap<String, (u32, u32)>,
+    /// device id → contending reactions `(reaction_id, priority)`, highest-priority
+    /// first (P6-9).  Populated only for buses shared by ≥2 reactions; drives the
+    /// priority-arbitrated claim/wait/grant.  Mirrors the C backend's field.
+    bus_contenders: HashMap<usize, Vec<(usize, u8)>>,
 }
 
 impl LlvmBackend {
@@ -220,6 +224,7 @@ impl LlvmBackend {
             retry_loop: None,
             deadline_ticks: HashMap::new(),
             ring_info: HashMap::new(),
+            bus_contenders: HashMap::new(),
         }
     }
 
@@ -370,6 +375,21 @@ impl LlvmBackend {
         // (a bus transaction) lowers to the IRQ-driven segment state machine
         // (P4-3) instead of a flat body.
         let bus_reactions: Vec<usize> = module.reactions.iter().filter(|r| r.yields).map(|r| r.id).collect();
+        // P6-9: a bus shared by ≥2 reactions is priority-arbitrated.  Record its
+        // contenders and emit a standalone `@__bus_waiting_N` flag per contending
+        // reaction (declared up front so the IRQ-grant chain can reference all of
+        // them).  Mirrors the C backend exactly.
+        if metal {
+            for d in &module.devices {
+                let c = crate::backend::c::bus_contenders(module, d.id);
+                if c.len() >= 2 {
+                    self.bus_contenders.insert(d.id, c);
+                }
+            }
+            for id in self.bus_grant_order() {
+                self.globals.push_str(&format!("@__bus_waiting_{} = global i32 0\n", id));
+            }
+        }
         for r in &module.reactions {
             if matches!(r.trigger, SirTrigger::SysStart) {
                 continue;
@@ -1019,6 +1039,19 @@ impl LlvmBackend {
         let seg0_reset = self.fresh_label("seg0reset");
         let default_l = self.fresh_label("bdefault");
         let body_labels: Vec<String> = (0..nseg).map(|i| self.fresh_label(&format!("seg{}_", i))).collect();
+        // P6-9: a contended-bus terminator needs a re-entry label a grant jumps
+        // back to (the analogue of the C `__kick_n_i` label).  Pre-generate one per
+        // segment whose terminator is a contended BusXfer.
+        let kick_labels: Vec<Option<String>> = segs
+            .iter()
+            .enumerate()
+            .map(|(i, (_, xfer))| match xfer {
+                Some(SirStmt::BusXfer { device, .. }) if self.bus_contenders.contains_key(device) => {
+                    Some(self.fresh_label(&format!("kick{}_{}_", n, i)))
+                }
+                _ => None,
+            })
+            .collect();
         let st = self.fresh();
         self.inst(&format!("{} = load i32, ptr {}", st, state_g));
         let mut arms = vec![format!("i32 0, label %{}", seg0_reset)];
@@ -1064,6 +1097,22 @@ impl LlvmBackend {
                     self.label(&bodyl);
                 }
                 if let Some(SirStmt::BusXfer { device, op, dst, propagate, code_dst, fault_codes, .. }) = segs[i - 1].1 {
+                    // P6-9: a granted waiter re-enters here — if it was waiting
+                    // (never kicked), retry the prior segment's kick now that the
+                    // bus is free, instead of decoding a result that never came.
+                    if let Some(kl) = kick_labels[i - 1].clone() {
+                        let w = self.fresh();
+                        self.inst(&format!("{} = load i32, ptr @__bus_waiting_{}", w, n));
+                        let wnz = self.fresh();
+                        self.inst(&format!("{} = icmp ne i32 {}, 0", wnz, w));
+                        let retry = self.fresh_label("regrant");
+                        let decode = self.fresh_label("decode");
+                        self.inst(&format!("br i1 {}, label %{}, label %{}", wnz, retry, decode));
+                        self.label(&retry);
+                        self.inst(&format!("store i32 0, ptr @__bus_waiting_{}", n));
+                        self.inst(&format!("br label %{}", kl));
+                        self.label(&decode);
+                    }
                     let dref = self.var_ptr(dst, true);
                     if let Some(code) = code_dst {
                         let cref = self.var_ptr(code, true);
@@ -1094,9 +1143,30 @@ impl LlvmBackend {
             // Terminate: kick the next transaction (suspend on bus), arm the await
             // (suspend until SysTick), or complete (tail).
             if let Some(SirStmt::BusXfer { device, op, args, .. }) = xfer {
-                self.emit_bus_kick(*device, op, args, n);
-                self.inst(&format!("store i32 {}, ptr @{}state", i + 1, prefix));
-                self.inst("ret void");
+                if let Some(kl) = kick_labels[i].clone() {
+                    // P6-9 contended bus: claim only if free + no higher-priority
+                    // waiter; else record as a waiter and suspend.  The kick label
+                    // is the re-entry point a grant jumps back to.
+                    self.inst(&format!("br label %{}", kl));
+                    self.label(&kl);
+                    let claim = self.emit_bus_claim_cond(*device, n);
+                    let doclaim = self.fresh_label("claim");
+                    let dowait = self.fresh_label("wait");
+                    self.inst(&format!("br i1 {}, label %{}, label %{}", claim, doclaim, dowait));
+                    self.label(&doclaim);
+                    self.emit_bus_kick(*device, op, args, n);
+                    self.inst(&format!("store i32 0, ptr @__bus_waiting_{}", n));
+                    self.inst(&format!("store i32 {}, ptr @{}state", i + 1, prefix));
+                    self.inst("ret void");
+                    self.label(&dowait);
+                    self.inst(&format!("store i32 1, ptr @__bus_waiting_{}", n));
+                    self.inst(&format!("store i32 {}, ptr @{}state", i + 1, prefix));
+                    self.inst("ret void");
+                } else {
+                    self.emit_bus_kick(*device, op, args, n);
+                    self.inst(&format!("store i32 {}, ptr @{}state", i + 1, prefix));
+                    self.inst("ret void");
+                }
             } else if let Some(SirStmt::Await { within_ns, .. }) = xfer {
                 let ticks = within_ns.div_ceil(1_000_000).max(1);
                 self.inst(&format!("store i32 1, ptr @{}await", prefix));
@@ -1143,6 +1213,46 @@ impl LlvmBackend {
 
     /// Bus kick: write SA/RA/DR, barrier, CR start, own the bus, clear-pending +
     /// enable the completion IRQ (the caller then sets state and returns).
+    /// Reaction ids that contend for any bus, highest-priority first (P6-9) — the
+    /// order the bus IRQ grants a freed bus to a waiter.  Mirrors the C backend.
+    fn bus_grant_order(&self) -> Vec<usize> {
+        let mut all: Vec<(usize, u8)> = Vec::new();
+        for v in self.bus_contenders.values() {
+            for &(id, p) in v {
+                if !all.iter().any(|(i, _)| *i == id) {
+                    all.push((id, p));
+                }
+            }
+        }
+        all.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        all.into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// Emit IR computing an i1 "reaction `n` may claim bus `device` now" (P6-9):
+    /// the bus is free AND no strictly-higher-priority contender is already waiting
+    /// (priority arbitration; ties favour the running reaction).  Returns the SSA
+    /// name of the i1 result.  Mirrors the C `bus_claim_cond`.
+    fn emit_bus_claim_cond(&mut self, device: usize, n: usize) -> String {
+        let contenders = self.bus_contenders[&device].clone();
+        let n_pri = contenders.iter().find(|(id, _)| *id == n).map(|(_, p)| *p).unwrap_or(0);
+        let owner = self.fresh();
+        self.inst(&format!("{} = load i32, ptr @__bus_owner", owner));
+        let mut cond = self.fresh();
+        self.inst(&format!("{} = icmp eq i32 {}, -1", cond, owner));
+        for (id, p) in &contenders {
+            if *id != n && *p > n_pri {
+                let w = self.fresh();
+                self.inst(&format!("{} = load i32, ptr @__bus_waiting_{}", w, id));
+                let wz = self.fresh();
+                self.inst(&format!("{} = icmp eq i32 {}, 0", wz, w));
+                let and = self.fresh();
+                self.inst(&format!("{} = and i1 {}, {}", and, cond, wz));
+                cond = and;
+            }
+        }
+        cond
+    }
+
     fn emit_bus_kick(&mut self, device: usize, op: &str, args: &[SirExpr], n: usize) {
         let Some((cr, _sr, sa, ra, dr)) = self.bus_regs(device) else {
             self.inst(&format!("; unsupported: bus device {} missing CR/SR/SA/RA/DR", device));
@@ -1334,6 +1444,36 @@ impl LlvmBackend {
             self.inst(&format!("br label %{}", done));
         }
         self.label(&done);
+        // P6-9: the owner released the bus (didn't re-claim) → grant it to the
+        // highest-priority waiter (it re-enters its dispatcher and retries the
+        // now-free kick).  One grant per completion; the rest wait their turn.
+        let grant = self.bus_grant_order();
+        if !grant.is_empty() {
+            let owner2 = self.fresh();
+            self.inst(&format!("{} = load i32, ptr @__bus_owner", owner2));
+            let free = self.fresh();
+            self.inst(&format!("{} = icmp eq i32 {}, -1", free, owner2));
+            let nogrant = self.fresh_label("nogrant");
+            let first = self.fresh_label("grant");
+            self.inst(&format!("br i1 {}, label %{}, label %{}", free, first, nogrant));
+            self.label(&first);
+            for (k, id) in grant.iter().enumerate() {
+                let w = self.fresh();
+                self.inst(&format!("{} = load i32, ptr @__bus_waiting_{}", w, id));
+                let wnz = self.fresh();
+                self.inst(&format!("{} = icmp ne i32 {}, 0", wnz, w));
+                let do_g = self.fresh_label("dogrant");
+                let next = if k + 1 < grant.len() { self.fresh_label("grnext") } else { nogrant.clone() };
+                self.inst(&format!("br i1 {}, label %{}, label %{}", wnz, do_g, next));
+                self.label(&do_g);
+                self.inst(&format!("call void @__react_{}_run()", id));
+                self.inst(&format!("br label %{}", nogrant));
+                if k + 1 < grant.len() {
+                    self.label(&next);
+                }
+            }
+            self.label(&nogrant);
+        }
         self.inst("ret void");
         self.functions.push_str("define void @__BUS_IRQHandler() {\nentry:\n");
         self.functions.push_str(&self.body);

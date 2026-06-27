@@ -1,0 +1,55 @@
+// Multi-consumer bus arbitration (§5.2, audit P6-9) on nRF52840 metal.
+//
+// TWO reactions read TWO sensors on the SAME I²C controller (`i2c0`), so they
+// contend for the one bus.  A low-priority `every` reaction owns the bus first;
+// while its transfer is in flight a higher-priority button reaction also wants
+// the bus — it can't preempt the in-flight transfer, so it WAITS, and is granted
+// the bus (priority-ordered) the instant the first transfer completes.  Both
+// reads complete: neither is lost.  Two observable cells make it checkable:
+//   - `sa` — set by the low-priority `every` (env_a)
+//   - `sb` — set by the high-priority button (env_b)
+// Under the old single-owner model the button's kick would clobber the in-flight
+// owner and the `every`'s read would be lost (`sa` stuck at 0).
+//
+//   silicac --sim examples/bus_contend_nrf52840.si
+//   RENODE=… ./harness/bus_arbitration.sh
+
+board demo {
+  soc s {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+
+  gpio0 : nrf_gpio at 0x5000_0000
+  i2c0  : i2c_controller at 0x4000_3000 { needs { clock = soc.sysclk } }
+  env_a : bme280 { needs { bus = i2c0 } }
+  env_b : bme280 { needs { bus = i2c0 } }
+  btn   : nrf_gpio.pin = gpio0.pin(11) as input pulling up
+}
+
+program app {
+  use board demo as b
+
+  let sensor_a = b.env_a
+  let sensor_b = b.env_b
+  let button   = b.btn
+  cell sa : u32 = 0      // low-priority `every` (owns the bus first)
+  cell sb : u32 = 0      // high-priority button (contends, waits, then granted)
+
+  every 1000ms {
+    let t = sensor_a.read_temp()?
+    sa = sa + 1
+  }
+  on button.falling {
+    let t = sensor_b.read_temp()?
+    sb = sb + 1
+  }
+}
+
+sim app_sim for app {
+  inject btn.falling at 1000001us   // 1µs into env_a's bus window → contention
+  run until 1100ms
+}

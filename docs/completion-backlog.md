@@ -534,8 +534,20 @@ Renode path can't be validated or a genuine design fork is the user's call (P6-7
       + harness/float_metal.sh. **Renode PASS** (C and LLVM) — acc=4.5/out=9.0 bit-exact = sim; sim ≡
       metal. NOTE: float compares, int↔float conversion, and f64 on the single-precision M4F are
       follow-ups; mixing int+float operands without a cast is unsupported.
-- [ ] P6-9 Multi-consumer bus arbitration / bounded per-bus wait queue (front-to-back). Per-bus owner +
-      queue in SIR, resolver contention, sim oracle, both backends. **PAUSE** to confirm the arbitration
-      policy.
+- [x] P6-9 Multi-consumer bus arbitration / bounded per-bus wait queue (front-to-back) `[metal]`. Two
+      reactions reading two sensors on the SAME `i2c0` used to break silently — the second kick clobbered
+      the single `@__bus_owner` and the first read was lost. Now the bus is priority-arbitrated, with an
+      **implicit** surface (no new syntax; sharing one controller auto-serializes) and **priority-ordered**
+      grant (user-chosen). The arbitration key is `BusXfer.device` (no SIR change). Sim oracle: per-bus
+      busy flag + bounded waiter queue keyed by device — a BusXfer on a busy bus joins the queue
+      (`BusBlocked`); on completion the highest-priority waiter is granted (`BusGranted`, ties → lowest
+      id). Both backends mirror it, **gated on contention** (≥2 reactions on one bus): a standalone
+      `__bus_waiting_N` flag per contender, a claim gated on free + no higher-priority waiter (else record
+      + suspend without clobbering the owner), and an IRQ-grant chain that resumes the top waiter (which
+      retries its kick). A single-consumer bus keeps the simpler single-owner path byte-for-byte.
+      examples/bus_contend_nrf52840.si + tests/sim_bus_arbitration.rs + tests/llvm_canary.rs (P6-9 shape +
+      single-consumer no-arbitration) + harness/bus_arbitration.sh. **Renode PASS** (C and BUILD=llvm) —
+      both reads complete (mid 0/0 → post 1/1) = sim; single-bus gates (bus_parity/bus_refire/
+      deadline_reset/watchdog_reset) still PASS on both backends.
 ## Completed log
 _(append `item — PR #NN — date` here as items land)_
