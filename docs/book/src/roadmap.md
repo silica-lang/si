@@ -1,11 +1,10 @@
 # Status & Roadmap
 
-Silica is deliberately a **"toy"** — an intellectual exercise — with an aspirational
-long-term ceiling: *potentially replacing an RTOS like Zephyr for personal projects.* That
-ceiling is **not a v1 deliverable**; it is a *foreclosure constraint*. Every design
-decision is checked against it, but the deferred feature list stays short on purpose.
-Foreclosure lives in only two places — the type system and the memory model — so those are
-designed conservatively and reviewed hardest.
+Silica is experimental. The long-term aim is to be usable for personal projects in place of
+an RTOS like Zephyr; that target is not a v1 deliverable but a constraint used to check
+design decisions, which is mostly why the deferred-feature list stays short. The two areas
+where a wrong decision would be hardest to reverse — the type system and the memory model —
+are designed conservatively and reviewed most carefully.
 
 The phases below describe the path. Phases 0–3 are substantially **done** — the reactive
 core, composition + faults, the agent edit surface, and a second (LLVM) backend at metal

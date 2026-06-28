@@ -6,30 +6,25 @@ composed devices on buses, and the full numeric/fault/typestate surface run in a
 deterministic simulator and on real hardware (nRF52840), through two independent backends
 (C and LLVM) held to `sim ≡ metal` parity.
 
-Silica is built around a wager: that the language an **AI agent** most wants to author,
-edit, and debug is the same language a **compiler** most wants to analyze and a **hardware
-engineer** most wants to read — and that *embedded systems* are where that alignment is
-sharpest, because embedded work is already about explicit resources, explicit time, and a
-hardware truth that does not lie.
-
-Two design goals drive everything, and they reinforce rather than compete:
+It has two design goals:
 
 - **Embedded-native.** Semantics are built from hardware concepts — *devices, registers,
   interrupts, time, resources, capabilities* — rather than from the C-and-UNIX vocabulary
-  (files, heap, stdio, errno, flat untyped memory) that most embedded toolchains smuggle
-  in. A program's mental model should be the *board*, not a stripped-down PC.
-- **Agentic-native.** The language is engineered to be an excellent target for AI
-  authoring, editing, and debugging — not by adding "AI features," but by removing the
-  things that make code hard for a machine to reason about: hidden state, ambiguous
-  grammar, and untyped text that only becomes meaningful after a build.
+  (files, heap, stdio, `errno`, flat untyped memory) most embedded toolchains inherit. The
+  mental model is the *board*, not a stripped-down PC.
+- **Agentic-native.** The language is meant to be straightforward for tools to analyze,
+  edit, and debug — compilers and AI agents alike — not by adding "AI features," but by
+  removing the things that make code hard to reason about mechanically: hidden state, an
+  ambiguous grammar, and untyped text that only becomes meaningful after a build.
 
-These two goals converge: the thesis is that they are the *same* language, and where they
-seem to pull apart, that is a signal the design is wrong, not a tradeoff to split.
+The two goals tend to point the same way: code a compiler can analyze is generally also
+easier for an agent to edit and a person to read. Embedded systems are a reasonable place
+to test that, since they are already about explicit resources, explicit time, and
+observable hardware.
 
-Silica is deliberately a "toy" — an intellectual exercise — with an aspirational
-long-term ceiling (potentially replacing an RTOS like Zephyr for personal projects) used
-as a *foreclosure constraint*, not a v1 deliverable. See the [roadmap](roadmap.md) for
-where it stands.
+Silica is experimental. The long-term aim — being usable for personal projects in place of
+an RTOS like Zephyr — is a design constraint, not a v1 deliverable. See the
+[roadmap](roadmap.md) for where it stands.
 
 ## What works today
 

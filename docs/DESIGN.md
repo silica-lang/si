@@ -24,26 +24,23 @@ publishing decision):
 
 ---
 
-## 1. Vision & the two-goals-converge thesis
+## 1. Goals & scope
 
-Silica is built around a wager: that the language an **AI agent** most wants to author, edit, and
-debug is the same language a **compiler** most wants to analyze and a **hardware engineer** most
-wants to read — and that *embedded systems* are where that alignment is sharpest, because embedded
-work is already about explicit resources, explicit time, and a hardware truth that does not lie.
-
-Two design goals drive everything, and they reinforce rather than compete:
+Silica has two design goals, which are intended to point the same way rather than trade off:
 
 - **Embedded-native.** Semantics are built from hardware concepts — *devices, registers,
   interrupts, time, resources, capabilities* — rather than from the C-and-UNIX vocabulary
-  (files, heap, stdio, errno, flat untyped memory) that most embedded toolchains smuggle in. A
-  program's mental model should be the *board*, not a stripped-down PC.
-- **Agentic-native.** The language is engineered to be an excellent target for AI authoring,
-  editing, and debugging — not by adding "AI features," but by removing the things that make code
-  hard for a machine to reason about: hidden state, ambiguous grammar, and untyped text that only
-  becomes meaningful after a build.
+  (files, heap, stdio, errno, flat untyped memory) most embedded toolchains inherit. A
+  program's mental model is the *board*, not a stripped-down PC.
+- **Agentic-native.** The language aims to be a good target for analysis, editing, and
+  debugging by tools — compilers and AI agents alike — not by adding "AI features," but by
+  removing the things that make code hard to reason about mechanically: hidden state, ambiguous
+  grammar, and untyped text that only becomes meaningful after a build.
 
-These converge on **three shared properties**. A good compiler and a good agent want the same
-things, and so does a careful human:
+The premise is that these are largely the same goal: code a compiler can analyze is also easier
+for an agent to edit and a person to read, and embedded work is a reasonable place to test it
+because it is already about explicit resources, explicit time, and observable hardware. Both
+goals favor the same **three properties**:
 
 1. **Explicitness.** Effects, time, resources, and capabilities are visible *in types*. Nothing
    that matters to correctness is implicit. If a function touches a device, takes time, can fail,
@@ -56,19 +53,18 @@ things, and so does a careful human:
    parse. Edits are structured graph operations over named entities. The same mechanism that
    replaces Devicetree overlays is the mechanism an agent uses to edit code.
 
-The thesis in one line: **no hidden *software* state, and nothing about the program's resources,
-topology, or effects is statically unknowable.** This is deliberately a claim about software, not
-physics: dynamic hardware behaviour — input levels, interrupt timing, analog values, clock
-tolerance, bus faults, metastability, the environment — is real and is modelled *explicitly* as
-events, faults, and bounded waits, never assumed away. What the language removes is *hidden*
-state (implicit globals, untyped effects, unknowable resource use), not *uncertainty about the
-world*. Wherever the embedded goal and the agentic goal seem to pull apart, that is a signal the
-design is wrong, not a tradeoff to split.
+In one line: **no hidden *software* state, and nothing about the program's resources, topology, or
+effects is statically unknowable.** This is a claim about software, not physics: dynamic hardware
+behaviour — input levels, interrupt timing, analog values, clock tolerance, bus faults,
+metastability, the environment — is real and is modelled *explicitly* as events, faults, and
+bounded waits, never assumed away. What the language removes is *hidden* state (implicit globals,
+untyped effects, unknowable resource use), not *uncertainty about the world*. Where the embedded
+goal and the agentic goal appear to pull apart, that is taken as a sign the design needs work
+rather than a tradeoff to split.
 
-**Scope.** Silica is deliberately a "toy" — an intellectual exercise — but with an aspirational
-long-term ceiling: *potentially replacing an RTOS like Zephyr for personal projects.* That ceiling
-is not a v1 deliverable; it is a **foreclosure constraint**. Every decision below is checked
-against it. Target hardware is **fully open / documented / open-source hardware**, which sidesteps
+**Scope.** Silica is experimental, not production software. The long-term aim — potentially being
+usable for personal projects in place of an RTOS like Zephyr — is not a v1 deliverable but a
+**constraint** that design decisions are checked against. Target hardware is **fully open / documented / open-source hardware**, which sidesteps
 vendor NDAs and keeps the typed peripheral library tractable.
 
 ---
@@ -1352,7 +1348,7 @@ what makes the sim usable as CI and as the agent's debug loop rather than a flak
 
 ### 7.2 Graph-aware debug info
 
-The aspirational debugging goal: debug info carries the **reactive graph + device state**, so an
+The debugging goal: debug info carries the **reactive graph + device state**, so an
 agent (or a human) debugs at the *language's* abstraction level — "reaction `pump_ctrl` is yielded
 awaiting `i2c` while `valve` is `closed`" — rather than at register/PC level. The same tables that
 power the Layer-3 fault decoder (§5.4) power this. Where useful, Silica leverages existing **MCP
@@ -1381,7 +1377,7 @@ demonstrates one pattern cleanly, because the agent will learn the language *fro
 > the `escape_audit` bin + `harness/escape_hatch_audit.sh` report them per file. Baseline: corpus
 > total **11** (9 casts, 2 wrap/sat), with the **std lib at just 1** (the bme280 compensation cast).
 > `tests/escape_hatch.rs` gates the std lib at ≤ 3 so a regression toward "escape-hatch everywhere"
-> fails CI — the concrete, deterministic proxy for the agentic-native thesis (a live agent eval, risk
+> fails CI — a concrete, deterministic proxy for the agentic-native goal (a live agent eval, risk
 > #5, remains future work).
 
 ### 7.5 Self-versioning

@@ -1,11 +1,11 @@
 # Silica
 
-> An experimental, embedded-native and agentic-native programming language (`.si`). Silica builds its semantics from hardware concepts — devices, registers, interrupts, time, capabilities — rather than C/UNIX vocabulary, on the wager that the language an AI agent most wants to author is the same one a compiler most wants to analyze and a hardware engineer most wants to read.
+> An experimental, embedded-native and agentic-native programming language (`.si`) for microcontrollers. Silica builds its semantics from hardware concepts — devices, registers, interrupts, time, capabilities — rather than C/UNIX vocabulary, and aims to be straightforward for tools (compilers and AI agents) to analyze and edit: no hidden state, a regular grammar, and typed structure instead of free text. Programs run in a deterministic simulator and on real hardware from the same source.
 
 This file is the LLM-oriented index of the Silica documentation, in the [llms.txt](https://llmstxt.org/) format. Every link points to a self-contained Markdown-rendered page. For the entire documentation as a single file, fetch [llms-full.txt](https://silica-lang.github.io/si/llms-full.txt).
 
 ## Getting Started
-- [Introduction](https://silica-lang.github.io/si/intro.html): vision, the two-goals-converge thesis, and what works today
+- [Introduction](https://silica-lang.github.io/si/intro.html): the two design goals (embedded-native, agentic-native) and what works today
 - [Installation & Build](https://silica-lang.github.io/si/getting-started/install.html): Rust toolchain, build/run/test commands, and the `silicac` CLI
 - [Your First Program](https://silica-lang.github.io/si/getting-started/first-program.html): the canonical blink + button program, explained
 
