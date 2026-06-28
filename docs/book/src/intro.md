@@ -1,7 +1,10 @@
 # Introduction
 
 Silica is an experimental, **embedded-native** and **agentic-native** programming
-language. File extension: `.si`. Status: early — a working Phase-0 compiler slice.
+language. File extension: `.si`. Status: early but substantial — the reactive core,
+composed devices on buses, and the full numeric/fault/typestate surface run in a
+deterministic simulator and on real hardware (nRF52840), through two independent backends
+(C and LLVM) held to `sim ≡ metal` parity.
 
 Silica is built around a wager: that the language an **AI agent** most wants to author,
 edit, and debug is the same language a **compiler** most wants to analyze and a **hardware
@@ -30,31 +33,40 @@ where it stands.
 
 ## What works today
 
-The compiler implements the **reactive-core vertical slice**: the canonical blink + button
-program runs **both** in a deterministic host simulator **and on real hardware**
-(nRF52840), from the *same source*.
+The compiler runs a real reactive program — blink + button, composed sensors on a bus, and
+the full numeric/fault/typestate surface — **both** in a deterministic host simulator **and
+on real hardware** (nRF52840), from the *same source*, with the metal image emitted by
+either the C or the LLVM backend.
 
-- **Language:** `program` / `board` / `soc` / `device`, typed pin bindings, `cell`, and
-  the `on <event>` / `every <duration>` reactive model.
+- **Language:** `program` / `board` / `soc` / `device`, typed pin bindings, `cell`, the
+  `on <event>` / `every <duration>` reactive model, plus `match` (incl. over an op's
+  `ok`/`fault` result), `atomic {}`, `poll`/`await … within`, typed [overlays](language/overlays.md),
+  and `when`-typestate.
 - **A real device model.** `gpio` is an ordinary std-lib `device`, not a compiler
   built-in ("no privileged built-ins"); pin ops lower to target-neutral register accesses.
+  Composed sensors talk over `i2c`/`spi` controllers, suspending the reaction during a bus
+  transaction (a real IRQ-driven yields state machine on metal).
+- **Typed numbers:** `as` casts with implicit-narrowing rejected, saturating/wrapping
+  operators with overflow-trap-by-default, `fixed<I,F>` fixed-point, runtime `float` on the
+  FPU, `instant`/`duration` with `now()`, and the bounded `ring<T,N>`.
 - **Compiler-computed concurrency.** Two reactions sharing one `cell` get a
   priority-ceiling **critical section computed automatically** — no `disable_irq` in
   source; on metal it lowers to real BASEPRI masking. Single-owner cells are *proven*
-  section-free.
+  section-free, and multiple consumers on one bus are priority-arbitrated.
 - **Static safety checks.** Binding two things to one physical pad is a **compile error**;
-  the static RAM budget is checked against the chip's memory (no dynamic allocation).
+  a *measured* worst-case stack bound and a flash budget are enforced against the chip's
+  memory (no dynamic allocation, no over-budget image).
 - **A deterministic simulator:** a virtual clock, scripted event injection, mock register
   side effects, and a structured trace — reproducible, no wall-clock dependence.
-- **On-metal codegen** (`--target metal-nrf52840`): generated linker script, vector
-  table, reset/startup, ordered MMIO with barriers, `every`→SysTick, and
-  `on <pin>.falling`→GPIOTE/NVIC — a freestanding image with no libc.
+- **On-metal codegen** (`--target metal-nrf52840`, via C or `--emit-llvm`): generated
+  linker script, vector table, reset/startup, ordered MMIO with barriers, `every`→TIMER1,
+  `now()`/deadlines→TIMER2, `on <pin>.falling`→GPIOTE/NVIC, hardware watchdog, and
+  `host_io.print`→semihosting — a freestanding image with no libc.
 - **Fault decoding:** an address-ownership map turns a faulting address into a
   language-level diagnosis (*"no device claims this address"* / *"within device
-  `gpio0`"*), in both the simulator and the metal `HardFault_Handler`.
+  `gpio0`"*), in the simulator and in both backends' metal `HardFault_Handler`.
 
-This completes the Phase-0 reactive core. [Phase 1](roadmap.md) adds composed devices over
-buses — both `i2c` and `spi` controllers, with composed sensors.
+See the [roadmap](roadmap.md) for what is done and what is deliberately deferred.
 
 ## For AI agents
 

@@ -2,8 +2,9 @@
 //!
 //! A second, structurally independent SIR consumer.  These tests are hermetic:
 //! they build SIR fixtures by hand and assert the *shape* of the emitted textual
-//! LLVM IR — no LLVM toolchain required (the toolchain-backed `llvm-as`/`opt
-//! -verify`/compile+run gate lives in `harness/llvm_canary.sh`).
+//! LLVM IR — no LLVM toolchain required (the toolchain-backed end-to-end LLVM
+//! gates live in `harness/llvm_metal.sh`, `harness/llvm_metal_sched.sh`, and the
+//! `BUILD=llvm` mode of the shared metal harnesses).
 //!
 //! The two load-bearing structural claims:
 //!   1. The overflow trap lowers to an LLVM intrinsic (`llvm.*.with.overflow.iN`

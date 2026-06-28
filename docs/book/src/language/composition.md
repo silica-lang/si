@@ -149,3 +149,12 @@ the design makes contention explicit rather than hoping handlers never overlap:
 This is still the same keystone — a controller is just a device whose op surface
 several consumers share — but the resource discipline is named, because "two
 drivers, one bus" is where naïve composition models tend to break.
+
+> **Status (implemented).** Multi-consumer bus arbitration is built on the simulator and
+> **both** metal backends, with the surface kept **implicit** — sharing one controller
+> auto-serializes, no new syntax. A transaction on a busy bus joins a bounded per-bus wait
+> queue; on completion the highest-priority waiter is granted (ties broken by lowest id) and
+> retries its kick, without clobbering the in-flight owner. A single-consumer bus keeps the
+> simpler single-owner path unchanged. See `examples/bus_contend_nrf52840.si`, validated
+> `sim ≡ metal` in Renode on both backends. (Per-device speed/mode type-checking via interface
+> properties is also enforced — see [Typed Overlays](overlays.md) and `examples/bus_speed.si`.)

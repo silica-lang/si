@@ -125,6 +125,10 @@ Deleting the `fpu` line turns the `reading` cell into a compile error.
 
 > **Status.** The FPU gate is implemented: `float`/`f32`/`f64`/`double` resolve
 > to single/double types, and a `float` cell or `let` on a board whose SoC does
-> not declare `fpu` is a compile error. Float *arithmetic* at runtime (sim ops,
-> float literals) is a follow-up — today a `float` value is carried and stored but
-> not computed on.
+> not declare `fpu` is a compile error. Runtime float **arithmetic** is also
+> implemented front-to-back: the simulator computes on the IEEE bits, and both the
+> C and the LLVM backend enable the FPU at reset and emit hardware float (no
+> soft-float libcalls) — `examples/float_nrf52840.si` is bit-exact `sim ≡ metal`
+> on both backends. Float comparisons, int↔float conversion, and `f64` on the
+> single-precision M4F remain follow-ups; mixing int and float operands without a
+> cast is unsupported.

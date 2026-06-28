@@ -181,8 +181,8 @@ pub struct LlvmBackend {
     /// While lowering a `Retry`-disposition reaction (P5-3): the back-edge label
     /// to re-run the body on a retry.  `None` otherwise.
     retry_loop: Option<String>,
-    /// reaction id → `within` deadline in SysTick (1 ms) ticks (P5-4).  Populated
-    /// only when a watchdog exists (the reset mechanism); the SysTick handler
+    /// reaction id → `within` deadline in 1 ms TIMER2 ticks (P5-4).  Populated
+    /// only when a watchdog exists (the reset mechanism); the TIMER2 tick handler
     /// counts these down and the idle-loop feed is gated on none having elapsed.
     deadline_ticks: HashMap<usize, u32>,
     /// ring name → (element bits, capacity) (P6-1).  A `ring<T,N>` cell lowers to
@@ -360,7 +360,7 @@ impl LlvmBackend {
         }
         if metal {
             // Metal: `Reset_Handler` does real startup (.data/.bss/pins + GPIOTE)
-            // + runs `sys.start` + programs SysTick/TIMER1, then idles.  No `@main`.
+            // + runs `sys.start` + programs TIMER2/TIMER1, then idles.  No `@main`.
             self.lower_reset_handler(module, &sys, timer.as_ref(), &events, needs_tick);
         } else {
             // Host: `@main` runs every `on sys.start` body, in order.
@@ -1005,7 +1005,7 @@ impl LlvmBackend {
         let prefix = format!("__rf_{}_", n);
 
         // Segment the body at each top-level suspend point — a BusXfer (resumed by
-        // the bus IRQ) or an `await` (resumed by SysTick, P6-5).
+        // the bus IRQ) or an `await` (resumed by the TIMER2 tick, P6-5).
         let mut segs: Vec<(Vec<&SirStmt>, Option<&SirStmt>)> = Vec::new();
         let mut cur: Vec<&SirStmt> = Vec::new();
         for stmt in &reaction.body {
@@ -1021,7 +1021,7 @@ impl LlvmBackend {
 
         // Frame globals: dispatcher state + retry/fault + every cross-yield temp.
         // `@__rf_N_await`/`_await_deadline` (P6-5): an await-suspended frame is
-        // resumed by SysTick (not the bus IRQ) and counts its `within` down.
+        // resumed by the TIMER2 tick (not the bus IRQ) and counts its `within` down.
         let temps = self.collect_frame_temps(reaction);
         self.globals.push_str(&format!("@{p}state = global i32 0\n@{p}retry = global i32 0\n@{p}faulted = global i32 0\n", p = prefix));
         if has_await {
@@ -1146,7 +1146,7 @@ impl LlvmBackend {
                 self.emit_stmt(stmt);
             }
             // Terminate: kick the next transaction (suspend on bus), arm the await
-            // (suspend until SysTick), or complete (tail).
+            // (suspend until the TIMER2 tick), or complete (tail).
             if let Some(SirStmt::BusXfer { device, op, args, .. }) = xfer {
                 if let Some(kl) = kick_labels[i].clone() {
                     // P6-9 contended bus: claim only if free + no higher-priority
@@ -1205,7 +1205,7 @@ impl LlvmBackend {
         self.inst("ret void");
         self.label(&fire);
         // Arm this activation's `within` deadline (P5-4): if it is still in flight
-        // when the SysTick countdown elapses, it overran (§4.5/§5.6).
+        // when the TIMER2 countdown elapses, it overran (§4.5/§5.6).
         if let Some(&ticks) = self.deadline_ticks.get(&n) {
             self.inst(&format!("store i32 {}, ptr @__deadline_{} ; arm `within` deadline", ticks, n));
         }

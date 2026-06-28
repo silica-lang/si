@@ -41,8 +41,10 @@ same way: coalesce/drop return; `fault` calls the safe-state path and halts.
 
 > **Status (partly deferred).** Today the pending slot is exactly one (the common case); a
 > capacity greater than 1 and a per-event-*source* declaration (rather than per-reaction) are
-> follow-ups. Multi-consumer bus arbitration and a bounded per-bus wait queue beyond the
-> single-yield [suspension](suspension.md) model are not yet built.
+> follow-ups. Multi-consumer bus arbitration — a bounded per-bus wait queue when two or more
+> reactions share one controller — **is** implemented (priority-ordered, with an implicit
+> surface: sharing a bus auto-serializes, no new syntax), on the simulator and both metal
+> backends; see [Composed Devices on a Bus](../language/composition.md).
 
 ### Single live activation per reaction
 

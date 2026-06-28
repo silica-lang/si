@@ -2,8 +2,12 @@
 
 > An experimental, embedded-native and agentic-native programming language.
 > **Name:** Silica (after the silicon substrate). **File extension:** `.si`.
-> Status: design draft, spec-level. This document describes intent and structure; it is not an
-> implementation. It is meant to be versioned alongside the eventual repository and evolve with it.
+> Status: this document describes the intent and structure of a **working implementation**. The
+> `silicac` compiler in this repository realizes the reactive core, composed devices on buses, and
+> the full numeric/fault/typestate surface, running in a deterministic simulator and on real
+> hardware (nRF52840) through **two independent backends** (C and LLVM) held to `sim ≡ metal` parity
+> in Renode. Inline `> Status:` notes throughout record what is built versus what is deliberately
+> deferred (§10/§11); the document is versioned alongside the code and evolves with it.
 
 ---
 
@@ -712,11 +716,14 @@ silent soft-float fallback. In the toy we *refuse* rather than emit slow soft-fl
 > **Status (implemented — FPU gate).** A SoC declares the capability with an `fpu` line in its `soc`
 > block (`SocDef.fpu`). `float`/`f32`/`f64`/`double` resolve to `SirType::F32`/`F64`, and a `float`
 > cell or `let` on a board whose SoC does *not* declare `fpu` is a compile error (no silent
-> soft-float). On an FPU board it is allowed and lowers to a C `float`/`double`. **Remaining:** the
-> broader capability system — unforgeable typed device grants and the "a handler touches only granted
-> devices" check — is not yet built (the FPU capability is the first, concrete instance); float
-> *arithmetic* at runtime (sim ops, float literals) is a follow-up, so today a `float` value is
-> carried/stored but not computed on.
+> soft-float). Runtime float **arithmetic** is implemented front-to-back (audit P6-8): SIR
+> `FloatLit`/`FloatArith`, type-directed `+ - * /` in the resolver, the sim computing on the IEEE
+> bits, and **both** backends enabling the FPU at reset and emitting hardware float (no soft-float
+> libcalls) — bit-exact `sim ≡ metal` on the M4F. **Remaining:** the broader capability system —
+> unforgeable typed device grants and the "a handler touches only granted devices" check — is not yet
+> built (the FPU capability is the first, concrete instance); float comparisons, int↔float
+> conversion, and `f64` on the single-precision M4F are follow-ups, and mixing int and float operands
+> without a cast is unsupported.
 
 > **Status (implemented — `fixed<I,F>` type + casts + add/sub, audit #35 P0-3a).** `fixed<I,F>` is a
 > first-class `SirType::Fixed { int_bits, frac_bits, signed }` stored in a 2's-complement integer of
@@ -861,7 +868,7 @@ monotonic clock; arithmetic is defined so only sensible combinations type-check.
 
 > **Status (implemented).** `instant`/`duration` are distinct `SirType`s (both `uint64_t` ns at
 > runtime) and `now()` reads the clock — the sim's virtual time, a host `clock_gettime` monotonic
-> read, or a SysTick-driven uptime counter on metal. The resolver's `time_kind` pass enforces the
+> read, or a TIMER2-driven uptime counter on metal. The resolver's `time_kind` pass enforces the
 > rules above: `instant - instant → duration`, `instant ± duration → instant`, and rejects
 > `instant + instant`, `now() + <bare int>`, scaling an instant, comparing an instant to a
 > non-instant, and assigning an instant to a non-instant cell. A duration literal (`500ms`) is kept
@@ -897,7 +904,7 @@ is **fixed-rate** (the next deadline is computed from the *scheduled* time, not 
 completion), so handler execution time does not accumulate as drift. If a periodic handler **overruns**
 its own period, the default is **coalesce** (the missed tick is dropped, not queued — a backlog of
 stale ticks is worse than skipping), and the overrun is observable via the trace ring (§7.1, D13);
-`every ... on fault` and a future `within` deadline (§9.2) let a program choose otherwise. Clock
+`every ... on fault` and the `within` deadline (§9.2) let a program choose otherwise. Clock
 *drift* (crystal tolerance, temperature) is a physical fact the type system does not pretend to
 remove (§1, D12); it surfaces as the bound on `instant` accuracy, not as a guarantee.
 
@@ -945,9 +952,10 @@ following, all statically sized to keep RAM a compile-time constant (§5.3):
   > behaviour) collapses the re-fire; drop-newest discards it (distinct trace); `fault` drives the
   > device to its safe state and stops — a system-integrity fault. On metal the yielding-reaction
   > trigger entry branches the same way (coalesce/drop → return; `fault` → `__drive_safe()` + halt).
-  > **Remaining:** a pending capacity > 1 (today the slot is exactly one, the common case) and a
-  > per-event-*source* declaration (vs per-reaction) are follow-ups; multi-consumer bus arbitration /
-  > a bounded per-bus wait queue beyond the §5.2 single-yield model is not yet built.
+  > Multi-consumer bus arbitration — a bounded per-bus wait queue when ≥2 reactions share one
+  > controller — **is** implemented (audit P6-9, priority-ordered, implicit; the simulator oracle and
+  > both metal backends, §3.5). **Remaining:** a pending capacity > 1 (today the slot is exactly one,
+  > the common case) and a per-event-*source* declaration (vs per-reaction) are follow-ups.
 - **Single live activation per reaction.** A reaction has at most one in-flight activation. If its
   event re-fires while it is running *or yielded*, the re-fire follows the overflow policy above
   (default: coalesce). Reactions are **not** re-entrant; there is no stack of suspended activations
@@ -1155,14 +1163,14 @@ system watchdog; windowed/multi-stage watchdogs are deferred-not-foreclosed (§1
 
 > **Status (implemented — `within` on metal).** Beyond the watchdog catching a handler that *never*
 > returns to idle, a per-reaction `within <d>` deadline is now enforced on metal for yielding
-> reactions when a watchdog is declared: the backend emits a `__deadline_N` countdown (in 1ms SysTick
-> ticks) armed at the trigger entry, decremented by SysTick, and disarmed when the frame returns to
-> idle; an overrun latches `__deadline_missed`, which gates off the idle-loop watchdog feed → reset.
-> This catches a handler that is merely *too slow* (would eventually complete), a tighter bound than
-> "never idle". Proven on nRF52840 in Renode (`harness/deadline_reset.sh`: a `within 30ms` read over
-> a ~50ms bus latches the flag; `within 80ms` does not). **Remaining:** it requires a declared
-> watchdog (the reset path); non-yielding reactions are bounded by ISR run-to-completion (no
-> mid-handler check); resolution is the 1ms SysTick base tick.
+> reactions when a watchdog is declared: the backend emits a `__deadline_N` countdown (in the TIMER2
+> 1 ms tick) armed at the trigger entry, decremented on each tick, and disarmed when the frame returns
+> to idle; an overrun latches `__deadline_missed`, which gates off the idle-loop watchdog feed →
+> reset. This catches a handler that is merely *too slow* (would eventually complete), a tighter bound
+> than "never idle". Proven on nRF52840 in Renode on both backends (`harness/deadline_reset.sh`: a
+> `within 30ms` read over a ~50ms bus latches the flag; `within 80ms` does not). **Remaining:** it
+> requires a declared watchdog (the reset path); non-yielding reactions are bounded by ISR
+> run-to-completion (no mid-handler check); resolution is the 1 ms TIMER2 tick.
 
 ---
 
@@ -1227,7 +1235,7 @@ or the language's guarantees (checked overflow, fixed widths, ordered MMIO) leak
 Each of these is also exactly what the LLVM backend (§6.3) does natively, which is why holding the C
 backend to them keeps SIR honest instead of letting C-isms calcify.
 
-### 6.3 LLVM path (then)
+### 6.3 LLVM backend
 
 The LLVM backend is what makes "replace Zephyr" structurally real: full control of startup, no libc,
 custom section placement, and direct lowering of SIR's typed memory ops to LLVM IR. Because SIR is
@@ -1235,214 +1243,50 @@ already target-neutral and below source sugar, the LLVM backend is a second *con
 IR, validating §6.2's guard. Nothing in the language design above assumes C semantics; this is
 checked in §10's foreclosure audit (LLVM, FFI, multicore all remain reachable).
 
-> **Status (audit #35 P2-1 — the canary is live).** A thin second SIR consumer now exists:
-> `backend/llvm.rs` (`LlvmBackend`) lowers a SIR subset to **textual LLVM IR**, reachable via
-> `silicac --emit-llvm`. It is structurally independent of the C path, so it is the standing proof
-> that SIR is target-neutral and that the §6.2 guard is real rather than cosmetic. Two C-isms are
-> proven *absent* by construction: the overflow trap (§4.3/SIL-004) lowers to
-> `llvm.{u,s}{add,sub,mul}.with.overflow.iN` + `llvm.trap` — **not** `__builtin_*_overflow` — and the
-> emitted module references **no libc / C-runtime symbol** (host-io lowers to a raw `svc` syscall, not
-> `write`/`printf`). Gate: `harness/llvm_canary.sh` runs `llvm-as` + `opt -verify` on the IR, compiles
-> and runs the arithmetic canary (`examples/llvm_canary.si`, exit code 42 = 20 + 22), and greps the IR
-> for any libc/`__builtin` leak; `tests/llvm_canary.rs` asserts the IR shape hermetically (no toolchain
-> needed).
+> **Status (implemented — full metal parity with the C backend).** `backend/llvm.rs`
+> (`LlvmBackend`) lowers SIR to **textual LLVM IR**, reachable via `silicac --emit-llvm` (orthogonal
+> to `--target`). It is structurally independent of the C path — it shares no code with the C
+> printer — so it is the standing proof that SIR is target-neutral and that the §6.2 guard is real
+> rather than cosmetic. Two C-isms are absent by construction: the overflow trap (§4.3/SIL-004)
+> lowers to `llvm.{u,s}{add,sub,mul}.with.overflow.iN` + a safe-state trap — **not**
+> `__builtin_*_overflow` — and the emitted module references **no libc / C-runtime symbol**. On the
+> host, `tests/llvm_canary.rs` asserts the IR shape hermetically (no toolchain needed).
 >
-> **Extended (audit P3-4a).** `@main` runs the `sys.start` bodies and **every other reaction lowers to
-> its own `void @__reaction_N` function**; statements add `If` control flow (so `match` lowers); the
-> expression set adds `Now` (→ `llvm.readcyclecounter`, never a libc clock) and signed `saturate`
-> (clamp via `ashr`). `examples/llvm_features.si` exercises `match`→`if`, `now()`, and a non-`sys.start`
-> reaction; `harness/llvm_canary.sh` `opt -verify`s it.
+> On `--target metal-nrf52840` the backend emits a **freestanding** module — `thumbv7em-none-eabi`,
+> a generated `.vectors` table, a real `Reset_Handler` (`.data` copy / `.bss` zero, pin directions +
+> pull-ups, peripheral config, `sys.start`), and the full reactive runtime — at **parity with the C
+> backend**:
 >
-> **MMIO (audit P3-4b).** A `SirPlace::Reg` store / `RegLoad` lowers to a `volatile` load/store at the
-> absolute address (`base + offset`) via `inttoptr` — a rw field is a read-modify-write, a wo/w1c field
-> a direct store, a read masks + shifts the field. The same target-neutral register node the sim
-> services as a mock array and the C backend emits as a `volatile` pointer. `examples/llvm_mmio.si`;
-> `harness/llvm_canary.sh` `opt -verify`s it and `llc`s it to an object.
+> - **Scheduler & events:** `every` → a **TIMER1** compare channel per reaction (`@TIMER1_IRQHandler`
+>   re-arms `CC += period`); `on <pin>.falling` → GPIOTE/NVIC (`@GPIOTE_IRQHandler`);
+>   `SirStmt::Critical` → **BASEPRI** raise/restore.
+> - **Yields & buses:** a yielding (bus) reaction → an IRQ-driven segment state machine with
+>   cross-yield temps + `__state`/`__retry`/`__faulted` as module globals; `@__BUS_IRQHandler`
+>   resumes the owner; **multi-consumer arbitration** (a bounded per-bus waiter queue, priority-
+>   ordered, gated on contention) mirrors the simulator oracle.
+> - **Time, deadlines, watchdog:** `now()` reads a **TIMER2** uptime counter at 1 µs (CAPTURE channel
+>   + a software wrap high word; SysTick is retired). The same TIMER2 1 ms tick runs the
+>   `within`-deadline and `await` re-check countdowns and serves as the watchdog wake; the idle loop
+>   feeds the hardware watchdog only on a clean return to idle.
+> - **Faults & safe state:** `@__drive_safe` runs each device's safe sequence; the overflow trap, the
+>   `Safe` disposition, and the typestate guard all route through it. `@HardFault_Handler` emits the
+>   full Layer-3 region decoder (parity with C) against the shared ownership table.
+> - **Numbers & data:** `ring<T,N>` (backing-store globals), `fixed<I,F>` mul/div (64-bit
+>   intermediate, rescale, div0/overflow trap), and runtime `float` on the **FPU** (CPACR enabled at
+>   reset; IEEE bits in `iN` bitcast around `fadd`/`fmul`, built `llc -mcpu=cortex-m4
+>   -float-abi=hard`) — no soft-float libcalls.
+> - **`poll`/`await`:** the non-yielding path carries a Layer-2 fault flow (`poll` a bounded
+>   busy-wait, `await` a true frame suspend reusing the bus state machine).
+> - **`host_io.print`:** on the host a libc-free inline itoa + raw `write` syscall; on metal, ARM
+>   semihosting (`BKPT 0xAB` / SYS_WRITE0).
 >
-> **Metal boot (audit P3-4c).** `LlvmBackend::with_target(MetalNrf52840)` emits a **freestanding**
-> module — `target triple = thumbv7em-none-eabi`, a `.vectors` table `[_estack, Reset_Handler]`, and a
-> `Reset_Handler` that runs `sys.start` then idles (`wfi`); no `@main`, no host syscall. It links
-> against the *generated* linker script (the same `emit_linker_script`, now also dropping `.ARM.exidx`)
-> and **boots on Renode**: `harness/llvm_metal.sh` takes `examples/boot_nrf52840.si` all the way — SIR →
-> LLVM IR → `llc` → object → ELF → Renode → reads the cell back as **42**, with the C backend not
-> involved anywhere. This is the genuine second-backend proof for the metal direction.
->
-> **Scheduler — `every` (audit P4-1).** `@Reset_Handler` now does real startup (`.data` copy / `.bss`
-> zero, output-pin directions + input pull-ups) before `sys.start`, programs **TIMER1** (one compare
-> channel per `every`, reusing `c::timer_plan`), enables interrupts, and idles; a `@TIMER1_IRQHandler`
-> clears the COMPARE event, re-arms `CC += period`, and calls the periodic `@__reaction_N`. The full
-> Cortex-M **vector table** (system slots + external IRQ slots to `16+IRQn`) + `@__default_handler`/
-> `@HardFault_Handler` stubs are emitted. `harness/llvm_metal_sched.sh` boots an LLVM-built blink on
-> Renode and confirms the LED toggles on its TIMER period — `sim ≡ metal(LLVM)`.
->
-> **Events + criticals — `on <pin>.falling` (audit P4-2).** The reset configures GPIOTE channels (from
-> `module.events`) + input pull-ups + NVIC; a `@GPIOTE_IRQHandler` clears `EVENTS_IN[ch]` and calls the
-> bound `@__reaction_N`s; the GPIOTE slot (`16+6`) joins the vector table. `SirStmt::Critical` lowers to
-> a **BASEPRI** raise/restore (`msr/mrs basepri` + ISB/DMB, ceiling via `basepri_byte`) so a shared cell
-> stays consistent. `BUILD=llvm harness/metal_vs_sim.sh` boots an LLVM-built blink+button on Renode and
-> matches the sim LED sequence (including button-triggered toggles) — `sim ≡ metal(LLVM)`.
->
-> **Yields — the bus runtime (audit P4-3).** A yielding reaction (a bus transaction) lowers to an
-> IRQ-driven **segment state machine**, mirroring the C path: the body splits at each `BusXfer`;
-> cross-yield temps + `__state`/`__retry`/`__faulted` become **module globals** (so they survive an IRQ
-> return); `@__react_N_run` is a `switch i32 @__rf_N_state` into per-segment blocks (case 0 resets retry/
-> fault then enters seg-0; case s resumes seg s; default returns). A segment resume-decodes the prior
-> transaction's SR (→ frame temp, or `__faulted` → the Layer-2 disposition, with `Retry` a back-edge to
-> seg-0), then kicks the next (CR/SA/RA/DR volatile stores + `@__bus_owner` + NVIC clear-pending/enable)
-> and suspends, or completes. `@__BUS_IRQHandler` resumes the single owner. The trigger entry coalesces
-> a re-fire while in flight. `BUILD=llvm harness/bus_parity.sh` boots the LLVM firmware on Renode and
-> shows the button reaction running **during** the bus suspension (mid: hits=1, samples=0; end: both 1)
-> — `sim ≡ metal(LLVM)`. **The metal LLVM runtime is now complete** for the every/event/bus core; a real
-> reactive program runs end-to-end through the LLVM backend with no C. (Watchdog/`within`, `poll`/
-> `await`, `now()`/SysTick, and safe-sequence `drive_safe` remain `; unsupported` follow-ups.)
->
-> **`now()` / SysTick (audit P5-1).** The metal LLVM `now()` no longer borrows the host
-> `llvm.readcyclecounter`: the reset programs **SysTick** (SCS `SYST_RVR`/`CVR`/`CSR`, 1 ms base from
-> `c::systick_reload`) when `needs_systick` (now() ∥ a watchdog, mirroring `c.rs`), a
-> `@SysTick_Handler` advances `@__uptime_ns` by 1 ms, vector slot 15 points at it, and `SirExpr::Now`
-> lowers to a `load i64 @__uptime_ns` (the host path keeps the cycle counter). `harness/now_uptime.sh`
-> boots the LLVM firmware on Renode and confirms the `now()`-stamped cell reads ≈ the elapsed wall time
-> (300 ms ± 1 tick) — `sim ≡ metal(LLVM)`. This is the time base the `within`-deadline bookkeeping (P5-4)
-> builds on.
->
-> **Safe state — `drive_safe` / overflow trap (audit P5-2).** The safe-state primitive is now real:
-> `@__drive_safe` runs each device's safe sequence (the `SafeSeq` register writes, via a single ordered
-> `RegWrite` store — also newly lowered), and a shared `drive-safe-then-hold` sequence (`cpsid i` → call
-> → `wfi` loop) backs all three entry points — `SirStmt::DriveSafe` (typestate guard, §4.1/D07), the
-> `Safe` disposition (§5.6), and the **overflow trap**: on metal a trapping `+` now calls
-> `@__silica_overflow_trap` (→ `@__drive_safe`) instead of bare `llvm.trap`, so §4.3's "overflow drives
-> the system to its safe state and holds" is honoured rather than reduced to a HardFault hang. The host
-> path is unchanged (`now()` = cycle counter, trap = `llvm.trap`). `BUILD=llvm harness/overflow_trap.sh`
-> boots the LLVM firmware on Renode: the default `+` halts at the overflow (ticks froze at 4) while `+%`
-> wraps and runs every tick (10) — `sim ≡ metal(LLVM)`.
->
-> **`poll` / `await` (audit P5-3).** The non-yielding reaction path gains a fault flow it never had on
-> the LLVM side: a reaction that can fault via a `poll`/`await` timeout gets a `%__faulted` flag and the
-> Layer-2 disposition routing (a `Retry` disposition wraps the body in a bounded re-run loop), mirroring
-> the C `emit_reaction_fn`. `poll` lowers to a bounded busy-wait (spin until the condition or the bound
-> elapses → `__faulted` → disposition); `await` to a bounded re-check with `wfi` between checks so ISRs
-> run (a full D2-style frame suspend across the await is a follow-up, as on the C path). `harness/
-> poll_await.sh` — the **first** Renode gate for these (the C path only ever validated them in sim + a
-> codegen test) — boots both, built only through LLVM: each passes when the condition is satisfied
-> (`done` advances) and faults into `skip` on timeout (`done` stays 0). `sim ≡ metal(LLVM)`.
->
-> **`within`-deadline + watchdog (audit P5-4 — the metal LLVM runtime is complete).** The last runtime
-> piece, building on P5-1's SysTick. A yielding reaction's `within` deadline (enforced only when a
-> watchdog exists — the reset mechanism) arms a per-reaction countdown (`@__deadline_N`, in 1 ms ticks)
-> on the trigger entry; the SysTick handler ticks each one down, disarming a reaction back at idle and
-> latching `@__deadline_missed` if one is still in flight when its countdown elapses. The reset
-> configures + starts the watchdog over its declared CR/RLR/KR (reload = timeout ms, `0xAAAA` feed), and
-> the idle loop feeds it **only on a clean return to idle** — no yielding reaction mid-transaction *and*
-> no deadline missed — so a hung or merely-too-slow handler stops the feed and the watchdog resets.
-> Mirrors the C startup/SysTick/idle emission. `BUILD=llvm harness/deadline_reset.sh` (a tight
-> `within 30ms` overruns a 50 ms bus → `__deadline_missed`=1; `within 80ms` completes → 0) and
-> `BUILD=llvm harness/watchdog_reset.sh` (a wedged bus → the mock WDT fires; a healthy one → fed) both
-> pass on Renode. **Every remaining runtime feature now runs on metal built only through the LLVM
-> backend, matching the simulator** — the metal LLVM runtime is complete.
->
-> **Rings (audit P6-1).** Closing the LLVM language-parity gaps (Cluster P6) beyond the runtime. A
-> `ring<T,N>` cell now lowers (was `; unsupported`) to backing-store globals — `@__ring_<n>_buf` =
-> `[N x iW]` + `@__ring_<n>_head/_tail/_count` — with push/pop/len as index arithmetic (overwrite-oldest
-> on full, 0 on empty), mirroring the C `__ring_<n>_*` lowering. `harness/ring_metal.sh` boots an
-> LLVM-built producer that fills a cap-4 ring past capacity then drains it: the observable cells
-> (`len`=4, `sum`=7) match the simulator — `sim ≡ metal(LLVM)`.
->
-> **Fixed-point (audit P6-2).** `FixedArith`/`FixedCast` now lower (were `; unsupported`): mul/div
-> compute in a 64-bit sign-aware intermediate and rescale by `frac` (mul `>>`, div `<<`-then-divide with
-> a divide-by-zero trap), then apply the overflow mode at `width` (trap range-check → the P5-2
-> `@__silica_overflow_trap`, wrap = trunc, saturate = clamp); the cast shifts the binary point and
-> narrows. Mirrors the C `fixmul`/`fixdiv` helpers. `harness/fixed_metal.sh` boots an LLVM-built Q16.16
-> program (`opt -O2` folds the scale constants so a divide-by-constant lowers to shifts, as the C `-Os`
-> does; a runtime divisor would pull libgcc's `__divdi3` either way) and confirms `3·n`/`n÷4` match the
-> simulator — `sim ≡ metal(LLVM)`.
->
-> **Layer-3 fault decoder (audit P6-3).** The LLVM `@HardFault_Handler` was a bare `wfi` stub; it now
-> emits the full Layer-3 decoder (parity with C): an `@__owner_start`/`@__owner_end` address-ownership
-> table from `layer3::ownership_map` (no on-device strings — the host renders labels from indices), and a
-> handler that reads SCB CFSR/BFAR, finds the owning region on a valid BFAR, and records `{addr, owner,
-> cfsr, pending}` to fixed RAM. The address→owner decode is validated by the sim oracle + the hermetic
-> canary; `harness/fault_decode_metal.sh` confirms the decoder + tables link and coexist with a live
-> program on Renode. (A precise BFAR fault can't be injected on Renode — CFSR is hardware-managed and
-> unmapped reads don't fault the core — the same reason the C Layer-3 has no on-metal fault-injection
-> gate; the *finer* per-call-site map remains deferred.)
->
-> **Dynamic `host_io.print` (audit P6-4).** `host_io.print(<value>)` (a non-literal argument) was
-> unimplemented on every backend — the sim no-op'd it, the C backend left a `TODO`, the LLVM backend
-> signposted it. All three now agree: print the runtime value as **unsigned decimal**. The LLVM host path
-> converts via an inline `udiv`/`urem` itoa into a stack buffer + the raw `write` syscall (no libc); the
-> sim formats with `to_string`; the C backend emits an equivalent inline itoa. `harness/print_value.sh`
-> confirms the LLVM host binary and the sim both print `42` for `host_io.print(40+2)`. Host-only — there
-> is no metal `host_io` target until semihosting (P6-7).
->
-> **`await` true frame suspend (audit P6-5).** `await` was a bounded `wfi`-recheck that blocked the
-> reaction's IRQ context (an equal/lower-priority reaction that would set the condition could never run).
-> It is now a **true frame suspend**, reusing the bus state machine in both backends: the body is
-> segmented at each top-level `await`, and the await terminator arms a `within` countdown
-> (`__rf_N.__await`/`__await_deadline`, 1 ms ticks) and **returns** to the scheduler. The **SysTick**
-> handler re-checks each suspended await (resume on the condition, fault on the elapsed budget → the
-> frame disposition, else stay suspended) — distinct from a bus suspend, which the bus IRQ resumes; the
-> `__await` flag keeps the two resume paths from crossing, so the bus path is untouched (and an
-> await-suspended reaction does **not** gate the watchdog feed). `harness/await_interleave.sh` (the await
-> analogue of `bus_parity.sh`) proves on Renode — C **and** `BUILD=llvm` — that a peer reaction runs
-> *during* the suspension and sets the awaited condition, so the worker resumes (`done`=3 = sim) where
-> the old busy-wait would have deadlocked. `poll` stays a non-yielding busy-wait; a priority-preserving
-> resume (PendSV instead of SysTick-context) is a further follow-up.
->
-> **Runtime float arithmetic (audit P6-8).** `float` was storage-only — float math *silently miscompiled*
-> to integer + Q16.16-mangled literals. Now it computes, front-to-back: new SIR `FloatLit`/`FloatArith`;
-> the resolver types it (a decimal/int literal is a float in a float context via the existing arith
-> context — `3.5` stays Q16.16 fixed elsewhere — and `+ - * /` route to `FloatArith` when an operand is
-> float, type-directed like fixed-point); the sim reinterprets the `u64` model's bits as `f32`/`f64`. On
-> metal both backends enable the **FPU** (CPACR CP10/CP11) in the reset handler and emit hardware float:
-> the LLVM backend keeps values as IEEE bits in an `iN` and `bitcast`s to `float`/`double` around
-> `fadd`/`fmul`/… (so cell storage/loads are unchanged), built with `llc -mcpu=cortex-m4
-> -float-abi=hard`; the C backend emits plain float ops with `-mfpu=fpv4-sp-d16 -mfloat-abi=hard`. Both
-> avoid soft-float libcalls (`__addsf3`) that `-nostdlib` couldn't satisfy. `harness/float_metal.sh`
-> runs `acc += 1.5; out = acc*2` on the M4F: `acc=4.5`, `out=9.0` **bit-exact** with the sim, `sim ≡
-> metal(LLVM)`. (Float comparisons, int↔float conversions, and `f64` on the single-precision M4F are
-> follow-ups; mixing int and float operands without a cast is unsupported.)
->
-> **Metal semihosting — `host_io` (audit P6-7).** `host_io.print` now works on metal via ARM
-> semihosting: a string lowers to a NUL-terminated constant + `BKPT 0xAB` with SYS_WRITE0 (op 4 in r0,
-> the pointer in r1); a runtime value reuses the decimal itoa. Both backends emit it (LLVM as inline
-> asm, C as a `register`-pinned `bkpt 0xab`); no MMIO, no libc. `harness/semihosting.sh` captures it on
-> Renode by attaching `UART.SemihostingUart @ cpu` + `CreateFileBackend` (Renode has no
-> `EnableSemihosting` toggle — that was the earlier dead-end) and confirms the captured stream equals
-> the simulator's stdout (`n=1/n=2/n=3`), on C **and** `BUILD=llvm` — `sim ≡ metal`.
-
-> **Multi-consumer bus arbitration (audit P6-9).** Two reactions reading two sensors on the *same* I²C
-> controller used to break silently: the second kick clobbered the single `__bus_owner` and the first
-> read was lost. The bus is now a priority-arbitrated shared resource — **implicit** (no new syntax;
-> sharing one controller auto-serializes) and **priority-ordered**. The arbitration key is already
-> `BusXfer.device`, so no SIR change. The **simulator is the oracle**: a per-controller busy flag + a
-> bounded waiter queue keyed by device — a `BusXfer` on a busy bus joins the queue (`BusBlocked`); on
-> completion the highest-priority waiter is granted the freed bus (`BusGranted`; ties → lowest id). The
-> queue is bounded by construction: §5.1 coalescing gives each reaction ≤1 in-flight activation, so a bus
-> shared by N reactions has ≤ N−1 waiters. Both metal backends mirror it, **gated on contention** (a bus
-> with ≥2 reactions): a standalone `__bus_waiting_N` flag per contender, a claim gated on *free AND no
-> higher-priority waiter* (otherwise the reaction records itself and suspends *without* clobbering the
-> owner/SA-RA-DR-CR), and a bus-IRQ grant chain that, if the owner released the bus, resumes the
-> highest-priority waiter — which re-enters its dispatcher and retries the now-free kick (the bus analogue
-> of P6-5's await re-entry). A single-consumer bus keeps the simpler single-owner path byte-for-byte.
-> `harness/bus_arbitration.sh` runs two contending reactions on Renode: both reads complete (mid 0/0 →
-> post 1/1), priority-ordered, on C **and** `BUILD=llvm` — `sim ≡ metal`; the single-bus gates are
-> undisturbed.
-
-> **TIMER-rebased `now()`/deadlines, SysTick retired (audit P6-6).** SysTick had quietly accreted four
-> jobs — the `now()` uptime base, the `within`-deadline countdown (P5-4), the await re-check (P6-5), and
-> the watchdog wake cadence — all at 1 ms resolution. P6-6 moves every one onto a dedicated **TIMER2** (a
-> free-running 1 MHz/1 µs 32-bit counter; TIMER0/IRQ8 collides with the bus, TIMER1 drives `every`) and
-> retires SysTick entirely (no handler, no SCS programming, vector slot 15 → default). `now()` gains **µs
-> resolution**: it reads the live counter through a CAPTURE channel (`TASKS_CAPTURE[1]`→`CC[1]`) and
-> combines it with a software wrap high word into 64-bit ns — `now_ns = ((high << 32) | capture) * 1000`.
-> A 1 ms TIMER2 COMPARE interrupt (auto-rearm `CC[0] += 1000`) maintains that high word on a 32-bit wrap
-> (which it always catches — the wrap is every ~4295 s), runs the deadline/await countdowns exactly as the
-> SysTick handler did, and — firing every 1 ms — serves as the watchdog wake so `wfi` can't oversleep the
-> timeout. The one Renode capability risk (does the emulator model TIMER CAPTURE→CC?) was **verified up
-> front** with a bare-metal probe before any codegen — it does, monotonically. `harness/now_uptime.sh`
-> confirms `now()` reads exactly 300000000 ns at the 300 ms tick on C **and** `BUILD=llvm`, and the whole
-> metal gate suite re-greened on the TIMER2 base. (A sub-1 ms `now()` wrap-lag glitch once per ~71 min is
-> accepted; the next tick corrects it.)
+> The gates that hold this honest: `harness/llvm_metal.sh` (boot) and `harness/llvm_metal_sched.sh`
+> (scheduler) run the LLVM path end-to-end on Renode, and every shared `harness/*.sh` gate takes a
+> `BUILD=llvm` switch that re-runs the whole `sim ≡ metal` check through the LLVM backend — so the C
+> and LLVM backends are continuously required to produce identical observable behaviour. Remaining
+> follow-ups (shared with the C path): a priority-preserving resume (PendSV rather than the timer-tick
+> context), float comparisons / int↔float conversion / `f64` on the single-precision M4F, and the
+> finer per-call-site Layer-3 site map.
 
 ### 6.4 Generated linker script, vector table, startup, `.data`/`.bss`
 
@@ -1698,41 +1542,44 @@ short without foreclosing the ceiling.
 
 ## 11. Roadmap
 
-**Phase 0 — first slice (the reactive core).** Implement enough to run **blink + button on one open
-board, in sim then on metal, via the C backend** (§9.6). Deliverables: minimal grammar + parser;
-`device`/`board`/`program`/`on`/`every`/`cell`; the leaf `gpio` and `timer` device types; the
-atomicity construct (§5.5); SIR + C backend (§6.2); generated startup/linker (§6.4); host simulator
-(§7.1). **Two items the review (D16/D13) correctly pulls forward into Phase 0, because blink-on-metal
-genuinely needs them:** (a) a **minimal pin/pad model** — pad mux, pull, direction — with
-**duplicate pin ownership a compile error** (you cannot wire `led_user` and an alternate function to
-the same pad); and (b) a **structured trace ring buffer** (fault code, handler id, device id, event
-id, tick timestamp; text rendered host-side, no on-device strings, §4.3) so first bring-up is
-debuggable instead of dark. Target board: a well-documented open part (e.g. RP2040, or an STM32
-Nucleo / iCE40-class target with full datasheets). Success = identical program runs in sim and on
-metal, LED blinks, the button reaction shares one `cell` with the timer reaction without a manual
-critical section, and a forced fault shows up as a decoded trace record.
+Phases 0–3 are **done**; Phase 4+ stays demand-ordered. The blow-by-blow record of every feature
+cluster (A–F, then P0–P6) — each its own branch + PR behind a hard `cargo test` + Renode gate —
+lives in [`completion-backlog.md`](completion-backlog.md). The summary:
 
-*Phase-0 validation matrix (Gemini), the concrete machine-checkable acceptance gates:* (1) **no
-dynamic allocation** — `.bss` + `.data` + computed pool/frame/stack sizes equal the program's total
-RAM footprint exactly (§5.3); (2) **deterministic pin muxing** — compiling two bindings to one
-physical pad is a *static error* (§3.3); (3) **barrier insertion** — the emitted C contains the
-required `__DSB()`/`__DMB()`/compiler-volatile fences around each register-write block and before
-IRQ enable (§4.2, §6.2). These are CI assertions, not prose claims.
+**Phase 0 — first slice (the reactive core). _Done._** Runs **blink + button on one open board, in
+sim and on metal** (§9.6): minimal grammar + parser; `device`/`board`/`program`/`on`/`every`/`cell`;
+the leaf `gpio` and `timer` device types; the atomicity construct (§5.5); SIR + the C backend
+(§6.2); generated startup/linker (§6.4); the host simulator (§7.1). Plus the two items the review
+(D16/D13) correctly pulled forward because blink-on-metal needs them: a **minimal pin/pad model**
+(pad mux, pull, direction) with **duplicate pin ownership a compile error**, and a **structured
+trace ring buffer** (fault code, handler/device/event id, tick timestamp; text rendered host-side,
+no on-device strings, §4.3). The identical program runs in sim and on the nRF52840, the LED blinks,
+the button reaction shares one `cell` with the timer without a manual critical section, and a forced
+fault shows up as a decoded trace record.
 
-**Phase 1 — composition + faults.** Add interfaces, the `i2c`/`spi` controller leaf devices, one
-composed sensor (e.g. BME280, §3.5), `yields`/suspension lowering (§5.2), and the three-layer fault
-model incl. safe-state and the **scheduler-fed hardware watchdog** (§5.4–§5.6). This is where the
-keystone is proven against real silicon — and the right place to validate the bus model (§3.5) and
-register access model (§4.2) against a genuinely awkward part (clock-stretching, `w1c`/`pop_on_read`
-registers), per risk #7 (§12).
+*Phase-0 validation matrix — the machine-checkable acceptance gates, now CI assertions:* (1) **no
+dynamic allocation** — `.bss` + `.data` + computed pool/frame/stack sizes fit the program's RAM
+footprint, with the stack bound *measured* from the toolchain call-graph (§5.3); (2) **deterministic
+pin muxing** — two bindings to one physical pad is a *static error* (§3.3); (3) **barrier
+insertion** — the emitted code carries the required `__DSB()`/`__DMB()`/`__ISB()` fences around each
+register-write block and before IRQ enable (§4.2, §6.2).
 
-**Phase 2 — agent edit surface + facts.** Typed overlays (§3.6) as the agent edit API; the
-DTS→Silica transpiler (§8) to harvest board facts; graph-aware debug info v1 from the simulator
-(§7.2); self-versioning (§7.5).
+**Phase 1 — composition + faults. _Done._** Interfaces, the `i2c`/`spi` controller leaf devices,
+composed sensors (a BME280 over I²C with datasheet fixed-point compensation, a BMP280-style sensor
+over SPI, §3.5), `yields`/suspension lowering (a real IRQ-driven state machine on metal, §5.2), and
+the three-layer fault model incl. safe-state and the **scheduler-fed hardware watchdog** (§5.4–§5.6).
+The keystone is proven against real silicon (Renode) on a genuinely awkward part (clock-stretching,
+`w1c`/`pop_on_read` registers), per risk #7 (§12); multiple consumers sharing one bus are
+priority-arbitrated with a bounded wait queue.
 
-**Phase 3 — LLVM backend.** Second consumer of SIR (§6.3), validating the C-purity guard and making
-the "replace Zephyr" path structurally real. No language changes expected — this is the proof that
-none were needed.
+**Phase 2 — agent edit surface + facts. _Partially done._** Typed overlays (§3.6, compile-time
+`set`/`remove`) and `when`-typestate (§4.1) are built. Remaining: the DTS→Silica transpiler (§8) to
+harvest board facts, graph-aware debug info v1 from the simulator (§7.2), the agent overlay-edit
+*API* surface, and self-versioning (§7.5).
+
+**Phase 3 — LLVM backend. _Done._** A second consumer of SIR (§6.3) at **full metal parity** with
+the C backend, validating the C-purity guard and making the "replace Zephyr" path structurally real.
+No language changes were needed — the proof that none were.
 
 **Phase 4+ — deferred items, demand-ordered.** Pull from §10 as real projects need them (protocol
 state machine → flash/DFU → filesystem → richer observability), each as an *instance* of an existing

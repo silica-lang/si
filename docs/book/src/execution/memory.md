@@ -43,10 +43,11 @@ and the oldest samples are dropped — visibly bounded. (Full example: `examples
 the ring is shared across two reactions, its ops are protected by the automatic priority-ceiling
 critical section described under [atomicity](atomicity.md).
 
-> **Status (partly deferred).** `ring<T, N>` is implemented (for example, `ring<u32,16>` sums to
-> 76 bytes, verified by the RAM-budget gate). `pool<T,N>`, `arena`, and `buffer<N>`/`bytes` are
-> not yet built; `T` must currently be an integer scalar (see [numbers](../types/numbers.md));
-> and a fault-on-full/empty variant, as an alternative to overwrite-oldest, is a follow-up.
+> **Status (partly deferred).** `ring<T, N>` is implemented on the simulator and **both** metal
+> backends (for example, `ring<u32,16>` sums to 76 bytes, verified by the RAM-budget gate; see
+> `examples/ring_nrf52840.si`). `pool<T,N>`, `arena`, and `buffer<N>`/`bytes` are not yet built;
+> `T` must currently be an integer scalar (see [numbers](../types/numbers.md)); and a
+> fault-on-full/empty variant, as an alternative to overwrite-oldest, is a follow-up.
 
 ## A bounded stack
 

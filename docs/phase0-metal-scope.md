@@ -6,6 +6,16 @@
 > Companion to [`DESIGN.md`](DESIGN.md) §6.2/§6.4 (backend), §4.2 (registers),
 > §5.5 (atomicity), §11 (roadmap). The sim-side reactive-core slice was built
 > first; this closed the on-metal half of Phase 0.
+>
+> **Historical note.** This document captures the *original C-backend* metal bring-up
+> (Stages A–E) and describes the timing mechanism *as it was then*. Two things have since
+> changed and are **superseded below**: (a) `every` no longer runs on **SysTick** — it is
+> lowered onto a hardware **TIMER1** compare channel (P1-4), and `now()`/deadlines onto
+> **TIMER2** (P6-6), with SysTick fully retired; and (b) the metal lowering now also has a
+> **second backend (LLVM) at parity** with the C path described here (`--emit-llvm`, DESIGN.md
+> §6.3). The work also went far beyond Phase 0 — Phase-1 composition/yields/arbitration and the
+> full Cluster A–F / P0–P6 feature set. The blow-by-blow record lives in
+> [`completion-backlog.md`](completion-backlog.md).
 
 ## Context
 
@@ -23,8 +33,8 @@ observed in **Renode**. It closes the outstanding Phase-0 items:
 - validation gate **#3** (barrier insertion in emitted C),
 - success criteria "identical program runs in sim **and** on metal" + "LED blinks".
 
-It takes Phase 0 from ~60% to ~95%; only the Layer-3 forced-fault decoder (§5.4) remains
-after this.
+It closed the on-metal half of Phase 0 (the Layer-3 forced-fault decoder, §5.4, landed
+shortly after — see below); Phase 0 is complete.
 
 ## Target facts (nRF52840 / PCA10056 DK)
 
@@ -157,13 +167,15 @@ end-to-end on-metal complement (needs arm-gcc + Renode, run on demand).
 ## Status: metal scope complete
 
 All five stages done; the §9.6 "identical program in sim and on metal" criterion
-is met and automated. This takes Phase 0 to ~95%; the remaining item is the
-Layer-3 forced-fault → decoded-trace decoder (§5.4), tracked as the out-of-scope
-note below.
+is met and automated. This completed the on-metal half of Phase 0; the Layer-3
+forced-fault → decoded-trace decoder (§5.4) landed next (see below), finishing
+Phase 0.
 
-### Phase-1 metal lowering (in progress)
+### Phase-1 metal lowering (done)
 
-Closing the sim≡metal gap for the Phase-1 keystone (composition + yields). Done:
+Closed the sim≡metal gap for the Phase-1 keystone (composition + yields) — and has
+since gone further (bus IRQ state machine, multi-consumer arbitration), on both the C
+and the LLVM backend. Highlights:
 
 - **`SirExpr::RegLoad` → volatile masked MMIO read** — the read counterpart of the
   Stage-B store lowering. A register read (e.g. `button.get()`) now emits
