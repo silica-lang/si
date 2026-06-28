@@ -9,13 +9,13 @@
 > simulator **and** on real hardware (nRF52840), through **two independent backends** (C
 > and LLVM) that are held to byte-for-byte `sim ≡ metal` parity in Renode.
 
-Silica is built around a wager: that the language an **AI agent** most wants to author,
-edit, and debug is the same language a **compiler** most wants to analyze and a **hardware
-engineer** most wants to read — and that *embedded systems* are where that alignment is
-sharpest. Semantics are built from hardware concepts (devices, registers, interrupts, time,
-resources, capabilities) rather than the C-and-UNIX vocabulary most embedded toolchains
-smuggle in, and the language deliberately removes the things that make code hard for a
-machine to reason about: hidden state, ambiguous grammar, and untyped text.
+Silica is a programming language for microcontrollers. Its semantics are built from hardware
+concepts — devices, registers, interrupts, time, resources, and capabilities — rather than the
+files/heap/`errno` vocabulary most embedded toolchains inherit from C and UNIX. It also aims to
+be straightforward for tools to analyze and edit, AI agents included: there is no hidden state,
+the grammar is regular and unambiguous, and code is typed structure rather than text that only
+gains meaning after a build. Programs run in a deterministic simulator and on real hardware from
+the same source.
 
 The full rationale, type system, execution model, and roadmap live in
 **[`docs/DESIGN.md`](docs/DESIGN.md)** — start there. A friendlier, user-facing version is
@@ -150,6 +150,7 @@ simulation script.
 
 ## Status & scope
 
-Silica is deliberately a "toy" — an intellectual exercise — with an aspirational long-term
-ceiling (potentially replacing an RTOS like Zephyr for personal projects) used as a
-*foreclosure constraint*, not a v1 deliverable. See DESIGN.md §1 (scope) and §11 (roadmap).
+Silica is experimental and not production software. The long-term aim — being usable for
+personal projects in place of an RTOS like Zephyr — is treated as a design constraint rather
+than a near-term deliverable, and is mainly what shapes which features are deferred. See
+DESIGN.md §1 (scope) and §11 (roadmap).
