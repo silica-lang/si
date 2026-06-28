@@ -53,4 +53,5 @@ register. (Full example: `examples/fault_nrf52840.si`.)
 
 On metal the same tables back the `HardFault_Handler`: the trap path reads the faulting address
 and PC and runs the same decode, so the diagnosis you see in the simulator is the diagnosis you
-get on hardware.
+get on hardware. Both the C and the LLVM backend emit this decoder against the identical
+ownership table.

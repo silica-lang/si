@@ -7,7 +7,7 @@
 //
 // The register *bit conventions* (start/dir, done/nak/...) are documented on
 // the fields and encoded in the metal backend's `BusXfer` lowering — the same
-// nRF-target/SIR-neutral split used for GPIOTE/SysTick.
+// nRF-target/SIR-neutral split used for GPIOTE/timer.
 
 device i2c_controller implements i2c {
   regs {

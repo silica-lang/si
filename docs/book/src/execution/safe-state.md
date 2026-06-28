@@ -94,11 +94,11 @@ scheduler, like the critical sections of [atomicity](atomicity.md). (Full exampl
 
 > **Status (implemented — `within` on metal).** Beyond the watchdog catching a handler that
 > *never* returns to idle, a per-reaction `within <d>` deadline is now enforced on metal for
-> yielding reactions when a watchdog is declared: a `__deadline_N` countdown (in 1ms SysTick
-> ticks) is armed at trigger entry, decremented by SysTick, and disarmed when the frame returns to
-> idle; an overrun latches a flag that gates off the idle-loop watchdog feed, forcing a reset.
-> This catches a handler that is merely *too slow* (would eventually complete), a tighter bound
-> than "never idle." Proven on nRF52840 in Renode. **Remaining:** it requires a declared watchdog
-> (the reset path); non-yielding reactions are bounded by ISR run-to-completion (no mid-handler
-> check); resolution is the 1ms SysTick base tick. Windowed and multi-stage watchdogs are
-> deferred-not-foreclosed.
+> yielding reactions when a watchdog is declared: a `__deadline_N` countdown (in the **TIMER2**
+> 1 ms tick) is armed at trigger entry, decremented on each tick, and disarmed when the frame
+> returns to idle; an overrun latches a flag that gates off the idle-loop watchdog feed, forcing a
+> reset. This catches a handler that is merely *too slow* (would eventually complete), a tighter
+> bound than "never idle." Proven on nRF52840 in Renode on **both** the C and LLVM backends.
+> **Remaining:** it requires a declared watchdog (the reset path); non-yielding reactions are
+> bounded by ISR run-to-completion (no mid-handler check); resolution is the 1 ms TIMER2 tick.
+> Windowed and multi-stage watchdogs are deferred-not-foreclosed.

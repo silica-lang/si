@@ -1,6 +1,7 @@
 //! Stage-A on-metal backend: hermetic checks on the generated freestanding C,
 //! the linker script, and the RAM-budget gate (no arm-none-eabi-gcc / Renode
-//! needed — those are exercised by spike/run.sh and documented in the scope).
+//! needed — the end-to-end metal gates live in `harness/` and are documented in
+//! the scope).
 
 use silicac::backend::{c, Target};
 use silicac::sir::SirModule;

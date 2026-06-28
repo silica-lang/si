@@ -1,8 +1,29 @@
 # Metal validation harness
 
+These scripts are the **sim ≡ metal** gates: each proves the *same* `.si` program
+produces the *same* observable behaviour in the host simulator (`silicac --sim`)
+and on real hardware (nRF52840, run in Renode). Together they cover the whole
+runtime — the [full catalog](#full-gate-catalog) is at the bottom; the foundational
+gates are written up in detail below.
+
+Requires `cargo`, `arm-none-eabi-gcc`, and a Renode binary (set `$RENODE` or put
+`renode` on `PATH`; portable builds: <https://github.com/renode/renode/releases>).
+LLVM gates additionally need `llc` (Homebrew LLVM).
+
+> **Both backends.** Silica emits the metal image through two independent backends
+> (C and LLVM). Every shared gate below takes a **`BUILD=llvm`** switch that re-runs
+> the entire check through the LLVM backend, so the two backends are continuously
+> required to produce identical behaviour:
+> ```sh
+> RENODE=/path/to/renode            ./harness/metal_vs_sim.sh   # C backend (default)
+> RENODE=/path/to/renode BUILD=llvm ./harness/metal_vs_sim.sh   # LLVM backend
+> ```
+
+## `metal_vs_sim.sh` — the baseline sim ≡ metal gate (§9.6)
+
 `metal_vs_sim.sh` is the Phase-0 **sim ≡ metal** gate (DESIGN.md §9.6): it proves
-the *same* `.si` program produces the *same* LED behaviour in the host simulator
-(`silicac --sim`) and on real hardware (nRF52840, run in Renode).
+the *same* `.si` program produces the *same* LED behaviour in the simulator and on
+the nRF52840 in Renode.
 
 ```sh
 RENODE=/path/to/renode ./harness/metal_vs_sim.sh [path/to/program.si]
@@ -10,17 +31,15 @@ RENODE=/path/to/renode ./harness/metal_vs_sim.sh [path/to/program.si]
 
 Default program: `examples/blink_button_nrf52840.si`.
 
-Requires `cargo`, `arm-none-eabi-gcc`, and a Renode binary (set `$RENODE` or put
-`renode` on `PATH`; portable builds: <https://github.com/renode/renode/releases>).
-
 ## What it does
 
 1. Runs `--sim` and extracts the reference LED toggle sequence (writes to
    `gpio0` bit 13).
 2. Compiles the same program with `--target metal-nrf52840` to an `.elf`.
 3. Runs the `.elf` in Renode on the nRF52840-DK platform, with **`nvic Frequency
-   64000000`** so SysTick ticks at 64 MHz and the blink period is real-time
-   (500 ms). It injects the button (`gpio0.sw0`) at the same virtual times as the
+   64000000`** so the on-chip timers run at the 64 MHz core clock and the blink
+   period is real-time (500 ms; `every` is driven by TIMER1). It injects the button
+   (`gpio0.sw0`) at the same virtual times as the
    program's `sim` block (1200 ms, 1800 ms — the GPIOTE falling edge lands on
    Release), and samples the LED just after each expected toggle.
 4. Asserts the metal LED sequence equals the simulator's.
@@ -118,8 +137,8 @@ PASS: the default `+` trapped on overflow and halted (safe-state); `+%` wrapped 
 overruns its declared `within` deadline** — a tighter bound than the bare
 watchdog (which only catches a handler that *never* returns to idle). The
 backend arms a per-reaction `__deadline_N` countdown at the trigger entry, ticks
-it down in SysTick, and latches `__deadline_missed` on an overrun; that flag
-gates off the watchdog feed, so the system resets.
+it down on the TIMER2 1 ms tick, and latches `__deadline_missed` on an overrun;
+that flag gates off the watchdog feed, so the system resets.
 
 ```sh
 RENODE=/path/to/renode ./harness/deadline_reset.sh
@@ -138,13 +157,50 @@ Expected output ends with:
 PASS: the metal firmware detects a within-deadline overrun (latches __deadline_missed → stops the watchdog feed, §4.5/§5.6).
 ```
 
+## Full gate catalog
+
+The five gates above are written up in detail; the rest follow the same pattern
+(build the program, run it in Renode, assert an observable equals the simulator's).
+Unless noted, each takes the `BUILD=llvm` switch to re-run through the LLVM backend.
+
+| Script | Gates | Default program |
+| --- | --- | --- |
+| `metal_vs_sim.sh` | baseline blink+button sim ≡ metal (§9.6) | `blink_button_nrf52840.si` |
+| `bus_parity.sh` | a yielding bus xfer suspends so a peer runs during the window (§5.2) | `bus_interleave_nrf52840.si` |
+| `bus_refire.sh` | a yielding `every` reaction re-arms and fires repeatedly (clears stale bus pending) | `fault_match.si` |
+| `bus_arbitration.sh` | two reactions on one bus are priority-arbitrated; both reads complete (P6-9) | `bus_contend_nrf52840.si` |
+| `watchdog_reset.sh` | the idle loop feeds the WDT only on clean idle; a wedged reaction → reset (§5.6) | `bus_watchdog_nrf52840.si` |
+| `deadline_reset.sh` | a `within <d>` overrun latches `__deadline_missed` → stops the feed (§4.5/§5.6) | `deadline_nrf52840.si` |
+| `overflow_trap.sh` | a default `+` traps to safe-state on overflow; `+%` wraps (§4.3/SIL-004) | `overflow_nrf52840.si` |
+| `fault_decode_metal.sh` | the `HardFault_Handler` Layer-3 region decoder + ownership table link & run (§5.4) | `fault_nrf52840.si` |
+| `fault_match.sh` | `match` over an op's `ok`/`fault <code>` decodes the runtime outcome (P2-4/P3-2) | `fault_match{,_composed}.si` |
+| `poll_await.sh` | `poll`/`await … within … else fault` resume when satisfied, fault on timeout (§3.2) | `poll_nrf52840.si`, `await_nrf52840.si` |
+| `await_interleave.sh` | an `await` frame-suspends so a peer runs during the wait (P6-5) | `await_interleave_nrf52840.si` |
+| `now_uptime.sh` | `now()` reads the TIMER2 µs uptime, matching sim virtual time (P5-1/P6-6) | `uptime_nrf52840.si` |
+| `ring_metal.sh` | `ring<T,N>` push/pop/len on metal (P6-1) | `ring_nrf52840.si` |
+| `fixed_metal.sh` | `fixed<I,F>` mul/div with rescale on metal (P6-2) | `fixed_nrf52840.si` |
+| `float_metal.sh` | runtime float on the hardware FPU, bit-exact with sim (P6-8) | `float_nrf52840.si` |
+| `semihosting.sh` | `host_io.print` → ARM semihosting, captured stream = sim stdout (P6-7) | `semihosting_nrf52840.si` |
+| `typestate_runtime.sh` | a runtime `when`-precondition guard drives safe-state on mismatch (P3-3) | `typestate_runtime.si` |
+| `stack_budget.sh` | the measured worst-case stack budget is enforced; oversized → no ELF (P0-1b) | `stack_over_budget_nrf52840.si` |
+| `flash_budget.sh` | the flash/code-size budget is enforced; oversized → no ELF (P1-3) | `flash_over_budget_nrf52840.si` |
+| `llvm_metal.sh` | the LLVM backend boots `sys.start` on Renode, end-to-end, no C (P3-4c) | `boot_nrf52840.si` |
+| `llvm_metal_sched.sh` | the LLVM backend's TIMER1 scheduler toggles the LED on period (P4-1) | `blink_nrf52840.si` |
+| `escape_hatch_audit.sh` | reports the cast / wrap-sat escape-hatch count per file (host, no Renode) (P2-2) | (the corpus) |
+
+The C# files `MockBusController.cs` (the abstract bus controller at `0x4000_3000`,
+IRQ 8) and `MockWatchdog.cs` (a latching WDT at `0x4001_0000`) are Renode peripheral
+models loaded by the bus/watchdog gates, since Renode does not model Silica's
+abstract controllers.
+
 ## Notes
 
-- The hermetic codegen tests in `crates/silicac/tests/metal_codegen.rs` run in CI
-  without Renode/arm-gcc; these harnesses are the end-to-end on-metal complement
-  and need both tools, so they run on demand rather than in `cargo test`. The
-  interleave example's sim oracle is additionally guarded hermetically by
+- The hermetic codegen tests in `crates/silicac/tests/metal_codegen.rs` and
+  `crates/silicac/tests/llvm_canary.rs` run in CI without Renode/arm-gcc/llc; these
+  harnesses are the end-to-end on-metal complement and need the toolchain, so they
+  run on demand rather than in `cargo test`. The interleave example's sim oracle is
+  additionally guarded hermetically by
   `sim_composition::bus_interleave_example_runs_button_during_the_suspension`.
-- Renode clocks SysTick from the NVIC `Frequency` property; pinning it to the
-  board's 64 MHz core clock is what makes the metal *timing* (not just the toggle
+- Renode clocks the on-chip timers from the NVIC `Frequency` property; pinning it to
+  the board's 64 MHz core clock is what makes the metal *timing* (not just the toggle
   sequence) match the simulator.

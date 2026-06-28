@@ -2,9 +2,10 @@
 
 Silica's compiler does not lower source straight to a target. It first emits a narrow
 intermediate form — **Silica IR (SIR)** — and a *backend consumes it*. The host
-[simulator](./simulator.md) and the C/metal backend are both consumers of the same SIR,
-which is what keeps a future LLVM backend reachable: swapping backends is "swap one
-consumer," not "rewrite the compiler."
+[simulator](./simulator.md), the C backend, and the LLVM backend are all consumers of the
+same SIR: swapping backends is "swap one consumer," not "rewrite the compiler." Two of those
+consumers (C and LLVM) reach the same metal target independently and are held to identical
+behaviour, so the IR boundary is not a hypothesis — it is continuously tested.
 
 ## The SIR boundary
 
@@ -52,8 +53,9 @@ backend emits a strict **freestanding subset**:
   there is no `__attribute__((constructor))`, no `malloc`, and no static initializers that
   run before the generated reset path.
 
-Each of these is also exactly what a native LLVM backend would do, which is why holding the
-C backend to them keeps SIR honest instead of letting C-isms calcify.
+Each of these is also exactly what the LLVM backend does, which is why holding the C backend
+to them keeps SIR honest instead of letting C-isms calcify — and the LLVM backend (below) now
+*proves* it, emitting the same behaviour with no C in the loop at all.
 
 You can inspect the emitted C, or build a host binary through it:
 
@@ -61,6 +63,32 @@ You can inspect the emitted C, or build a host binary through it:
 # Compile a host program to a native binary via the C backend
 cargo run -- examples/hello.si -o /tmp/hello && /tmp/hello
 ```
+
+## The LLVM backend
+
+The second backend (`--emit-llvm`) emits **textual LLVM IR** straight from SIR — a
+structurally independent consumer that shares no code with the C printer. It exists to keep
+the IR boundary honest: anything the LLVM backend cannot express from SIR alone is a C-ism
+that leaked into the contract. In practice nothing did — the LLVM backend now reaches **full
+parity with the C backend on metal**.
+
+```sh
+# Emit LLVM IR for inspection
+cargo run -- --emit-llvm examples/hello.si
+
+# Build the same bare-metal nRF52840 image through LLVM instead of C (needs llc)
+cargo run -- --target metal-nrf52840 --emit-llvm examples/blink_button_nrf52840.si -o blink.elf
+```
+
+On metal it emits its own freestanding module — the `thumbv7em-none-eabi` triple, the
+`.vectors` table, reset/startup, and every runtime feature the C path has: the
+TIMER1/TIMER2/GPIOTE scheduler, BASEPRI critical sections, the bus yields state machine and
+arbitration, `ring<T,N>`, `fixed<I,F>`, hardware-FPU float, the Layer-3 `HardFault_Handler`,
+drive-safe, poll/await, deadline + watchdog, and `host_io.print` via ARM semihosting — with
+**no libc and no `__builtin`** (overflow traps lower to `llvm.*.with.overflow` intrinsics, not
+C helpers). Every `harness/*.sh` Renode gate takes a `BUILD=llvm` switch that runs the whole
+check through this backend; the two backends are required to produce identical observable
+behaviour.
 
 ## The metal target
 
@@ -87,10 +115,13 @@ Hand-editing a linker script is not a supported workflow. Changing the memory ma
 changing the board type, which re-derives everything consistently. The result is a
 freestanding image with no libc.
 
-On metal, reactions also lower to real hardware wiring: `every <duration>` becomes a SysTick
-configuration, and `on <pin>.falling` becomes a GPIOTE event routed through the NVIC. MMIO
-writes are emitted in order with the required barriers, and the auto-computed critical
-sections lower to real **BASEPRI** masking — see [atomicity](../execution/atomicity.md).
+On metal, reactions also lower to real hardware wiring: `every <duration>` becomes a
+**TIMER1** compare channel (1 MHz, one channel per periodic reaction, re-armed in its IRQ),
+and `on <pin>.falling` becomes a GPIOTE event routed through the NVIC. `now()`, the
+`within`-deadline countdowns, and the watchdog wake cadence all run off a dedicated
+**TIMER2** (1 µs resolution; the old 1 ms SysTick grid is fully retired). MMIO writes are
+emitted in order with the required barriers, and the auto-computed critical sections lower to
+real **BASEPRI** masking — see [atomicity](../execution/atomicity.md).
 
 ## Register access → MMIO lowering
 
@@ -124,7 +155,11 @@ on the nRF52840 in Renode, and checks that the LED sequence matches the
 ```sh
 # End-to-end "sim ≡ metal" gate (needs arm-none-eabi-gcc + Renode)
 RENODE=/path/to/renode ./harness/metal_vs_sim.sh
+
+# ...and the same gate through the LLVM backend
+RENODE=/path/to/renode BUILD=llvm ./harness/metal_vs_sim.sh
 ```
 
-Both sides are consumers of the same SIR, so this gate is what keeps the two backends —
-and the IR boundary between them — honest.
+The simulator, the C backend, and the LLVM backend are all consumers of the same SIR, so this
+gate — run for each backend, across the whole [harness suite](https://github.com/silica-lang/si/tree/main/harness) —
+is what keeps all three, and the IR boundary between them, honest.

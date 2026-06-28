@@ -50,7 +50,7 @@ pub struct CBackend {
     fixed_combos: HashSet<(FixedArithOp, OverflowMode, u8, bool, u8)>,
     /// Ring cell name → (element bytes, capacity), for ring op codegen (§5.3).
     ring_info: HashMap<String, (u8, u32)>,
-    /// Yielding-reaction id → its `within <d>` deadline in SysTick base ticks
+    /// Yielding-reaction id → its `within <d>` deadline in TIMER2 base ticks
     /// (§4.5/§5.6).  Populated only when a watchdog exists (the reset mechanism);
     /// an overrun sets `__deadline_missed`, which stops the watchdog feed.
     deadline_ticks: HashMap<usize, u32>,
@@ -154,7 +154,7 @@ impl CBackend {
                     for r in &module.reactions {
                         if r.yields {
                             if let Some(ns) = r.deadline_ns {
-                                let ticks = ns.div_ceil(1_000_000).max(1) as u32; // 1ms SysTick base
+                                let ticks = ns.div_ceil(1_000_000).max(1) as u32; // 1ms TIMER2 base
                                 self.deadline_ticks.insert(r.id, ticks);
                             }
                         }
@@ -323,7 +323,7 @@ impl CBackend {
     }
 
     /// Emit `__now_ns()` (§4.5) backing the `now()` expression, when used.  Host
-    /// reads the POSIX monotonic clock; metal returns a SysTick-driven uptime
+    /// reads the POSIX monotonic clock; metal returns a TIMER2-driven uptime
     /// counter (1 ms resolution — the reactive scheduling granularity).
     fn emit_now_helper(&mut self, module: &SirModule) {
         if !module_uses_now(module) {
@@ -360,12 +360,12 @@ impl CBackend {
 
     /// Declare the per-reaction `within`-deadline countdowns + the shared
     /// `__deadline_missed` flag (§4.5/§5.6).  Referenced by the trigger fns
-    /// (arm), the SysTick handler (decrement), and the idle loop (gate the feed).
+    /// (arm), the TIMER2 tick handler (decrement), and the idle loop (gate the feed).
     fn emit_deadline_state(&mut self) {
         if self.deadline_ticks.is_empty() {
             return;
         }
-        self.line("/* §4.5/§5.6 `within` deadline countdowns (SysTick ticks); overrun stops the watchdog feed */");
+        self.line("/* §4.5/§5.6 `within` deadline countdowns (TIMER2 ticks); overrun stops the watchdog feed */");
         let mut ids: Vec<usize> = self.deadline_ticks.keys().copied().collect();
         ids.sort_unstable();
         for id in ids {
@@ -392,7 +392,7 @@ impl CBackend {
         // the earlier bounded busy-wait, which could not interleave.
         // A bus transaction OR an `await` (P6-5) makes the reaction suspend, so it
         // lowers to the IRQ-driven segment state machine: bus segments resume on
-        // the bus IRQ, await segments on SysTick.
+        // the bus IRQ, await segments on the TIMER2 tick.
         if self.target == Target::MetalNrf52840 && (reaction.yields || body_has_await(&reaction.body)) {
             self.emit_yielding_reaction_metal(reaction, &fn_name, &comment);
             return;
@@ -454,7 +454,7 @@ impl CBackend {
         let frame = format!("__rf_{}", n);
 
         // Segment the body at each top-level suspend point — a BusXfer (resumed by
-        // the bus IRQ) or an `await` (resumed by SysTick, P6-5).  Both are hoisted
+        // the bus IRQ) or an `await` (resumed by the TIMER2 tick, P6-5).  Both are hoisted
         // to the top level by the resolver; a critical cannot span one.
         let mut segs: Vec<(Vec<&SirStmt>, Option<&SirStmt>)> = Vec::new();
         let mut cur: Vec<&SirStmt> = Vec::new();
@@ -471,7 +471,7 @@ impl CBackend {
 
         // Frame struct: dispatcher state + retry/fault + every cross-yield temp.
         // An await-suspending reaction also carries `__await` (1 = currently
-        // suspended on an await, so SysTick — not the bus IRQ — resumes it) and
+        // suspended on an await, so the TIMER2 tick — not the bus IRQ — resumes it) and
         // `__await_deadline` (its `within` countdown, separate from the watchdog).
         let temps = self.collect_reaction_temps(reaction);
         self.line(&format!("/* {} — IRQ-driven yielding reaction (§5.2) */", comment));
@@ -481,8 +481,8 @@ impl CBackend {
         self.line("uint32_t __retry;");
         self.line("uint8_t  __faulted;");
         if has_await {
-            self.line("uint8_t  __await;          /* 1 = suspended on an await (SysTick resumes) */");
-            self.line("uint32_t __await_deadline; /* await `within` countdown (SysTick ticks) */");
+            self.line("uint8_t  __await;          /* 1 = suspended on an await (the TIMER2 tick resumes) */");
+            self.line("uint32_t __await_deadline; /* await `within` countdown (TIMER2 ticks) */");
         }
         for t in &temps {
             self.line(&format!("uint32_t {};", t));
@@ -563,7 +563,7 @@ impl CBackend {
                 self.emit_stmt(stmt);
             }
             // Terminate the segment: kick the next transaction (suspend on the
-            // bus), arm the await (suspend until SysTick), or, on the tail segment,
+            // bus), arm the await (suspend until the TIMER2 tick), or, on the tail segment,
             // complete and become ready to fire again.
             if let Some(SirStmt::BusXfer { device, op, args, .. }) = xfer {
                 if self.bus_contenders.contains_key(device) {
@@ -596,8 +596,8 @@ impl CBackend {
                     self.line("return; /* suspend on the bus (§5.2) */");
                 }
             } else if let Some(SirStmt::Await { within_ns, .. }) = xfer {
-                // §5.2 (P6-5) — arm the `within` countdown (1ms SysTick ticks) and
-                // suspend; SysTick re-enters the dispatcher to re-check the cond.
+                // §5.2 (P6-5) — arm the `within` countdown (1ms TIMER2 ticks) and
+                // suspend; the TIMER2 tick re-enters the dispatcher to re-check the cond.
                 let ticks = within_ns.div_ceil(1_000_000).max(1);
                 self.line(&format!("{f}.__await = 1U; {f}.__await_deadline = {t}U; {f}.__state = {s}U;", f = frame, t = ticks, s = i + 1));
                 self.line("return; /* suspend on await (§5.2) */");
@@ -612,7 +612,7 @@ impl CBackend {
         self.frame_name = None;
         self.frame_vars.clear();
 
-        // Trigger entry (SysTick/GPIOTE/main): coalesce a re-fire that arrives
+        // Trigger entry (TIMER2 tick/GPIOTE/main): coalesce a re-fire that arrives
         // while a prior activation is still in flight (§5.1), as the sim does.
         self.line(&format!("void {}(void) {{", fn_name));
         self.indent += 1;
@@ -636,7 +636,7 @@ impl CBackend {
                 self.line("}");
             }
         }
-        // §4.5/§5.6 — arm this activation's `within` deadline (in SysTick ticks);
+        // §4.5/§5.6 — arm this activation's `within` deadline (in TIMER2 ticks);
         // if it is still in flight when the countdown elapses, it overran.
         if let Some(ticks) = self.deadline_ticks.get(&n).copied() {
             self.line(&format!("__deadline_{} = {}U; /* arm `within` deadline (§4.5) */", n, ticks));
@@ -1679,9 +1679,9 @@ impl CBackend {
     }
 
     /// Emit the vector table + reset/startup (§6.4): copy `.data`, zero `.bss`,
-    /// configure pins, run `sys.start`, program SysTick (`every`) and GPIOTE/NVIC
+    /// configure pins, run `sys.start`, program TIMER1 (`every`) and GPIOTE/NVIC
     /// (`on <pin>.falling`), then idle in WFI.  `every` is dispatched from
-    /// `SysTick_Handler` (§4.5); `on` events from `GPIOTE_IRQHandler` (§4.1).
+    /// `TIMER1_IRQHandler` (§4.5); `on` events from `GPIOTE_IRQHandler` (§4.1).
     ///
     /// GPIOTE/NVIC register details are nRF-specific and live in this nRF52840
     /// target (SIR stays neutral); SysTick/NVIC are at architectural SCS
@@ -2530,7 +2530,7 @@ pub fn body_has_poll(stmts: &[SirStmt]) -> bool {
 
 /// True if the reaction body contains an `await` (a suspend point, P6-5).  On
 /// metal such a reaction is lowered as a yielding segment state machine (resumed
-/// by SysTick), not the bounded busy-recheck.  The resolver hoists await to the
+/// by the TIMER2 tick), not the bounded busy-recheck.  The resolver hoists await to the
 /// top level, so a flat scan suffices.
 pub fn body_has_await(stmts: &[SirStmt]) -> bool {
     stmts.iter().any(|s| matches!(s, SirStmt::Await { .. }))
@@ -2538,7 +2538,7 @@ pub fn body_has_await(stmts: &[SirStmt]) -> bool {
 
 /// True if the reaction body contains a yielding bus transfer (a bus segment) —
 /// distinguishes bus-suspending reactions (resumed by the bus IRQ) from
-/// await-suspending ones (resumed by SysTick).
+/// await-suspending ones (resumed by the TIMER2 tick).
 pub fn body_has_bus(stmts: &[SirStmt]) -> bool {
     stmts.iter().any(|s| matches!(s, SirStmt::BusXfer { .. }))
 }

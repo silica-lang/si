@@ -58,13 +58,13 @@ right type for the `period` cell.
 
 > **Status.** `instant` and `duration` are distinct types (both 64-bit
 > nanoseconds at runtime), and `now()` reads the clock — the sim's virtual time, a
-> host monotonic read, or a SysTick-driven uptime counter on metal. The resolver
-> enforces the arithmetic above and rejects `instant + instant`, `now() + <bare
-> int>`, scaling an instant, comparing an instant to a non-instant, and assigning
-> an instant to a non-instant cell. A duration literal (`500ms`) is kept
-> type-distinct from a bare integer (`5`). Not yet enforced: the exact-or-error
-> tick-rate conversion and `rounded` modes below; metal `now()` is at 1 ms
-> resolution today.
+> host monotonic read, or, on metal, a **TIMER2**-driven uptime counter at **1 µs**
+> resolution (a hardware CAPTURE of the live counter combined with a software wrap
+> high word; SysTick is retired). The resolver enforces the arithmetic above and
+> rejects `instant + instant`, `now() + <bare int>`, scaling an instant, comparing
+> an instant to a non-instant, and assigning an instant to a non-instant cell. A
+> duration literal (`500ms`) is kept type-distinct from a bare integer (`5`). Not
+> yet enforced: the exact-or-error tick-rate conversion and `rounded` modes below.
 
 ## Deadlines build on the same model
 

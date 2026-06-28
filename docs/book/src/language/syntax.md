@@ -84,8 +84,17 @@ return_type = type | type "or" "fault" ;
 
 program     = "program" ident "{" { use_decl | let_decl | state_decl | reaction } "}" ;
 reaction    = ( "on" event_ref | "every" duration_lit ) [ "within" duration_lit ]
-                [ fault_disp ] block ;
+                [ overflow_clause ] [ fault_disp ] block ;
+overflow_clause = "on" "overflow" ( "coalesce" | "drop_newest" | "fault" ) ;
 fault_disp  = "on" "fault" disposition ;
+
+block       = "{" { stmt } "}" ;
+stmt        = assign | reg_write | call
+            | "match" expr "{" { match_arm } "}"     (* lit, or `ok` / `ok` ident / `fault` ident *)
+            | "atomic" block
+            | "poll" cond "within" duration_lit "else" "fault" ident
+            | "await" cond "within" duration_lit "else" "fault" ident
+            | "become" ident ;
 
 overlay     = "overlay" ident "for" path "{" { edit } "}" ;
 edit        = "set" path "=" expr

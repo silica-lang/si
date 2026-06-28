@@ -70,9 +70,12 @@ docs, tools, and validation, while the value stays one regular shape to handle.
 > **Status.** The `match` statement is the surface conditional
 > (`match <expr> { <lit> => …, _ => … }`). Matching is enforced **total**: a `_`
 > wildcard arm is required (else a compile error) and duplicate literal arms are
-> rejected. Today patterns are integer/bool literals only; the `ok` / `fault f`
-> op-result patterns and exhaustiveness against an op's *declared* fault codes
-> build on this and are not yet wired.
+> rejected. Beyond integer/bool literals, `match` over an op's result is now
+> implemented: `ok` / `ok v` / `fault <code>` arms are checked for exhaustiveness
+> against the op's *declared* fault codes (every code plus `ok`, or a `_`), and the
+> simulator and both metal backends decode the runtime outcome to the right arm —
+> see `examples/fault_match.si` (a primitive bus op) and
+> `examples/fault_match_composed.si` (one composition hop up).
 
 ## Layer 2 — propagation through the reactive model: fault disposition
 

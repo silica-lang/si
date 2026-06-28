@@ -50,9 +50,15 @@ to lower to a **runtime precondition** whose violation is a hardware-level
 > resolver tracks each device's provable state through a reaction's straight-line
 > flow (reset at every event boundary, since typestate is not carried across
 > one). A `when S` op call where a dominating `become S` has not run is a compile
-> error; naming an undeclared state is rejected. The runtime-precondition
-> lowering for the unprovable cases is a follow-up — today the unprovable case is
-> conservatively a compile error rather than a deferred runtime check.
+> error; naming an undeclared state is rejected. State established at boot (in
+> `on sys.start`) **persists** into later reactions. The **runtime-precondition
+> lowering** is also implemented: a `when <state>` call that no dominating
+> `become` proves — because the state is configured in another reaction — lowers a
+> runtime guard that drives the device to its safe state on a mismatch (rather than
+> a conservative compile error); only a state that *no* op can establish stays a
+> compile error. See `examples/typestate_runtime.si` and
+> `examples/typestate_persist.si`. Across-yield preemption of a shared device's
+> proven state and the rich Layer-3 site map remain follow-ups.
 
 For more on how device types are declared and instantiated, see
 [Program & board structure](../language/structure.md). For an end-to-end
