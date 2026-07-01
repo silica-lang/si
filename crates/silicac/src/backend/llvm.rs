@@ -2228,6 +2228,9 @@ impl LlvmBackend {
                 self.inst(&format!("store volatile i{} {}, ptr {}", w, newv, p));
             }
         }
+        // §4.2/§6.2 (audit #35 P7-1): single trailing ordering barrier, byte-for-byte
+        // parity with the C backend's trailing `__DMB()` after every register store.
+        self.m_asm("dmb 0xf", "order device write — parity with C __DMB");
     }
 
     /// Lower a `SirStmt::RegWrite` (multi-field) to ONE ordered volatile store
@@ -2282,6 +2285,9 @@ impl LlvmBackend {
             self.inst(&format!("{} = or i{} {}, {}", newv, w, cleared, combined));
             self.inst(&format!("store volatile i{} {}, ptr {}", w, newv, p));
         }
+        // §4.2/§6.2 (audit #35 P7-1): one trailing ordering barrier for the whole
+        // multi-field write — parity with the C backend's single trailing `__DMB()`.
+        self.m_asm("dmb 0xf", "order device write — parity with C __DMB");
     }
 
     /// The metal "drive safe + hold" sequence (§4.3/§5.6, P5-2): mask interrupts

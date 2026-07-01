@@ -641,7 +641,12 @@ fixed-width volatile pointers (§6.2, D09).
 > handler returns, and `__DSB();__ISB()` after the bus NVIC-disable, so an interrupt does not
 > spuriously re-enter; a `__DSB()` precedes the bus completion-IRQ enable, and an `__ISB()` follows
 > the global `cpsie i`. Verified by `metal_codegen.rs` (single-DMB-per-store, ISB-after-BASEPRI,
-> DSB-at-event-clear) and the `metal_vs_sim` + `bus_parity` Renode gates. **Remaining (deferred):**
+> DSB-at-event-clear) and the `metal_vs_sim` + `bus_parity` Renode gates. **Two-backend parity
+> (audit #35 P7-1):** the LLVM backend now emits the same *single trailing* `dmb 0xf` after every
+> register `store volatile` (it previously omitted it), so the C and LLVM MMIO-ordering lowerings are
+> byte-for-byte equivalent — verified by `llvm_canary.rs`
+> (`reg_store_is_followed_by_a_dmb_matching_the_c_backend`, a store→dmb adjacency + C/LLVM barrier-count
+> equality check). **Remaining (deferred):**
 > fully eliminating the trailing `__DMB()` for runs with no Normal↔Device dependency.
 
 ### 4.3 The number / data model
