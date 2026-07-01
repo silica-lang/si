@@ -1919,7 +1919,9 @@ impl Parser {
                 // `buffer<N>`
                 if name == "buffer" && self.peek() == Some(&Token::Lt) {
                     self.advance();
-                    let n = self.parse_expr()?;
+                    // Parse `N` below comparison precedence so the closing `>` is
+                    // not consumed as a greater-than operator (mirrors `ring<T,N>`).
+                    let n = self.parse_add()?;
                     self.eat(&Token::Gt)?;
                     return Ok(TypeExpr {
                         kind: TypeKind::Buffer(Box::new(n)),

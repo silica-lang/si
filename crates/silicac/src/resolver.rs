@@ -224,6 +224,10 @@ pub struct Resolver {
     /// Boards already built, so a board used by more than one program (or used
     /// twice) does not append its devices/memory/pins to the module twice.
     boards_built: HashMap<String, BoardContext>,
+    /// Spans of type annotations already flagged as unknown/unsupported (audit
+    /// #35 P7-3): a type can be resolved at more than one lowering site, so this
+    /// keeps the hard error to one diagnostic per written annotation.
+    reported_type_spans: std::collections::HashSet<Span>,
 }
 
 impl Default for Resolver {
@@ -271,6 +275,7 @@ impl Resolver {
             board_ctx: None,
             program_ctx: HashMap::new(),
             boards_built: HashMap::new(),
+            reported_type_spans: std::collections::HashSet::new(),
         }
     }
 
@@ -382,7 +387,7 @@ impl Resolver {
                         // An explicit annotation may name `float` → FPU-gate it.
                         let ty = match &l.ty {
                             Some(t) => {
-                                let st = resolve_type_expr(t);
+                                let st = self.resolve_type_expr_checked(t);
                                 self.float_needs_fpu(&st, t.span);
                                 st
                             }
@@ -404,7 +409,7 @@ impl Resolver {
                     }
                 }
                 ProgramItem::CellDecl(c) => {
-                    let ty = resolve_type_expr(&c.ty);
+                    let ty = self.resolve_type_expr_checked(&c.ty);
                     // §4.3: a cell's initialiser must fit its declared type.
                     self.check_literal_range(sirtype_valtype(&ty), &c.init, c.init.span);
                     self.float_needs_fpu(&ty, c.ty.span); // §4.3 FPU gate
@@ -1097,6 +1102,50 @@ impl Resolver {
 
     /// §4.1/§4.3 — `float`/`f64` is allowed only on a board whose SoC declares an
     /// `fpu` capability; otherwise it is a compile error (no silent soft-float).
+    /// Resolve a type annotation at a *declaration* site (cell/local/param/cast
+    /// target): map it to a SIR type and hard-error if it names an unknown type
+    /// or a parsed-but-unlowered construct (audit #35 P7-3 / Finding C).  The
+    /// error is deduped by span so a type resolved at more than one lowering site
+    /// is only reported once.  Returns `u32` as a recovery placeholder on error.
+    fn resolve_type_expr_checked(&mut self, ty: &TypeExpr) -> SirType {
+        self.check_type_expr(ty);
+        resolve_type_expr(ty)
+    }
+
+    /// Emit the P7-3 hard error for an unknown/unsupported type annotation
+    /// (recursing into a `ring<T,N>` element).  Idempotent per span.
+    fn check_type_expr(&mut self, ty: &TypeExpr) {
+        match &ty.kind {
+            TypeKind::Named(ident) => {
+                if primitive_sirtype(&ident.name).is_none() && self.reported_type_spans.insert(ty.span) {
+                    self.err(
+                        ty.span,
+                        format!(
+                            "unknown type `{}` — expected a built-in type \
+                             (u8…u64/s8…s64, bool, bytes, instant, duration, \
+                             float/f64, fixed<I,F>, ring<T,N>)",
+                            ident.name
+                        ),
+                    );
+                }
+            }
+            // Parsed by the grammar but not yet lowered — refuse rather than
+            // silently treating them as `u32` (P7-5a implements `buffer<N>`).
+            TypeKind::Buffer(_) => {
+                if self.reported_type_spans.insert(ty.span) {
+                    self.err(ty.span, "`buffer<N>` is not yet implemented");
+                }
+            }
+            TypeKind::AnonEnum(_) => {
+                if self.reported_type_spans.insert(ty.span) {
+                    self.err(ty.span, "anonymous `enum { … }` types are not yet implemented");
+                }
+            }
+            TypeKind::Ring(elem, _) => self.check_type_expr(elem),
+            TypeKind::Fixed(..) | TypeKind::Unit | TypeKind::Bytes => {}
+        }
+    }
+
     fn float_needs_fpu(&mut self, ty: &SirType, span: Span) {
         if matches!(ty, SirType::F32 | SirType::F64) {
             let fpu = self.board_ctx.as_ref().map(|c| c.fpu).unwrap_or(false);
@@ -1542,7 +1591,7 @@ impl Resolver {
                 let init_vt = self.value_type(&l.init, scope);
                 let ty = match &l.ty {
                     Some(t) => {
-                        let ann = resolve_type_expr(t);
+                        let ann = self.resolve_type_expr_checked(t);
                         self.check_assign_time(sirtype_time_kind(&ann), tk, l.init.span);
                         let annvt = sirtype_valtype(&ann);
                         self.check_assign_type(annvt, init_vt, l.init.span);
@@ -1874,7 +1923,8 @@ impl Resolver {
                     let saved = bind.as_ref().and_then(|n| scope.lookup(&n.name).cloned().map(|b| (n.name.clone(), b)));
                     let bound_name = bind.as_ref().map(|n| n.name.clone());
                     if let Some(name) = &bound_name {
-                        scope.insert(name, Binding::Local(value_tmp.clone(), resolve_type_expr(&op.ret.ty)));
+                        let ret_ty = self.resolve_type_expr_checked(&op.ret.ty);
+                        scope.insert(name, Binding::Local(value_tmp.clone(), ret_ty));
                     }
                     let cond = SirExpr::BinOp(
                         SirBinOp::EqEq,
@@ -2121,7 +2171,7 @@ impl Resolver {
             },
             ExprKind::Cast(inner, ty) => {
                 let _ = self.value_type(inner, scope); // check inside the cast
-                sirtype_valtype(&resolve_type_expr(ty))
+                sirtype_valtype(&self.resolve_type_expr_checked(ty))
             }
             ExprKind::Not(inner) => {
                 let _ = self.value_type(inner, scope);
@@ -2370,7 +2420,8 @@ impl Resolver {
             ExprKind::Cast(inner, ty) => {
                 let from = self.expr_sirtype(inner, scope);
                 let v = self.lower_expr_emit(inner, scope, vars, out);
-                lower_cast(v, &from, &resolve_type_expr(ty))
+                let to = self.resolve_type_expr_checked(ty);
+                lower_cast(v, &from, &to)
             }
             _ => self.lower_expr(expr, scope),
         }
@@ -2540,7 +2591,8 @@ impl Resolver {
         for (p, v) in op.params.iter().zip(arg_vals) {
             let tmp = self.fresh("arg");
             out.push(SirStmt::Assign { target: SirPlace::Var(tmp.clone()), value: v });
-            inner.insert(&p.name.name, Binding::Local(tmp, resolve_type_expr(&p.ty)));
+            let p_ty = self.resolve_type_expr_checked(&p.ty);
+            inner.insert(&p.name.name, Binding::Local(tmp, p_ty));
         }
         if let Some(needs) = self.instance_needs.get(&inst.device).cloned() {
             for (name, val) in needs {
@@ -2777,7 +2829,8 @@ impl Resolver {
             ExprKind::Cast(inner, ty) => {
                 let from = self.expr_sirtype(inner, scope);
                 let v = self.lower_expr(inner, scope);
-                lower_cast(v, &from, &resolve_type_expr(ty))
+                let to = self.resolve_type_expr_checked(ty);
+                lower_cast(v, &from, &to)
             }
             ExprKind::BinOp { op, lhs, rhs } => {
                 let l = self.lower_expr(lhs, scope);
@@ -3455,26 +3508,37 @@ fn time_kind_sirtype(k: TimeKind) -> Option<SirType> {
     }
 }
 
-/// Resolve an AST type annotation to a SIR type.
+/// Map a primitive type name to its SIR type; `None` for a name that is not a
+/// built-in scalar/`bytes`/`instant`/`duration`/`float` type (an unknown or
+/// misspelled name, or a user type used where a value type is expected).
+fn primitive_sirtype(name: &str) -> Option<SirType> {
+    Some(match name {
+        "u8" => SirType::U8,
+        "u16" => SirType::U16,
+        "u32" => SirType::U32,
+        "u64" => SirType::U64,
+        "s8" | "i8" => SirType::S8,
+        "s16" | "i16" => SirType::S16,
+        "s32" | "i32" => SirType::S32,
+        "s64" | "i64" => SirType::S64,
+        "bool" => SirType::Bool,
+        "bytes" => SirType::Bytes,
+        "instant" => SirType::Instant,
+        "duration" => SirType::Duration,
+        "float" | "f32" => SirType::F32,
+        "f64" | "double" => SirType::F64,
+        _ => return None,
+    })
+}
+
+/// Resolve an AST type annotation to a SIR type **without** reporting errors.
+/// An unknown name / unsupported construct falls back to `u32` so pure type
+/// *inference* (e.g. `expr_sirtype`, `infer_type_from_expr`) can proceed; the
+/// hard error is raised at the type's declaration site via
+/// [`Resolver::resolve_type_expr_checked`] (audit #35 P7-3).
 fn resolve_type_expr(ty: &TypeExpr) -> SirType {
     match &ty.kind {
-        TypeKind::Named(ident) => match ident.name.as_str() {
-            "u8" => SirType::U8,
-            "u16" => SirType::U16,
-            "u32" => SirType::U32,
-            "u64" => SirType::U64,
-            "s8" | "i8" => SirType::S8,
-            "s16" | "i16" => SirType::S16,
-            "s32" | "i32" => SirType::S32,
-            "s64" | "i64" => SirType::S64,
-            "bool" => SirType::Bool,
-            "bytes" => SirType::Bytes,
-            "instant" => SirType::Instant,
-            "duration" => SirType::Duration,
-            "float" | "f32" => SirType::F32,
-            "f64" | "double" => SirType::F64,
-            _ => SirType::U32,
-        },
+        TypeKind::Named(ident) => primitive_sirtype(&ident.name).unwrap_or(SirType::U32),
         // `fixed<I, F>` — 2's-complement binary fixed-point (§4.3, P0-3a).
         TypeKind::Fixed(int_bits, frac_bits) => SirType::Fixed {
             int_bits: (*int_bits).min(64) as u8,
