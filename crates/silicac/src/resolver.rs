@@ -1135,13 +1135,10 @@ impl Resolver {
                     );
                 }
             }
+            // `buffer<N>` is implemented (P7-5a); its `N` is validated at lowering.
+            TypeKind::Buffer(_) => {}
             // Parsed by the grammar but not yet lowered — refuse rather than
-            // silently treating them as `u32` (P7-5a implements `buffer<N>`).
-            TypeKind::Buffer(_) => {
-                if self.reported_type_spans.insert(ty.span) {
-                    self.err(ty.span, "`buffer<N>` is not yet implemented");
-                }
-            }
+            // silently treating them as `u32`.
             TypeKind::AnonEnum(_) => {
                 if self.reported_type_spans.insert(ty.span) {
                     self.err(ty.span, "anonymous `enum { … }` types are not yet implemented");
@@ -2364,6 +2361,10 @@ impl Resolver {
                                 self.lower_ring_stmt(&cell, &method.name, args, expr.span, scope, vars, out);
                                 return;
                             }
+                            Some(Binding::Cell(cell, ty)) if matches!(ty, SirType::Buffer { .. }) => {
+                                self.lower_buffer_stmt(&cell, &method.name, args, expr.span, scope, vars, out);
+                                return;
+                            }
                             None => {
                                 self.err(dev_expr.span, format!("undefined device '{}'", device_name));
                                 return;
@@ -2410,6 +2411,9 @@ impl Resolver {
                             }
                             Some(Binding::Cell(cell, ty)) if matches!(ty, SirType::Ring { .. }) => {
                                 return self.lower_ring_value(&cell, &method.name, args, expr.span, scope, vars, out);
+                            }
+                            Some(Binding::Cell(cell, ty)) if matches!(ty, SirType::Buffer { .. }) => {
+                                return self.lower_buffer_value(&cell, &method.name, args, expr.span, scope, vars, out);
                             }
                             _ => {}
                         }
@@ -2471,6 +2475,50 @@ impl Resolver {
             }
             other => {
                 self.err(span, format!("ring has no op '{other}' (expected push/pop/len/is_empty/is_full)"));
+                SirExpr::U64(0)
+            }
+        }
+    }
+
+    /// Lower a buffer op used as a **statement** (§5.3, P7-5a): `b.set(i, v)`
+    /// writes the byte `v` at index `i` (a bounds-guarded, defined store).
+    fn lower_buffer_stmt(&mut self, cell: &str, method: &str, args: &[Expr], span: Span, scope: &mut Scope, vars: &[SirVar], out: &mut Vec<SirStmt>) {
+        match method {
+            "set" => {
+                if args.len() != 2 {
+                    self.err(span, "buffer `set` takes exactly two arguments (index, value)");
+                    return;
+                }
+                let index = self.lower_expr_emit(&args[0], scope, vars, out);
+                let value = self.lower_expr_emit(&args[1], scope, vars, out);
+                out.push(SirStmt::BufferSet { buffer: cell.to_string(), index, value });
+            }
+            "get" | "len" => {
+                self.err(span, format!("buffer `{method}` returns a value — use it in an expression"));
+            }
+            other => self.err(span, format!("buffer has no op '{other}' (expected set/get/len)")),
+        }
+    }
+
+    /// Lower a buffer op used as a **value** (§5.3, P7-5a): `b.get(i)` reads the
+    /// byte at `i` (0 if out of range); `b.len` is the fixed capacity.
+    fn lower_buffer_value(&mut self, cell: &str, method: &str, args: &[Expr], span: Span, scope: &mut Scope, vars: &[SirVar], out: &mut Vec<SirStmt>) -> SirExpr {
+        match method {
+            "get" => {
+                if args.len() != 1 {
+                    self.err(span, "buffer `get` takes exactly one argument (index)");
+                    return SirExpr::U64(0);
+                }
+                let index = self.lower_expr_emit(&args[0], scope, vars, out);
+                SirExpr::BufferGet { buffer: cell.to_string(), index: Box::new(index) }
+            }
+            "len" => SirExpr::BufferLen(cell.to_string()),
+            "set" => {
+                self.err(span, "buffer `set` returns nothing — use it as a statement");
+                SirExpr::U64(0)
+            }
+            other => {
+                self.err(span, format!("buffer has no op '{other}' (expected set/get/len)"));
                 SirExpr::U64(0)
             }
         }
@@ -3235,6 +3283,9 @@ fn stmt_touches_cell(stmt: &SirStmt, cell: &str) -> bool {
         SirStmt::BusXfer { args, .. } => args.iter().any(|a| expr_touches_cell(a, cell)),
         SirStmt::RingPush { ring, value } => ring == cell || expr_touches_cell(value, cell),
         SirStmt::RingPop { ring, .. } => ring == cell,
+        SirStmt::BufferSet { buffer, index, value } => {
+            buffer == cell || expr_touches_cell(index, cell) || expr_touches_cell(value, cell)
+        }
         // A safe-state drive touches no cell (it halts the system).
         SirStmt::DriveSafe => false,
     }
@@ -3335,6 +3386,8 @@ fn expr_touches_cell(expr: &SirExpr, cell: &str) -> bool {
         SirExpr::BinOp(_, l, r) => expr_touches_cell(l, cell) || expr_touches_cell(r, cell),
         SirExpr::Arith { lhs, rhs, .. } => expr_touches_cell(lhs, cell) || expr_touches_cell(rhs, cell),
         SirExpr::RingLen(r) | SirExpr::RingEmpty(r) | SirExpr::RingFull(r) => r == cell,
+        SirExpr::BufferGet { buffer, index } => buffer == cell || expr_touches_cell(index, cell),
+        SirExpr::BufferLen(b) => b == cell,
         _ => false,
     }
 }
@@ -3562,6 +3615,14 @@ fn resolve_type_expr(ty: &TypeExpr) -> SirType {
             };
             SirType::Ring { elem_bytes, cap }
         }
+        // `buffer<N>` — N bytes of bounded storage (§5.3, P7-5a).
+        TypeKind::Buffer(n) => {
+            let bytes = match const_eval(n, &HashMap::new()) {
+                Some(ConstVal::Int(c)) => c as u32,
+                _ => 0,
+            };
+            SirType::Buffer { bytes }
+        }
         _ => SirType::U32,
     }
 }
@@ -3601,8 +3662,8 @@ fn sirtype_ctx(ty: &SirType) -> (u8, bool) {
         SirType::Bytes => (32, false),
         // instant/duration are u64 ns at runtime (§4.5).
         SirType::Instant | SirType::Duration => (64, false),
-        // a ring is not a scalar — never an arithmetic operand.
-        SirType::Ring { .. } => (32, false),
+        // a ring/buffer is not a scalar — never an arithmetic operand.
+        SirType::Ring { .. } | SirType::Buffer { .. } => (32, false),
         // floats are not integer-overflow-checked (§4.3); width is unused here.
         SirType::F32 | SirType::F64 => (32, false),
         // fixed-point is integer math at its storage width (§4.3, P0-3a), so

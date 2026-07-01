@@ -1030,9 +1030,14 @@ No general heap. Memory comes in **statically-sized** forms the compiler sums at
 > metal to a backing array + head/tail/count indices, all summed into the static RAM budget
 > (`ring<u32,16>` → 76 B; verified by `c::ram_budget`). On a full ring `push` overwrites the oldest
 > (a defined, bounded overflow policy); cross-reaction sharing is priority-ceiling protected by the
-> existing §5.5 auto-critical (ring ops register as cell touches). **Remaining:** `pool<T,N>`,
-> `arena`, and `buffer<N>`/`bytes` are not yet built (ring proves the bounded-container + static-
-> accounting pattern); `T` must be an integer scalar; a fault-on-full/empty variant (vs
+> existing §5.5 auto-critical (ring ops register as cell touches). **`buffer<N>` (audit #35 P7-5a).**
+> A second real bounded container: `buffer<N>` is `N` bytes of fixed backing storage with
+> bounds-guarded `.set(i,v)`/`.get(i)`/`.len` — an out-of-range `set` is a defined no-op and an
+> out-of-range `get` reads 0 (never UB, §5.3 "bounded allocation, not absent"). Modelled in the sim and
+> lowered on both backends to a `uint8_t __buf_<n>[N]` / `[N x i8]` array summed into the static RAM
+> budget; verified by `tests/buffer.rs`, `examples/buffer_nrf52840.si`, and a Renode readback
+> (`got=200`, `cap=8`) confirming sim ≡ metal. **Remaining:** `pool<T,N>` (P7-5b) and `arena` are not
+> yet built; a ring's `T` must be an integer scalar; a fault-on-full/empty variant (vs
 > overwrite-oldest) is a follow-up.
 
 Handler frames for suspendable handlers (§5.2) are also statically sized and counted. The result:

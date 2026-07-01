@@ -109,7 +109,7 @@ fn sir_bits(ty: &SirType) -> u32 {
         SirType::Fixed { int_bits, frac_bits, .. } => {
             SirType::fixed_storage_bits(*int_bits, *frac_bits)
         }
-        SirType::Bytes | SirType::Ring { .. } => 64,
+        SirType::Bytes | SirType::Ring { .. } | SirType::Buffer { .. } => 64,
     }
 }
 
@@ -189,6 +189,8 @@ pub struct LlvmBackend {
     /// backing-store globals (`@__ring_<n>_buf/head/tail/count`) + index math,
     /// mirroring the C backend's `ring_info`.
     ring_info: HashMap<String, (u32, u32)>,
+    /// Buffer cell name → capacity in bytes (§5.3, P7-5a).
+    buffer_info: HashMap<String, u32>,
     /// device id → contending reactions `(reaction_id, priority)`, highest-priority
     /// first (P6-9).  Populated only for buses shared by ≥2 reactions; drives the
     /// priority-arbitrated claim/wait/grant.  Mirrors the C backend's field.
@@ -224,6 +226,7 @@ impl LlvmBackend {
             retry_loop: None,
             deadline_ticks: HashMap::new(),
             ring_info: HashMap::new(),
+            buffer_info: HashMap::new(),
             bus_contenders: HashMap::new(),
         }
     }
@@ -283,6 +286,16 @@ impl LlvmBackend {
                 self.globals.push_str(&format!(
                     "@__ring_{n}_buf = global [{c} x i{e}] zeroinitializer\n@__ring_{n}_head = global i32 0\n@__ring_{n}_tail = global i32 0\n@__ring_{n}_count = global i32 0\n",
                     n = v.name, c = cap.max(1), e = ebits
+                ));
+                continue;
+            }
+            // A bounded byte buffer (§5.3, P7-5a): a fixed backing array global —
+            // mirrors the C `__buf_<n>`.
+            if let SirType::Buffer { bytes } = v.ty {
+                self.buffer_info.insert(v.name.clone(), bytes);
+                self.globals.push_str(&format!(
+                    "@__buf_{n} = global [{c} x i8] zeroinitializer\n",
+                    n = v.name, c = bytes.max(1)
                 ));
                 continue;
             }
@@ -1890,6 +1903,7 @@ impl LlvmBackend {
             // mirroring the C ring lowering (overwrite-oldest on full; 0 if empty).
             SirStmt::RingPush { ring, value } => self.emit_ring_push(ring, value),
             SirStmt::RingPop { ring, dst } => self.emit_ring_pop(ring, dst),
+            SirStmt::BufferSet { buffer, index, value } => self.emit_buffer_set(buffer, index, value),
             // §4.1/D07 runtime typestate guard failed (P3-3): drive the system to
             // its safe state and halt (P5-2).  Host has no safe sequence — it is a
             // signposted system-integrity fault.
@@ -2473,6 +2487,28 @@ impl LlvmBackend {
         self.inst(&format!("store i32 {}, ptr @__ring_{}_count", cc1, ring));
     }
 
+    /// `buffer.set(i, v)` (§5.3, P7-5a): bounds-guarded byte store — an
+    /// out-of-range index is a defined no-op.  Mirrors the C `BufferSet`.
+    fn emit_buffer_set(&mut self, buffer: &str, index: &SirExpr, value: &SirExpr) {
+        let n = self.buffer_info.get(buffer).copied().unwrap_or(0);
+        let arr = n.max(1);
+        let idx = self.emit_expr(index, 32);
+        let v = self.emit_expr(value, 8);
+        let ok = self.fresh();
+        self.inst(&format!("{} = icmp ult i32 {}, {}", ok, idx, n));
+        let set = self.fresh_label("bset");
+        let skip = self.fresh_label("bskip");
+        self.inst(&format!("br i1 {}, label %{}, label %{}", ok, set, skip));
+        self.label(&set);
+        let i64 = self.fresh();
+        self.inst(&format!("{} = zext i32 {} to i64", i64, idx));
+        let slot = self.fresh();
+        self.inst(&format!("{} = getelementptr [{} x i8], ptr @__buf_{}, i64 0, i64 {}", slot, arr, buffer, i64));
+        self.inst(&format!("store i8 {}, ptr {}", v, slot));
+        self.inst(&format!("br label %{}", skip));
+        self.label(&skip);
+    }
+
     /// `let d = ring.pop()` (§5.3, P6-1): dequeue the oldest into `dst`, or 0 if
     /// empty.  Mirrors the C `RingPop` lowering.
     fn emit_ring_pop(&mut self, ring: &str, dst: &str) {
@@ -2626,6 +2662,34 @@ impl LlvmBackend {
                 let t = self.fresh();
                 self.inst(&format!("{} = icmp uge i32 {}, {}", t, c, cap));
                 self.convert(&t, 1, want, false)
+            }
+            // Bounded byte-buffer reads (§5.3, P7-5a): a bounds-guarded byte load
+            // (0 when out of range), and the fixed capacity.
+            SirExpr::BufferGet { buffer, index } => {
+                let n = self.buffer_info.get(buffer).copied().unwrap_or(0);
+                let arr = n.max(1);
+                let idx = self.emit_expr(index, 32);
+                let ok = self.fresh();
+                self.inst(&format!("{} = icmp ult i32 {}, {}", ok, idx, n));
+                // Clamp the gep index so an out-of-range access never loads OOB;
+                // the `select` then forces the result to 0.
+                let safe = self.fresh();
+                self.inst(&format!("{} = select i1 {}, i32 {}, i32 0", safe, ok, idx));
+                let i64 = self.fresh();
+                self.inst(&format!("{} = zext i32 {} to i64", i64, safe));
+                let slot = self.fresh();
+                self.inst(&format!("{} = getelementptr [{} x i8], ptr @__buf_{}, i64 0, i64 {}", slot, arr, buffer, i64));
+                let byte = self.fresh();
+                self.inst(&format!("{} = load i8, ptr {}", byte, slot));
+                let z = self.fresh();
+                self.inst(&format!("{} = zext i8 {} to i32", z, byte));
+                let res = self.fresh();
+                self.inst(&format!("{} = select i1 {}, i32 {}, i32 0", res, ok, z));
+                self.convert(&res, 32, want, false)
+            }
+            SirExpr::BufferLen(b) => {
+                let n = self.buffer_info.get(b).copied().unwrap_or(0);
+                self.convert(&n.to_string(), 32, want, false)
             }
             // Fixed-point mul/div + rescale cast (§4.3, P6-2).
             SirExpr::FixedArith { op, mode, frac_bits, width, signed, lhs, rhs } => {
@@ -2984,6 +3048,7 @@ fn stmt_kind(s: &SirStmt) -> &'static str {
         SirStmt::RegWrite { .. } => "RegWrite",
         SirStmt::RingPush { .. } => "RingPush",
         SirStmt::RingPop { .. } => "RingPop",
+        SirStmt::BufferSet { .. } => "BufferSet",
         SirStmt::If { .. } => "If",
         SirStmt::Exit(_) => "Exit",
         SirStmt::DriveSafe => "DriveSafe",
@@ -3012,6 +3077,8 @@ fn expr_kind(e: &SirExpr) -> &'static str {
         SirExpr::RingLen(_) => "RingLen",
         SirExpr::RingEmpty(_) => "RingEmpty",
         SirExpr::RingFull(_) => "RingFull",
+        SirExpr::BufferGet { .. } => "BufferGet",
+        SirExpr::BufferLen(_) => "BufferLen",
         SirExpr::FloatLit { .. } => "FloatLit",
         SirExpr::FloatArith { .. } => "FloatArith",
     }

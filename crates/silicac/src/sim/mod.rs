@@ -261,6 +261,8 @@ struct Sim<'m> {
     cell_names: std::collections::HashSet<String>,
     /// Bounded `ring<T, N>` storage (§5.3): name → (queue, capacity).
     rings: HashMap<String, (std::collections::VecDeque<u64>, u32)>,
+    /// Bounded `buffer<N>` storage (§5.3, P7-5a): name → its `N` backing bytes.
+    buffers: HashMap<String, Vec<u8>>,
     /// Per-reaction single-live-activation flag (§5.1).
     in_flight: Vec<bool>,
     /// Per-reaction activation generation, bumped each fire, so a stale `within`
@@ -308,6 +310,7 @@ pub fn run(module: &SirModule) -> SimResult {
         cells: HashMap::new(),
         cell_names,
         rings: HashMap::new(),
+        buffers: HashMap::new(),
         bus_busy: HashMap::new(),
         bus_waiters: HashMap::new(),
         in_flight: vec![false; module.reactions.len()],
@@ -368,6 +371,9 @@ impl<'m> Sim<'m> {
         for var in &self.module.vars {
             if let SirType::Ring { cap, .. } = var.ty {
                 self.rings.insert(var.name.clone(), (std::collections::VecDeque::new(), cap));
+            } else if let SirType::Buffer { bytes } = var.ty {
+                // A bounded buffer starts zeroed (§5.3, P7-5a).
+                self.buffers.insert(var.name.clone(), vec![0u8; bytes as usize]);
             } else {
                 self.cells.insert(var.name.clone(), const_value(&var.init));
             }
@@ -926,6 +932,16 @@ impl<'m> Sim<'m> {
                     kind: TraceKind::RingOp { ring: ring.clone(), op: "pop".into(), len },
                 });
             }
+            SirStmt::BufferSet { buffer, index, value } => {
+                let i = self.eval_expr(index, frame) as usize;
+                let v = self.eval_expr(value, frame) as u8;
+                if let Some(buf) = self.buffers.get_mut(buffer) {
+                    // Bounded write (§5.3): an out-of-range index is a defined no-op.
+                    if i < buf.len() {
+                        buf[i] = v;
+                    }
+                }
+            }
             SirStmt::If { cond, then } => {
                 if self.eval_expr(cond, frame) != 0 {
                     self.eval_stmts(then, frame);
@@ -1152,6 +1168,13 @@ impl<'m> Sim<'m> {
                 .get(r)
                 .map(|(q, cap)| (q.len() as u32 >= *cap) as u64)
                 .unwrap_or(0),
+            // Bounded byte-buffer reads (§5.3, P7-5a): a bounds-guarded byte load
+            // (0 when out of range), and the fixed capacity.
+            SirExpr::BufferGet { buffer, index } => {
+                let i = self.eval_expr(index, frame) as usize;
+                self.buffers.get(buffer).and_then(|b| b.get(i)).map(|&x| x as u64).unwrap_or(0)
+            }
+            SirExpr::BufferLen(b) => self.buffers.get(b).map(|buf| buf.len() as u64).unwrap_or(0),
         }
     }
 
