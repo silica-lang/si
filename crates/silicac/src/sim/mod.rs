@@ -335,12 +335,13 @@ pub fn run(module: &SirModule) -> SimResult {
     SimResult { trace: sim.trace, stdout: sim.stdout }
 }
 
-/// Collect `(device, reg_offset)` for every read-to-clear (`rc`) register read
-/// in `expr` (§4.2/D04, P0-2b).
+/// Collect `(device, reg_offset)` for every register read whose read has a
+/// clearing side effect (`rc` *or* `pop_on_read`/`side_effect` — audit #35
+/// P7-6a, generalising the P0-2b `rc`-only tracking) in `expr` (§4.2/D04).
 fn collect_rc_reads(expr: &SirExpr, out: &mut Vec<(usize, u64)>) {
     match expr {
-        SirExpr::RegLoad { device, reg_offset, access, .. } => {
-            if matches!(access, SirRegAccess::Rc) {
+        SirExpr::RegLoad { device, reg_offset, read_clears, .. } => {
+            if *read_clears {
                 out.push((*device, *reg_offset));
             }
         }
@@ -983,7 +984,12 @@ impl<'m> Sim<'m> {
                 }
             }
             SirStmt::If { cond, then } => {
-                if self.eval_expr(cond, frame) != 0 {
+                let take = self.eval_expr(cond, frame) != 0;
+                // P7-6a: a read-clearing register read buried in the condition
+                // clears it too — apply the effect before the branch body runs, so
+                // a re-read inside `then` sees the cleared value (as on metal).
+                self.apply_read_clears(cond);
+                if take {
                     self.eval_stmts(then, frame);
                 }
             }
@@ -1001,6 +1007,7 @@ impl<'m> Sim<'m> {
                 // bound elapses and the fault is raised (the activation loop
                 // disposes of it — §3.2/§4.4).
                 let ok = self.eval_expr(cond, frame) != 0;
+                self.apply_read_clears(cond); // P7-6a: a poll condition read clears too
                 self.trace.push(TraceRecord {
                     at_ns: self.now,
                     kind: TraceKind::Poll { code: fault_code.clone(), satisfied: ok },
@@ -1014,6 +1021,7 @@ impl<'m> Sim<'m> {
                 // reached for an `await` nested in an `if`/critical, which cannot
                 // suspend — fall back to a single deterministic check (§5.2).
                 let ok = self.eval_expr(cond, frame) != 0;
+                self.apply_read_clears(cond); // P7-6a: an await condition read clears too
                 self.trace.push(TraceRecord {
                     at_ns: self.now,
                     kind: TraceKind::Await { code: fault_code.clone(), resolved: ok },
@@ -1096,10 +1104,11 @@ impl<'m> Sim<'m> {
         });
     }
 
-    /// Model read-to-clear (`rc`) reads (§4.2/D04, P0-2b): after an expression
-    /// is evaluated, zero any register read with `rc` access.  Only reads in
-    /// assignment-RHS position are modelled today; reads buried in conditions
-    /// are a documented follow-up.
+    /// Model read-clearing register reads (§4.2/D04): after an expression is
+    /// evaluated, zero any register whose read has a clearing side effect (`rc`
+    /// or `pop_on_read`).  Applied in every read position — assignment RHS *and*
+    /// `if`/`poll`/`await` conditions (audit #35 P7-6a extended the P0-2b
+    /// RHS-only, `rc`-only tracking).
     fn apply_read_clears(&mut self, expr: &SirExpr) {
         let mut hits = Vec::new();
         collect_rc_reads(expr, &mut hits);

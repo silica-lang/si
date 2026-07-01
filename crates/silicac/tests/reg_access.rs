@@ -121,6 +121,59 @@ fn sim_models_read_to_clear() {
     assert!(out.contains("cell c = 0"), "second rc read returns 0 (read cleared it):\n{out}");
 }
 
+fn run_sim(dev: &str, dev_name: &str, body: &str, cells: &str) -> String {
+    let src = format!(
+        "{dev}\n{BOARD}\nprogram p {{\n  use board b as bb\n  let d = bb.dev0\n{cells}\n  on sys.start {{ {body} }}\n}}\nsim s for p {{ run until 1ms }}\n"
+    )
+    .replace("dev0 : statusdev", &format!("dev0 : {dev_name}"));
+    let tokens = lexer::lex(&src).expect("lex");
+    let ast = parser::parse(tokens).expect("parse");
+    let sir: SirModule = resolver::resolve(&ast)
+        .unwrap_or_else(|e| panic!("resolve: {:?}", e.iter().map(|d| &d.msg).collect::<Vec<_>>()));
+    sim::run(&sir).render(&sir)
+}
+
+#[test]
+fn rc_read_inside_a_poll_condition_clears_the_register() {
+    // P7-6a: a read-to-clear register read buried in a `poll` condition clears it
+    // too — so a later read sees 0 (matching metal, where the volatile read
+    // clears in hardware).  Before P7-6a only assignment-RHS reads cleared, so a
+    // condition read left the register stale.  `poll SR.rdy == 1` reads SR (rc);
+    // once satisfied, SR must read back as 0.
+    let dev = "device pdev { regs { SR : reg32 at 0x0 access rc { rdy: bit[0] } } ops { \
+        op seed(v: u32) -> () { SR = v } \
+        op wait() -> () or fault{timeout} { poll SR.rdy == 1 within 2ms else fault timeout } \
+        op get() -> u32 { return SR } } }";
+    let src = format!(
+        "{dev}\n{BOARD}\nprogram p {{\n  use board b as bb\n  let d = bb.dev0\n  cell c : u32 = 9\n  every 1000ms on fault skip {{ d.seed(1)  d.wait()?  c = d.get() }}\n}}\nsim s for p {{ run until 1500ms }}\n"
+    )
+    .replace("dev0 : statusdev", "dev0 : pdev");
+    let tokens = lexer::lex(&src).expect("lex");
+    let ast = parser::parse(tokens).expect("parse");
+    let sir: SirModule = resolver::resolve(&ast)
+        .unwrap_or_else(|e| panic!("resolve: {:?}", e.iter().map(|d| &d.msg).collect::<Vec<_>>()));
+    let out = sim::run(&sir).render(&sir);
+    assert!(out.contains("poll — satisfied"), "poll should be satisfied (SR.rdy seeded to 1):\n{out}");
+    assert!(out.contains("cell c = 0"), "the poll condition read must have cleared SR:\n{out}");
+}
+
+#[test]
+fn pop_on_read_register_read_clears_even_though_access_is_rw() {
+    // P7-6a generalises the tracking from `rc`-only to any read-side-effect: a
+    // `pop_on_read` register is `rw`, so the old `access == Rc` check missed it.
+    let dev = "device pr { regs { ST : reg32 at 0x0 access rw pop_on_read {} } ops { \
+        op seed(v: u32) -> () { ST = v } \
+        op get() -> u32 { return ST } } }";
+    let out = run_sim(
+        dev,
+        "pr",
+        "d.seed(7)  a = d.get()  c = d.get()",
+        "  cell a : u32 = 0\n  cell c : u32 = 9",
+    );
+    assert!(out.contains("cell a = 7"), "first read returns the seeded value:\n{out}");
+    assert!(out.contains("cell c = 0"), "pop_on_read must clear on read (access is rw):\n{out}");
+}
+
 #[test]
 fn per_field_w1c_in_an_rw_register_lowers_to_a_single_write() {
     // A `w1c` field overriding its `rw` register: writing it must NOT read-

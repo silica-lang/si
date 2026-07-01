@@ -393,6 +393,11 @@ pub enum SirExpr {
         field_mask: u64,
         field_shift: u8,
         access: SirRegAccess,
+        /// Reading this register has a side effect that clears it (`rc`, or the
+        /// `pop_on_read`/`side_effect` modifier on an otherwise-`rw` register) —
+        /// §4.2/D04, audit #35 P7-6a.  The sim zeroes the register after any read
+        /// (assignment RHS *or* condition); on metal the hardware does it.
+        read_clears: bool,
     },
     /// `!<inner>` — boolean not.
     Not(Box<SirExpr>),
