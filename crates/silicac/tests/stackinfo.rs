@@ -28,11 +28,16 @@ fn callgraph_measure_sums_chains_per_priority() {
     assert_eq!(g.edges["SysTick_Handler"], vec!["__reaction_0".to_string()]);
 
     // base = max(Reset 72 + reaction 56, headroom 512) = 512;
-    // + SysTick chain (8 + 56) + EXC_FRAME 64 = 128  ⇒  640
-    let m = stackinfo::measure(&g).expect("measure");
+    // + SysTick chain (8 + 56) + EXC_FRAME_BASE 64 = 128  ⇒  640  (no FPU)
+    let m = stackinfo::measure(&g, false).expect("measure");
     assert_eq!(m.bytes, 640);
     assert_eq!(m.source, "callgraph");
     assert!(!m.any_dynamic);
+
+    // P7-2: on an FPU-bearing SoC the per-level frame is 104 B, so the SysTick
+    // chain reserves 40 B more ⇒ 680.
+    let fp = stackinfo::measure(&g, true).expect("measure");
+    assert_eq!(fp.bytes, 680);
 }
 
 #[test]
@@ -41,15 +46,15 @@ fn su_fallback_is_a_sound_upper_bound() {
     assert_eq!(frames[0], FuncFrame { name: "__reaction_0".into(), bytes: 56, dynamic: false });
     // The .su fallback (no edges) sums all frames + EXC per ISR + headroom, so
     // it must be >= the tight call-graph number for the same program.
-    let su = stackinfo::measure_su(&frames);
-    let ci = stackinfo::measure(&stackinfo::parse_ci(CI)).unwrap();
+    let su = stackinfo::measure_su(&frames, false);
+    let ci = stackinfo::measure(&stackinfo::parse_ci(CI), false).unwrap();
     assert!(su.bytes >= ci.bytes, "su {} should bound ci {}", su.bytes, ci.bytes);
     assert_eq!(su.source, "stack-usage");
 }
 
 #[test]
 fn enforce_is_the_authoritative_measured_budget() {
-    let m = stackinfo::measure(&stackinfo::parse_ci(CI)).unwrap();
+    let m = stackinfo::measure(&stackinfo::parse_ci(CI), false).unwrap();
     // Fits a real 256 KB nRF52840: returns statics + measured stack.
     assert_eq!(stackinfo::enforce(&m, 1, 262_144).unwrap(), 1 + m.bytes);
     // Over a tiny region: hard error.
@@ -59,7 +64,7 @@ fn enforce_is_the_authoritative_measured_budget() {
     let dynamic = stackinfo::parse_ci(
         r#"node: { title: "Reset_Handler" label: "Reset_Handler\n16 bytes (dynamic)\n1 dynamic objects" }"#,
     );
-    let dm = stackinfo::measure(&dynamic).unwrap();
+    let dm = stackinfo::measure(&dynamic, false).unwrap();
     assert!(stackinfo::enforce(&dm, 0, 262_144).is_err());
 }
 

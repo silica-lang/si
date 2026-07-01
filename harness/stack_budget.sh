@@ -45,4 +45,20 @@ if [[ -e "$WORK/over.elf" ]]; then
 fi
 echo "PASS: oversized program rejected at compile time (no firmware emitted)."
 
-echo "PASS: measured RAM-budget gate (P0-1b)."
+echo "== float program: measured budget must reserve the 104 B FP frame (P7-2) =="
+# A float-using program on an FPU-bearing SoC can lazily stack a 104 B FP
+# exception frame per preemption level, not the 64 B basic frame (audit #35
+# Finding B).  Build a real float program through the toolchain's own
+# (-fcallgraph-info) measured path and confirm the FPU-aware budget is reported.
+FP="$REPO/examples/float_nrf52840.si"
+fp_log="$WORK/fp.log"
+if ! cargo run -q -- --target metal-nrf52840 "$FP" -o "$WORK/fp.elf" 2>"$fp_log"; then
+  echo "FAIL: float program did not build"; cat "$fp_log"; exit 1
+fi
+cat "$fp_log"
+if ! grep -q "RAM budget (measured)" "$fp_log"; then
+  echo "FAIL: no measured RAM budget for the float build (FPU measured path not exercised)"; exit 1
+fi
+echo "PASS: float program built with an FPU-aware measured budget."
+
+echo "PASS: measured RAM-budget gate (P0-1b) + FP-frame soundness (P7-2)."

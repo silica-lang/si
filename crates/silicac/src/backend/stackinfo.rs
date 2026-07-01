@@ -18,10 +18,26 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-/// Cortex-M hardware exception stack frame pushed per preemption level (basic
-/// frame is 32 B; 104 B with FP context — 64 B is the conservative middle, and
-/// the same value the SIR estimate uses, `super::c::EXC_FRAME`).
-const EXC_FRAME: u64 = 64;
+/// Cortex-M hardware exception stack frame pushed per preemption level, without
+/// FP context: the basic frame is 32 B; 64 B is the conservative value used when
+/// the SoC has no FPU (matches the SIR estimate `super::c::EXC_FRAME`).
+const EXC_FRAME_BASE: u64 = 64;
+/// Exception frame *with* FP context stacked: basic 32 B + S0–S15 (64 B) + FPSCR
+/// + reserved word = 104 B (audit #35 P7-2 / Finding B).  A float-using reaction
+/// on an FPU-bearing SoC (P6-8 made hardware float real) can lazily stack this,
+/// so under `module.fpu` the measured bound must reserve 104 B per level or it
+/// under-counts by up to 40 B/level.
+const EXC_FRAME_FP: u64 = 104;
+
+/// The per-preemption-level exception frame size: 104 B when FP context can be
+/// stacked (an FPU-bearing SoC), else the conservative 64 B.
+fn exc_frame(fpu: bool) -> u64 {
+    if fpu {
+        EXC_FRAME_FP
+    } else {
+        EXC_FRAME_BASE
+    }
+}
 /// Thread-mode headroom (startup / idle context) — a floor on the base context.
 const STACK_HEADROOM: u64 = 512;
 
@@ -141,15 +157,16 @@ fn label_bytes(label: &str) -> (u64, bool) {
 /// chain + one `EXC_FRAME` per present ISR chain + headroom.  Errors if the
 /// graph contains a cycle (recursion is banned, so this signals a bad parse or
 /// an unexpected toolchain construct rather than a real program).
-pub fn measure(graph: &CallGraph) -> Result<MeasuredStack, String> {
+pub fn measure(graph: &CallGraph, fpu: bool) -> Result<MeasuredStack, String> {
     let any_dynamic = graph.nodes.values().any(|f| f.dynamic);
+    let exc = exc_frame(fpu);
 
     let base = chain_stack(graph, THREAD_ENTRY)?;
     let mut total = base.max(STACK_HEADROOM);
     for isr in ISR_ENTRIES {
         if graph.nodes.contains_key(*isr) {
             let cs = chain_stack(graph, isr)?;
-            total = total.saturating_add(EXC_FRAME.saturating_add(cs));
+            total = total.saturating_add(exc.saturating_add(cs));
         }
     }
     Ok(MeasuredStack { bytes: total, any_dynamic, source: "callgraph" })
@@ -190,13 +207,13 @@ fn chain_stack(graph: &CallGraph, entry: &str) -> Result<u64, String> {
 /// function's frame — i.e. assumes the whole program is one call chain — plus an
 /// `EXC_FRAME` per ISR present and the thread headroom.  Loose, but a sound
 /// upper bound; only used when `.ci` is unavailable.
-pub fn measure_su(frames: &[FuncFrame]) -> MeasuredStack {
+pub fn measure_su(frames: &[FuncFrame], fpu: bool) -> MeasuredStack {
     let any_dynamic = frames.iter().any(|f| f.dynamic);
     let sum: u64 = frames.iter().map(|f| f.bytes).fold(0, u64::saturating_add);
     let n_isr = frames.iter().filter(|f| ISR_ENTRIES.contains(&f.name.as_str())).count() as u64;
     let bytes = STACK_HEADROOM
         .saturating_add(sum)
-        .saturating_add(EXC_FRAME.saturating_mul(n_isr));
+        .saturating_add(exc_frame(fpu).saturating_mul(n_isr));
     MeasuredStack { bytes, any_dynamic, source: "stack-usage" }
 }
 
@@ -228,12 +245,12 @@ pub fn enforce(measured: &MeasuredStack, statics: u64, ram_size: u64) -> Result<
 /// Read `<dir>/<base>.ci` (preferred) or `<dir>/<base>.su` (fallback) and
 /// compute the measured worst-case stack.  Returns `None` if neither dump is
 /// present/usable (e.g. a non-GCC `--cc`), so callers degrade to the estimate.
-pub fn from_dump_dir(dir: &Path, base: &str) -> Option<MeasuredStack> {
+pub fn from_dump_dir(dir: &Path, base: &str, fpu: bool) -> Option<MeasuredStack> {
     let ci = dir.join(format!("{base}.ci"));
     if let Ok(text) = std::fs::read_to_string(&ci) {
         let g = parse_ci(&text);
         if !g.nodes.is_empty() {
-            if let Ok(m) = measure(&g) {
+            if let Ok(m) = measure(&g, fpu) {
                 return Some(m);
             }
             // A cycle/parse oddity in .ci — fall through to the .su fallback.
@@ -243,7 +260,7 @@ pub fn from_dump_dir(dir: &Path, base: &str) -> Option<MeasuredStack> {
     if let Ok(text) = std::fs::read_to_string(&su) {
         let frames = parse_su(&text);
         if !frames.is_empty() {
-            return Some(measure_su(&frames));
+            return Some(measure_su(&frames, fpu));
         }
     }
     None
@@ -295,18 +312,29 @@ edge: { sourcename: "Reset_Handler" targetname: "__reaction_0" label: "/tmp/x.c:
     #[test]
     fn measure_walks_chains_per_priority() {
         // base = max(Reset 72 + reaction 56 = 128, headroom 512) = 512
-        // + SysTick chain (8 + 56 = 64) + EXC_FRAME 64 = 128
-        // total = 640
-        let m = measure(&parse_ci(CI)).expect("measure");
+        // + SysTick chain (8 + 56 = 64) + EXC_FRAME_BASE 64 = 128
+        // total = 640  (no FPU)
+        let m = measure(&parse_ci(CI), false).expect("measure");
         assert_eq!(m.bytes, 640);
         assert_eq!(m.source, "callgraph");
         assert!(!m.any_dynamic);
     }
 
     #[test]
+    fn measure_reserves_the_fp_frame_when_fpu() {
+        // P7-2 / Finding B: with an FPU the per-level exception frame is 104 B,
+        // not 64 B — 40 B more per preempting ISR chain.  Same graph, fpu=true:
+        // 512 base + SysTick chain 64 + EXC_FRAME_FP 104 = 680 (= 640 + 40).
+        let base = measure(&parse_ci(CI), false).expect("measure").bytes;
+        let fp = measure(&parse_ci(CI), true).expect("measure").bytes;
+        assert_eq!(fp, 680);
+        assert_eq!(fp - base, EXC_FRAME_FP - EXC_FRAME_BASE);
+    }
+
+    #[test]
     fn dynamic_frame_is_flagged() {
         let ci = r#"node: { title: "Reset_Handler" label: "Reset_Handler\n16 bytes (dynamic)\n1 dynamic objects" }"#;
-        let m = measure(&parse_ci(ci)).expect("measure");
+        let m = measure(&parse_ci(ci), false).expect("measure");
         assert!(m.any_dynamic);
     }
 
@@ -317,16 +345,24 @@ edge: { sourcename: "Reset_Handler" targetname: "__reaction_0" label: "/tmp/x.c:
         g.nodes.insert("a".into(), FuncFrame { name: "a".into(), bytes: 8, dynamic: false });
         g.edges.insert("SysTick_Handler".into(), vec!["a".into()]);
         g.edges.insert("a".into(), vec!["SysTick_Handler".into()]);
-        let err = measure(&g).unwrap_err();
+        let err = measure(&g, false).unwrap_err();
         assert!(err.contains("cycle"), "got: {err}");
     }
 
     #[test]
     fn su_fallback_is_a_sound_sum() {
-        // headroom 512 + (56+8+72)=136 + 1 ISR * EXC_FRAME 64 = 712
-        let m = measure_su(&parse_su(SU));
+        // headroom 512 + (56+8+72)=136 + 1 ISR * EXC_FRAME_BASE 64 = 712
+        let m = measure_su(&parse_su(SU), false);
         assert_eq!(m.bytes, 712);
         assert_eq!(m.source, "stack-usage");
+    }
+
+    #[test]
+    fn su_fallback_reserves_the_fp_frame_when_fpu() {
+        // Same frames, fpu=true: the single ISR reserves 104 B not 64 B →
+        // 512 + 136 + 104 = 752 (= 712 + 40).
+        let m = measure_su(&parse_su(SU), true);
+        assert_eq!(m.bytes, 752);
     }
 
     fn measured(bytes: u64, any_dynamic: bool) -> MeasuredStack {

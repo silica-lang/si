@@ -76,6 +76,37 @@ fn ram_budget_within_region() {
 }
 
 #[test]
+fn fpu_soc_reserves_the_larger_exception_frame() {
+    // P7-2 / Finding B: hardware float is real (P6-8), so on an FPU-bearing SoC a
+    // preempting reaction can lazily stack a 104 B FP exception frame, not the
+    // 64 B basic frame.  The worst-case stack must reserve the extra 40 B/level or
+    // it under-counts.  Same program, same reaction (one priority level) — only
+    // the `fpu` soc line differs — so the reserve grows by exactly 40 B.
+    let prog = |fpu: &str| {
+        format!(
+            r#"
+board dk {{
+  soc s {{
+    memory {{ flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K }}
+    {fpu}
+  }}
+}}
+program p {{
+  use board dk as dev
+  cell v : u32 = 0
+  every 100ms {{ v = v + 1 }}
+}}
+"#
+        )
+    };
+    let no_fpu = compile(&prog(""));
+    let with_fpu = compile(&prog("fpu"));
+    assert!(!no_fpu.fpu && with_fpu.fpu, "the fpu flag must track the soc declaration");
+    let delta = c::worst_case_stack(&with_fpu) - c::worst_case_stack(&no_fpu);
+    assert_eq!(delta, 40, "FPU must reserve 104-64 = 40 B more per reaction level");
+}
+
+#[test]
 fn ram_budget_exceeded_is_an_error() {
     // A RAM region too small to hold even the reserved stack.
     let src = r#"

@@ -2622,8 +2622,13 @@ fn c_escape_bytes(bytes: &[u8]) -> String {
 const STACK_WORD: u64 = 4;
 /// Per active handler frame: saved registers + call args + spill headroom.
 const FRAME_OVERHEAD: u64 = 96;
-/// Cortex-M hardware exception stack frame pushed per nesting level.
+/// Cortex-M hardware exception stack frame pushed per nesting level, without FP
+/// context (basic frame is 32 B; 64 B is the conservative no-FPU value).
 const EXC_FRAME: u64 = 64;
+/// Exception frame with FP context stacked: 32 B basic + S0–S15 + FPSCR +
+/// reserved = 104 B.  Used when the SoC has an FPU (P6-8/P7-2 Finding B) so the
+/// SIR estimate stays consistent with the measured `stackinfo` bound.
+const EXC_FRAME_FP: u64 = 104;
 /// Base context (main / startup / idle loop) plus headroom.
 const STACK_BASE: u64 = 512;
 
@@ -2716,12 +2721,15 @@ pub fn enforce_flash(text: u64, data: u64, flash_size: u64) -> Result<u64, Strin
 /// the resolver.
 pub fn worst_case_stack(module: &SirModule) -> u64 {
     let globals: HashSet<&str> = module.vars.iter().map(|v| v.name.as_str()).collect();
+    // FP context (104 B) is stacked per preemption level on an FPU-bearing SoC
+    // (P7-2); otherwise the conservative 64 B basic frame.
+    let exc_frame = if module.fpu { EXC_FRAME_FP } else { EXC_FRAME };
     // Largest frame seen at each distinct priority level.
     let mut by_level: BTreeMap<u8, u64> = BTreeMap::new();
     for r in &module.reactions {
         let mut frame = HashSet::new();
         count_frame_vars(&r.body, &globals, &mut frame);
-        let bytes = frame.len() as u64 * STACK_WORD + FRAME_OVERHEAD + EXC_FRAME;
+        let bytes = frame.len() as u64 * STACK_WORD + FRAME_OVERHEAD + exc_frame;
         let slot = by_level.entry(r.priority).or_insert(0);
         *slot = (*slot).max(bytes);
     }
