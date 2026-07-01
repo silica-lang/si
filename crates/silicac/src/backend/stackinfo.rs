@@ -44,12 +44,18 @@ const STACK_HEADROOM: u64 = 512;
 /// Thread-mode entry (startup + WFI idle loop); does not push an `EXC_FRAME`.
 pub const THREAD_ENTRY: &str = "Reset_Handler";
 /// Interrupt entry points: each can preempt, so each adds one `EXC_FRAME` on top
-/// of the thread context (a sound over-approximation of nesting depth).
+/// of the thread context (a sound over-approximation of nesting depth).  These
+/// must be the handlers the backends actually emit (audit #35 issue #83): the
+/// TIMER1/TIMER2 ISRs replaced SysTick in P6-6, and `__hardfault_decode` — not
+/// the naked `HardFault_Handler` trampoline (P7-4b) — carries the real
+/// HardFault-level frame (GCC's `-fcallgraph-info` doesn't see the trampoline's
+/// asm tail-branch, so walking from `HardFault_Handler` would measure ~0).
 pub const ISR_ENTRIES: &[&str] = &[
-    "SysTick_Handler",
-    "GPIOTE_IRQHandler",
-    "__BUS_IRQHandler",
-    "HardFault_Handler",
+    "TIMER1_IRQHandler",  // `every` reactions (P1-4)
+    "TIMER2_IRQHandler",  // now()/deadline/await/watchdog tick (P6-6)
+    "GPIOTE_IRQHandler",  // `on <pin>` events
+    "__BUS_IRQHandler",   // bus completion
+    "__hardfault_decode", // HardFault decoder's real frame (naked-trampoline target, P7-4b)
 ];
 
 /// One function's measured frame.
@@ -279,13 +285,13 @@ mod tests {
     // Verbatim shapes from arm-none-eabi-gcc 15.2 (-Os inlines single-use
     // statics, so leaf/__react_*_run fold into __reaction_0's frame).
     const SU: &str = "/tmp/x.c:5:6:__reaction_0\t56\tstatic\n\
-                      /tmp/x.c:6:6:SysTick_Handler\t8\tstatic\n\
+                      /tmp/x.c:6:6:TIMER1_IRQHandler\t8\tstatic\n\
                       /tmp/x.c:7:6:Reset_Handler\t72\tstatic\n";
 
     const CI: &str = r#"graph: { title: "/tmp/x.c"
 node: { title: "__reaction_0" label: "__reaction_0\n/tmp/x.c:5:6\n56 bytes (static)\n0 dynamic objects" }
-node: { title: "SysTick_Handler" label: "SysTick_Handler\n/tmp/x.c:6:6\n8 bytes (static)\n0 dynamic objects" }
-edge: { sourcename: "SysTick_Handler" targetname: "__reaction_0" label: "/tmp/x.c:6:30" }
+node: { title: "TIMER1_IRQHandler" label: "TIMER1_IRQHandler\n/tmp/x.c:6:6\n8 bytes (static)\n0 dynamic objects" }
+edge: { sourcename: "TIMER1_IRQHandler" targetname: "__reaction_0" label: "/tmp/x.c:6:30" }
 node: { title: "Reset_Handler" label: "Reset_Handler\n/tmp/x.c:7:6\n72 bytes (static)\n0 dynamic objects" }
 edge: { sourcename: "Reset_Handler" targetname: "__reaction_0" label: "/tmp/x.c:6:30" }
 }"#;
@@ -295,7 +301,7 @@ edge: { sourcename: "Reset_Handler" targetname: "__reaction_0" label: "/tmp/x.c:
         let f = parse_su(SU);
         assert_eq!(f.len(), 3);
         assert_eq!(f[0], FuncFrame { name: "__reaction_0".into(), bytes: 56, dynamic: false });
-        assert_eq!(f[1].name, "SysTick_Handler");
+        assert_eq!(f[1].name, "TIMER1_IRQHandler");
         assert_eq!(f[2].bytes, 72);
         assert!(!f.iter().any(|x| x.dynamic));
     }
@@ -304,15 +310,15 @@ edge: { sourcename: "Reset_Handler" targetname: "__reaction_0" label: "/tmp/x.c:
     fn ci_parses_nodes_and_edges() {
         let g = parse_ci(CI);
         assert_eq!(g.nodes["__reaction_0"].bytes, 56);
-        assert_eq!(g.nodes["SysTick_Handler"].bytes, 8);
+        assert_eq!(g.nodes["TIMER1_IRQHandler"].bytes, 8);
         assert_eq!(g.nodes["Reset_Handler"].bytes, 72);
-        assert_eq!(g.edges["SysTick_Handler"], vec!["__reaction_0".to_string()]);
+        assert_eq!(g.edges["TIMER1_IRQHandler"], vec!["__reaction_0".to_string()]);
     }
 
     #[test]
     fn measure_walks_chains_per_priority() {
         // base = max(Reset 72 + reaction 56 = 128, headroom 512) = 512
-        // + SysTick chain (8 + 56 = 64) + EXC_FRAME_BASE 64 = 128
+        // + TIMER1 chain (8 + 56 = 64) + EXC_FRAME_BASE 64 = 128
         // total = 640  (no FPU)
         let m = measure(&parse_ci(CI), false).expect("measure");
         assert_eq!(m.bytes, 640);
@@ -324,11 +330,53 @@ edge: { sourcename: "Reset_Handler" targetname: "__reaction_0" label: "/tmp/x.c:
     fn measure_reserves_the_fp_frame_when_fpu() {
         // P7-2 / Finding B: with an FPU the per-level exception frame is 104 B,
         // not 64 B — 40 B more per preempting ISR chain.  Same graph, fpu=true:
-        // 512 base + SysTick chain 64 + EXC_FRAME_FP 104 = 680 (= 640 + 40).
+        // 512 base + TIMER1 chain 64 + EXC_FRAME_FP 104 = 680 (= 640 + 40).
         let base = measure(&parse_ci(CI), false).expect("measure").bytes;
         let fp = measure(&parse_ci(CI), true).expect("measure").bytes;
         assert_eq!(fp, 680);
         assert_eq!(fp - base, EXC_FRAME_FP - EXC_FRAME_BASE);
+    }
+
+    // issue #83: the real post-P6-6 ISRs (TIMER1/TIMER2) and the P7-4b HardFault
+    // decoder frame must all be walked — the stale list missed them, under-counting.
+    const CI_ISRS: &str = r#"graph: { title: "/tmp/x.c"
+node: { title: "__reaction_0" label: "__reaction_0\n56 bytes (static)\n0 dynamic objects" }
+node: { title: "Reset_Handler" label: "Reset_Handler\n72 bytes (static)\n0 dynamic objects" }
+edge: { sourcename: "Reset_Handler" targetname: "__reaction_0" label: "x" }
+node: { title: "TIMER1_IRQHandler" label: "TIMER1_IRQHandler\n8 bytes (static)\n0 dynamic objects" }
+edge: { sourcename: "TIMER1_IRQHandler" targetname: "__reaction_0" label: "x" }
+node: { title: "TIMER2_IRQHandler" label: "TIMER2_IRQHandler\n16 bytes (static)\n0 dynamic objects" }
+node: { title: "__hardfault_decode" label: "__hardfault_decode\n24 bytes (static)\n0 dynamic objects" }
+}"#;
+
+    #[test]
+    fn timer_and_hardfault_decode_isrs_are_all_counted() {
+        // base 512 + TIMER1 (64 EXC + 8+56 chain = 128) + TIMER2 (64 + 16 = 80)
+        // + __hardfault_decode (64 + 24 = 88) = 808.
+        let m = measure(&parse_ci(CI_ISRS), false).expect("measure");
+        assert_eq!(m.bytes, 808);
+        // Each of the three ISRs genuinely contributes (removing them drops the budget).
+        let base_only = r#"node: { title: "Reset_Handler" label: "Reset_Handler\n72 bytes (static)\n0 dynamic objects" }"#;
+        assert!(m.bytes > measure(&parse_ci(base_only), false).unwrap().bytes + 128);
+    }
+
+    #[test]
+    fn the_measured_hardfault_entry_is_the_decoder_not_the_trampoline() {
+        // P7-4b: HardFault_Handler is a ~0-byte naked trampoline; the real frame is
+        // in __hardfault_decode, and only that is an ISR entry.  A graph with a bare
+        // HardFault_Handler node (and no __hardfault_decode) adds no HardFault frame.
+        let trampoline_only = r#"graph: { title: "t"
+node: { title: "Reset_Handler" label: "Reset_Handler\n72 bytes (static)\n0 dynamic objects" }
+node: { title: "HardFault_Handler" label: "HardFault_Handler\n0 bytes (static)\n0 dynamic objects" }
+}"#;
+        // No ISR entry present → just the base context (max of Reset 72, headroom 512).
+        assert_eq!(measure(&parse_ci(trampoline_only), false).unwrap().bytes, STACK_HEADROOM);
+        // With the decoder node it IS counted: 512 + (64 EXC + 24) = 600.
+        let with_decoder = r#"graph: { title: "d"
+node: { title: "Reset_Handler" label: "Reset_Handler\n72 bytes (static)\n0 dynamic objects" }
+node: { title: "__hardfault_decode" label: "__hardfault_decode\n24 bytes (static)\n0 dynamic objects" }
+}"#;
+        assert_eq!(measure(&parse_ci(with_decoder), false).unwrap().bytes, 600);
     }
 
     #[test]
@@ -341,10 +389,10 @@ edge: { sourcename: "Reset_Handler" targetname: "__reaction_0" label: "/tmp/x.c:
     #[test]
     fn cycle_is_an_error() {
         let mut g = CallGraph::default();
-        g.nodes.insert("SysTick_Handler".into(), FuncFrame { name: "SysTick_Handler".into(), bytes: 8, dynamic: false });
+        g.nodes.insert("TIMER1_IRQHandler".into(), FuncFrame { name: "TIMER1_IRQHandler".into(), bytes: 8, dynamic: false });
         g.nodes.insert("a".into(), FuncFrame { name: "a".into(), bytes: 8, dynamic: false });
-        g.edges.insert("SysTick_Handler".into(), vec!["a".into()]);
-        g.edges.insert("a".into(), vec!["SysTick_Handler".into()]);
+        g.edges.insert("TIMER1_IRQHandler".into(), vec!["a".into()]);
+        g.edges.insert("a".into(), vec!["TIMER1_IRQHandler".into()]);
         let err = measure(&g, false).unwrap_err();
         assert!(err.contains("cycle"), "got: {err}");
     }

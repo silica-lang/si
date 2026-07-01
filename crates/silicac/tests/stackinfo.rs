@@ -11,30 +11,30 @@ use silicac::backend::Target;
 // into its caller's frame (here, __reaction_0).
 const CI: &str = r#"graph: { title: "/tmp/x.c"
 node: { title: "__reaction_0" label: "__reaction_0\n/tmp/x.c:5:6\n56 bytes (static)\n0 dynamic objects" }
-node: { title: "SysTick_Handler" label: "SysTick_Handler\n/tmp/x.c:6:6\n8 bytes (static)\n0 dynamic objects" }
-edge: { sourcename: "SysTick_Handler" targetname: "__reaction_0" label: "/tmp/x.c:6:30" }
+node: { title: "TIMER1_IRQHandler" label: "TIMER1_IRQHandler\n/tmp/x.c:6:6\n8 bytes (static)\n0 dynamic objects" }
+edge: { sourcename: "TIMER1_IRQHandler" targetname: "__reaction_0" label: "/tmp/x.c:6:30" }
 node: { title: "Reset_Handler" label: "Reset_Handler\n/tmp/x.c:7:6\n72 bytes (static)\n0 dynamic objects" }
 edge: { sourcename: "Reset_Handler" targetname: "__reaction_0" label: "/tmp/x.c:6:30" }
 }"#;
 
 const SU: &str = "/tmp/x.c:5:6:__reaction_0\t56\tstatic\n\
-                  /tmp/x.c:6:6:SysTick_Handler\t8\tstatic\n\
+                  /tmp/x.c:6:6:TIMER1_IRQHandler\t8\tstatic\n\
                   /tmp/x.c:7:6:Reset_Handler\t72\tstatic\n";
 
 #[test]
 fn callgraph_measure_sums_chains_per_priority() {
     let g = stackinfo::parse_ci(CI);
     assert_eq!(g.nodes["__reaction_0"].bytes, 56);
-    assert_eq!(g.edges["SysTick_Handler"], vec!["__reaction_0".to_string()]);
+    assert_eq!(g.edges["TIMER1_IRQHandler"], vec!["__reaction_0".to_string()]);
 
     // base = max(Reset 72 + reaction 56, headroom 512) = 512;
-    // + SysTick chain (8 + 56) + EXC_FRAME_BASE 64 = 128  ⇒  640  (no FPU)
+    // + TIMER1 chain (8 + 56) + EXC_FRAME_BASE 64 = 128  ⇒  640  (no FPU)
     let m = stackinfo::measure(&g, false).expect("measure");
     assert_eq!(m.bytes, 640);
     assert_eq!(m.source, "callgraph");
     assert!(!m.any_dynamic);
 
-    // P7-2: on an FPU-bearing SoC the per-level frame is 104 B, so the SysTick
+    // P7-2: on an FPU-bearing SoC the per-level frame is 104 B, so the TIMER1
     // chain reserves 40 B more ⇒ 680.
     let fp = stackinfo::measure(&g, true).expect("measure");
     assert_eq!(fp.bytes, 680);
