@@ -24,15 +24,35 @@ pub struct DtsNode {
     pub children: Vec<DtsNode>,
 }
 
+/// One entry in a `<…>` cell list: a numeric cell or a `&phandle` reference.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Cell {
+    Num(u64),
+    Phandle(String),
+}
+
 /// A property value in the supported subset.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DtsValue {
-    /// `<a b c>` — a list of 32-bit cells (phandles / unparsable cells are 0).
-    Cells(Vec<u64>),
+    /// `<a &ph b>` — a list of cells (numeric cells and `&phandle` references).
+    Cells(Vec<Cell>),
     /// `"…"` — a string.
     Str(String),
     /// A bare property (`foo;`).
     Bool,
+}
+
+impl DtsValue {
+    /// The numeric cells of a `<…>` value (phandles skipped).
+    fn nums(&self) -> Vec<u64> {
+        match self {
+            DtsValue::Cells(cs) => cs.iter().filter_map(|c| match c {
+                Cell::Num(n) => Some(*n),
+                Cell::Phandle(_) => None,
+            }).collect(),
+            _ => Vec::new(),
+        }
+    }
 }
 
 impl DtsNode {
@@ -45,6 +65,9 @@ impl DtsNode {
             _ => None,
         }
     }
+    fn u64_prop(&self, name: &str) -> Option<u64> {
+        self.prop(name).map(|v| v.nums()).and_then(|n| n.first().copied())
+    }
     fn child(&self, name: &str) -> Option<&DtsNode> {
         self.children.iter().find(|c| c.name == name)
     }
@@ -56,10 +79,11 @@ impl DtsNode {
     /// `reg = <addr size>` → `(addr, size)` under the common #address-cells=1 /
     /// #size-cells=1 layout.
     fn reg(&self) -> Option<(u64, u64)> {
-        match self.prop("reg") {
-            Some(DtsValue::Cells(c)) if c.len() >= 2 => Some((c[0], c[1])),
-            Some(DtsValue::Cells(c)) if c.len() == 1 => Some((c[0], 0)),
-            _ => None,
+        let nums = self.prop("reg")?.nums();
+        match nums.len() {
+            0 => None,
+            1 => Some((nums[0], 0)),
+            _ => Some((nums[0], nums[1])),
         }
     }
 }
@@ -306,13 +330,18 @@ fn split_unit_addr(name: &str) -> Option<(String, Option<u64>)> {
     Some((base, addr))
 }
 
-/// Parse a DTS cell (`0x…` hex, decimal, or a `&phandle`/expression → 0).
-fn parse_cell(w: &str) -> u64 {
-    if let Some(hex) = w.strip_prefix("0x").or_else(|| w.strip_prefix("0X")) {
+/// Parse a DTS cell: `&label` → a phandle reference, `0x…`/decimal → a number
+/// (an unparsable expression falls back to `Num(0)`).
+fn parse_cell(w: &str) -> Cell {
+    if let Some(label) = w.strip_prefix('&') {
+        return Cell::Phandle(label.to_string());
+    }
+    let n = if let Some(hex) = w.strip_prefix("0x").or_else(|| w.strip_prefix("0X")) {
         u64::from_str_radix(hex, 16).unwrap_or(0)
     } else {
         w.parse::<u64>().unwrap_or(0)
-    }
+    };
+    Cell::Num(n)
 }
 
 // ─── Converter ──────────────────────────────────────────────────────────────
@@ -395,14 +424,71 @@ fn fmt_size(bytes: u64) -> String {
     }
 }
 
-/// Import a parsed DTS root into a Silica board skeleton (§8, P7-8a).  `known`
+/// The soc's Silica name: its `compatible` part name (`"nordic,nrf52840"` →
+/// `nrf52840`) if present, else the node name.
+fn soc_name(soc: Option<&DtsNode>) -> String {
+    match soc {
+        Some(s) => s
+            .str_prop("compatible")
+            .and_then(|c| c.rsplit(',').next())
+            .map(ident)
+            .unwrap_or_else(|| ident(&s.name)),
+        None => "soc".into(),
+    }
+}
+
+/// Format a clock frequency in Hz as the largest exact unit (`MHz`/`kHz`/`Hz`).
+fn fmt_freq(hz: u64) -> String {
+    if hz != 0 && hz % 1_000_000 == 0 {
+        format!("{}MHz", hz / 1_000_000)
+    } else if hz != 0 && hz % 1_000 == 0 {
+        format!("{}kHz", hz / 1_000)
+    } else {
+        format!("{hz}Hz")
+    }
+}
+
+/// Extract a `gpios = <&ctrl pin flags>` spec → `(controller label, pin, flags)`.
+fn gpio_spec(v: &DtsValue) -> Option<(String, u64, u64)> {
+    let DtsValue::Cells(cs) = v else { return None };
+    let ctrl = cs.iter().find_map(|c| match c {
+        Cell::Phandle(l) => Some(l.clone()),
+        _ => None,
+    })?;
+    let nums: Vec<u64> = cs.iter().filter_map(|c| match c {
+        Cell::Num(n) => Some(*n),
+        _ => None,
+    }).collect();
+    let pin = *nums.first()?;
+    let flags = nums.get(1).copied().unwrap_or(0);
+    Some((ctrl, pin, flags))
+}
+
+/// `true` if a node groups gpio *inputs* (buttons / keys) rather than outputs
+/// (leds).  Zephyr conventions: `gpio-keys`, `buttons`, `keys`.
+fn is_input_group(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.contains("button") || n.contains("key")
+}
+
+/// `true` if a node groups gpio pins at all (leds / buttons / keys).
+fn is_pin_group(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.contains("led") || is_input_group(&n)
+}
+
+// Zephyr GPIO flag bits (post-cpp numeric): pull-up / pull-down.
+const GPIO_PULL_UP: u64 = 0x10;
+const GPIO_PULL_DOWN: u64 = 0x20;
+
+/// Import a parsed DTS root into a Silica board skeleton (§8, P7-8a/b).  `known`
 /// is the set of Silica device types a `compatible` may map to (see
 /// [`known_device_types`]); an unmatched device becomes a diagnosed stub.
 pub fn to_silica(root: &DtsNode, known: &[String]) -> Import {
     let mut diagnostics = Vec::new();
     let board = root.str_prop("model").map(ident).unwrap_or_else(|| "imported_board".into());
     let soc = root.child("soc");
-    let soc_name = soc.map(|s| ident(&s.name)).unwrap_or_else(|| "soc".into());
+    let soc_name = soc_name(soc);
     let scope = soc.unwrap_or(root);
 
     // Memory regions from `memory` nodes with a `reg`.
@@ -420,17 +506,32 @@ pub fn to_silica(root: &DtsNode, known: &[String]) -> Import {
         diagnostics.push("no memory regions found (`memory` node with `reg`) — the soc has an empty memory block".into());
     }
 
-    // Device instances from non-memory nodes with a `reg`.
+    // Clock topology (P7-8b): the first `clock-frequency` under the soc/root.
+    let clock_hz = scope
+        .children
+        .iter()
+        .chain(std::iter::once(scope))
+        .find_map(|n| n.u64_prop("clock-frequency"));
+    if clock_hz.is_none() {
+        diagnostics.push("no `clock-frequency` found — defaulting sysclk to 64MHz".into());
+    }
+
+    // Device instances from non-memory nodes with a `reg`.  Track each mapped
+    // instance's device type so pin bindings can name the port type (P7-8b).
     let mut instances = Vec::new();
+    let mut instance_types: Vec<(String, String)> = Vec::new();
     for n in &scope.children {
         if n.is_memory() {
             continue;
         }
         let Some((addr, _)) = n.reg() else { continue };
-        let inst = n.label.clone().unwrap_or_else(|| ident(&n.name));
+        let inst = ident(&n.label.clone().unwrap_or_else(|| ident(&n.name)));
         let compat = n.str_prop("compatible").unwrap_or("");
         match match_device(n, known) {
-            Some(ty) => instances.push(format!("  {} : {} at 0x{:08x}", ident(&inst), ty, addr)),
+            Some(ty) => {
+                instances.push(format!("  {} : {} at 0x{:08x}", inst, ty, addr));
+                instance_types.push((inst, ty));
+            }
             None => {
                 diagnostics.push(format!(
                     "device `{}` (compatible \"{}\") has no Silica device type — emitted as a commented `raw` stub",
@@ -438,15 +539,47 @@ pub fn to_silica(root: &DtsNode, known: &[String]) -> Import {
                 ));
                 instances.push(format!(
                     "  // TODO(raw stub): {} at 0x{:08x} — compatible \"{}\" (no Silica device type yet)",
-                    ident(&inst), addr, compat
+                    inst, addr, compat
                 ));
             }
         }
     }
 
+    // Pin bindings (P7-8b): leds/buttons/keys groups whose children carry a
+    // `gpios = <&ctrl pin flags>` become `<label> : <ctrl-type>.pin = ...`.
+    let mut pins = Vec::new();
+    for group in root.children.iter().chain(scope.children.iter()).filter(|n| is_pin_group(&n.name)) {
+        let input = is_input_group(&group.name);
+        for pin_node in &group.children {
+            let Some(gpios) = pin_node.prop("gpios") else { continue };
+            let Some((ctrl, pin, flags)) = gpio_spec(gpios) else {
+                diagnostics.push(format!("pin `{}` has an unparsable `gpios` — skipped", pin_node.name));
+                continue;
+            };
+            let ctrl_id = ident(&ctrl);
+            let Some((_, ctrl_ty)) = instance_types.iter().find(|(l, _)| *l == ctrl_id) else {
+                diagnostics.push(format!(
+                    "pin `{}` references gpio controller `{}` which was not imported as a device — skipped",
+                    pin_node.name, ctrl
+                ));
+                continue;
+            };
+            let label = ident(&pin_node.label.clone().unwrap_or_else(|| ident(&pin_node.name)));
+            let dir = if input { "input" } else { "output" };
+            let pull = if flags & GPIO_PULL_UP != 0 {
+                " pulling up"
+            } else if flags & GPIO_PULL_DOWN != 0 {
+                " pulling down"
+            } else {
+                ""
+            };
+            pins.push(format!("  {} : {}.pin = {}.pin({}) as {}{}", label, ctrl_ty, ctrl_id, pin, dir, pull));
+        }
+    }
+
     // Emit the skeleton.
     let mut s = String::new();
-    s.push_str(&format!("// Imported from DTS by silicac dts_import (§8, P7-8a).\n"));
+    s.push_str("// Imported from DTS by silicac dts_import (§8, P7-8a/b).\n");
     s.push_str(&format!("board {board} {{\n"));
     s.push_str(&format!("  soc {soc_name} {{\n"));
     s.push_str("    memory {\n");
@@ -455,13 +588,20 @@ pub fn to_silica(root: &DtsNode, known: &[String]) -> Import {
     }
     s.push_str("    }\n");
     s.push_str("    clocks {\n");
-    s.push_str("      sysclk : clock_source = 64MHz  // TODO: import the real clock topology (P7-8b)\n");
+    s.push_str(&format!("      sysclk : clock_source = {}\n", fmt_freq(clock_hz.unwrap_or(64_000_000))));
     s.push_str("    }\n");
     s.push_str("  }\n");
     if !instances.is_empty() {
         s.push('\n');
         for inst in &instances {
             s.push_str(inst);
+            s.push('\n');
+        }
+    }
+    if !pins.is_empty() {
+        s.push('\n');
+        for pin in &pins {
+            s.push_str(pin);
             s.push('\n');
         }
     }

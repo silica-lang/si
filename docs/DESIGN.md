@@ -1486,15 +1486,19 @@ over Zephyr. Drivers are designed from **datasheets** — the real `regs`/`ops` 
 dovetails with a future datasheet-extraction pipeline. The line is sharp: *DTS is data we ingest;
 the driver framework is a model we reject.*
 
-> **Status (MVP spike — audit #35 P7-8a).** A first `dts_import` binary (`silicac::dts`) parses a
-> **flat** `.dts` subset — root node, `model`, a `soc` node, `memory` nodes, and device nodes with
-> `reg` — and emits a `board`/`soc` skeleton: memory regions from `reg`, a default `clocks` block, and
-> device instances whose `compatible` maps to a Silica device type. The mapping is **data-driven from
-> the std-lib `device` names** (never a hardcoded table — the compiler core stays free of peripheral
-> names, §2); an unmatched `compatible` becomes a **commented stub *and* a diagnostic** (§8/D10 — no
-> silent drops). Worked example: `crates/silicac/dts_examples/nrf52840dk.dts` → `.imported.si`. The
-> `cpp` ingestion phase, `interrupts`/`clocks`/`pinctrl` node coverage, and a round-trip against an
-> existing board are the P7-8b follow-up.
+> **Status (MVP — audit #35 P7-8a/b).** A `dts_import` binary (`silicac::dts`) parses a **flat** `.dts`
+> subset and emits a `board`/`soc` skeleton. **Ingested:** the `model` → board name; the `soc` node's
+> `compatible` part → soc name; `memory` nodes' `reg` → memory regions; a `clock-frequency` → the
+> `clocks` block; `leds`/`buttons`/`keys` groups' `gpios = <&ctrl pin flags>` → typed pin bindings
+> (`<label> : <ctrl-type>.pin = <ctrl>.pin(N) as output/input [pulling up/down]`, direction from the
+> group and pull from the gpio flags); and device nodes' `compatible` → device instances. The
+> `compatible`→type mapping is **data-driven from the std-lib `device` names** (never a hardcoded
+> table — the compiler core stays free of peripheral names, §2); an unmatched `compatible` becomes a
+> **commented stub *and* a diagnostic** (§8/D10 — no silent drops). The committed
+> `crates/silicac/dts_examples/nrf52840dk.dts` **round-trips the real `nrf52840_dk` board**
+> (`examples/blink_button_nrf52840.si`): soc + memory + 64 MHz clock + the `gpio0` instance + both LED
+> and button pin bindings, all reconstructed from the DTS. **Remaining:** the `cpp` ingestion phase,
+> `interrupts`/`interrupt-parent` chains, `pinctrl` pad-mux, and typed validation of the emitted board.
 
 ---
 
