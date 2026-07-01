@@ -269,7 +269,7 @@ fn run(cfg: &Config) -> Result<(), String> {
         // non-static (alloca/VLA) frame.  The SIR estimate above is only a
         // fast pre-compile fail / host fallback.
         if cfg.target == Target::MetalNrf52840 {
-            match backend::stackinfo::from_dump_dir(&dump_dir, STACK_DUMP_BASE) {
+            match backend::stackinfo::from_dump_dir(&dump_dir, STACK_DUMP_BASE, sir.fpu) {
                 Some(m) => {
                     let budget = metal_budget.expect("metal budget computed before compile");
                     let verdict = backend::stackinfo::enforce(&m, budget.statics, budget.ram_size);

@@ -1049,9 +1049,16 @@ on parts that have one — not a runtime mystery.
 > *measured* number is the authoritative budget: after compile, `backend::stackinfo::enforce` folds it
 > with the statics and **hard-errors** if `statics + worst-case stack > RAM`, or if any frame is
 > non-static (alloca/VLA — impossible since recursion/VLAs are banned, so it signals an unsound bound).
-> The SIR estimate remains a fast pre-compile fail and the host/unit-test fallback. Covered by
+> The SIR estimate remains a fast pre-compile fail and the host/unit-test fallback. **FP exception
+> frame (audit #35 P7-2 / Finding B).** Hardware float is real (P6-8), so a float-using reaction on an
+> FPU-bearing SoC can lazily stack a **104 B** FP exception frame (basic 32 B + S0–S15 + FPSCR) per
+> preemption level, not the 64 B basic frame. Both the SIR estimate (`c::worst_case_stack`) and the
+> measured bound (`stackinfo::measure`/`measure_su`) now reserve 104 B/level when `module.fpu`, else
+> 64 B — closing an up-to-40 B/level under-count. Covered by
 > `harness/stack_budget.sh` (healthy build reports a measured budget; an oversized program is rejected
-> with no firmware emitted). **Remaining:** the **frame-union** optimisation (overlapping
+> with no firmware emitted; a float program builds through the FPU-aware measured path) and the
+> `stackinfo`/`metal_codegen` fixture tests (both frame sizes; the +40 B/level FPU delta).
+> **Remaining:** the **frame-union** optimisation (overlapping
 > disjoint-lifetime frames) is not yet applied — it can only make the budget smaller.
 
 > **Status (implemented — flash / code-size budget, audit #35 P1-3).** Symmetric to RAM, metal builds
