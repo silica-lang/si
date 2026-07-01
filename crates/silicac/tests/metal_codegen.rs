@@ -76,6 +76,58 @@ fn ram_budget_within_region() {
 }
 
 #[test]
+fn emits_the_layer3_site_map_table() {
+    // P7-4a: metal codegen emits a PC→(handler, when-state) site table — one
+    // entry per reaction handler, carrying its `__reaction_<id>` symbol, id, and
+    // (as a host-rendered comment) the device typestate it runs under.  A boot
+    // `become` publishes `t = ready`, which the later `every` handler inherits.
+    let src = r#"
+device thermostat {
+  regs {
+    CTRL : reg32 at 0x00 access rw { enable: bit[0] }
+    TEMP : reg32 at 0x04 access ro {}
+  }
+  states { idle, ready }
+  ops {
+    op power_on() -> () { CTRL.enable = 1  become ready }
+    op read() when ready -> u32 { return TEMP }
+  }
+}
+board dk {
+  soc s { memory { flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K } clocks { sysclk : clock_source = 64MHz } }
+  t : thermostat at 0x5000_0000
+}
+program app {
+  use board dk as b
+  let dev = b.t
+  cell n : u32 = 0
+  on sys.start { dev.power_on() }
+  every 100ms { let v = dev.read()  n = v }
+}
+"#;
+    let sir = compile(src);
+    let out = c::CBackend::with_target(Target::MetalNrf52840).emit(&sir);
+
+    assert!(out.contains("Layer-3 site map: PC -> (handler, when-state)"), "no site-map banner:\n{out}");
+    assert!(out.contains("#define __SITE_COUNT 2U"), "expected 2 site entries:\n{out}");
+    assert!(
+        out.contains("static void (* const __site_fn[__SITE_COUNT])(void) = { __reaction_0, __reaction_1 };"),
+        "site fn table missing handler entry pointers:\n{out}"
+    );
+    assert!(out.contains("static const uint32_t __site_rid[__SITE_COUNT] = { 0U, 1U };"), "site rid table missing:\n{out}");
+    // sys.start establishes `t = ready` (via `power_on`), and the later `every`
+    // handler inherits that boot-published state — both run under `t=ready`.
+    assert!(
+        out.contains("/* site[0] = __reaction_0 [sys.start] when { t=ready } */"),
+        "sys.start site must carry the state it establishes:\n{out}"
+    );
+    assert!(
+        out.contains("/* site[1] = __reaction_1 [every 100000000ns] when { t=ready } */"),
+        "every-handler site must carry the inherited typestate t=ready:\n{out}"
+    );
+}
+
+#[test]
 fn fpu_soc_reserves_the_larger_exception_frame() {
     // P7-2 / Finding B: hardware float is real (P6-8), so on an FPU-bearing SoC a
     // preempting reaction can lazily stack a 104 B FP exception frame, not the

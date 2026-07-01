@@ -938,7 +938,13 @@ impl Resolver {
             Some(OverflowPolicy::Fault) => SirOverflow::Fault,
             _ => SirOverflow::Coalesce, // default (§5.1/D02)
         };
-        Some(SirReaction { id, trigger, body, priority, disposition, yields, deadline_ns, overflow })
+        // P7-4a: snapshot the device typestate this reaction provably runs under
+        // (boot-published + any `become` established in the body), for the
+        // Layer-3 site map.  Sorted by device id for deterministic codegen.
+        let mut when_state: Vec<(usize, String)> =
+            self.device_states.iter().map(|(d, s)| (*d, s.clone())).collect();
+        when_state.sort_by_key(|(d, _)| *d);
+        Some(SirReaction { id, trigger, body, priority, disposition, yields, deadline_ns, overflow, when_state })
     }
 
     /// §4.1/D07 — validate a device's typestate declarations: every op `when S`

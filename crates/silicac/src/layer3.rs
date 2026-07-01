@@ -65,6 +65,61 @@ pub fn ownership_map(module: &SirModule) -> Vec<OwnedRegion> {
     regions
 }
 
+/// One entry of the PC→(handler, `when`-state) **site map** (§5.4/§7.2, P7-4a):
+/// which reaction handler owns a code region, and the device typestate it runs
+/// under.  Emitted as a table so a fault-time PC can be attributed to a handler
+/// (the decode + wire-up is P7-4b).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SiteEntry {
+    /// The reaction id (also the `__reaction_<id>` handler symbol).
+    pub reaction_id: usize,
+    /// The generated handler function symbol, e.g. `__reaction_1`.
+    pub handler: String,
+    /// A human-readable trigger description (`sys.start`, `every 100ms`, …).
+    pub trigger: String,
+    /// The device typestate the handler runs under: `(device name, state)`.
+    pub when_state: Vec<(String, String)>,
+}
+
+/// The generated handler function symbol for a reaction id.
+pub fn handler_symbol(reaction_id: usize) -> String {
+    format!("__reaction_{reaction_id}")
+}
+
+/// A human-readable description of a reaction trigger, for the site map.
+fn trigger_desc(t: &SirTrigger) -> String {
+    match t {
+        SirTrigger::SysStart => "sys.start".to_string(),
+        SirTrigger::EveryNs(ns) => format!("every {ns}ns"),
+        SirTrigger::Event(id) => format!("event #{id}"),
+    }
+}
+
+/// Build the Layer-3 site map from the module: one entry per reaction handler,
+/// carrying its trigger and the device typestate it provably runs under
+/// (§5.4/§7.2, P7-4a).  Device ids on each reaction's `when_state` are resolved
+/// to instance names via the module's device list.
+pub fn site_map(module: &SirModule) -> Vec<SiteEntry> {
+    let dev_name = |id: usize| {
+        module
+            .devices
+            .iter()
+            .find(|d| d.id == id)
+            .map(|d| d.name.clone())
+            .unwrap_or_else(|| format!("device#{id}"))
+    };
+    module
+        .reactions
+        .iter()
+        .map(|r| SiteEntry {
+            reaction_id: r.id,
+            handler: handler_symbol(r.id),
+            trigger: trigger_desc(&r.trigger),
+            when_state: r.when_state.iter().map(|(d, s)| (dev_name(*d), s.clone())).collect(),
+        })
+        .collect()
+}
+
 /// The result of decoding a faulting address against the ownership map.
 #[derive(Debug, Clone)]
 pub struct FaultDecode {
@@ -146,5 +201,39 @@ mod tests {
     fn memory_region_is_attributed() {
         let d = decode_address(&module(), 0x2000_0010);
         assert_eq!(d.owner.as_ref().unwrap().kind, RegionKind::Memory);
+    }
+
+    fn reaction(id: usize, trigger: SirTrigger, when_state: Vec<(usize, String)>) -> SirReaction {
+        SirReaction {
+            id,
+            trigger,
+            body: vec![],
+            priority: 0,
+            disposition: SirDisposition::Escalate,
+            yields: false,
+            deadline_ns: None,
+            overflow: SirOverflow::Coalesce,
+            when_state,
+        }
+    }
+
+    #[test]
+    fn site_map_maps_handlers_triggers_and_when_state() {
+        // P7-4a: one entry per reaction, with its `__reaction_<id>` handler, a
+        // trigger description, and its device typestate resolved to names.
+        let mut m = module();
+        m.reactions = vec![
+            reaction(0, SirTrigger::SysStart, vec![]),
+            reaction(1, SirTrigger::EveryNs(100_000_000), vec![(0, "configured".into())]),
+        ];
+        let sites = site_map(&m);
+        assert_eq!(sites.len(), 2);
+        assert_eq!(sites[0].handler, "__reaction_0");
+        assert_eq!(sites[0].trigger, "sys.start");
+        assert!(sites[0].when_state.is_empty());
+        assert_eq!(sites[1].handler, "__reaction_1");
+        assert_eq!(sites[1].trigger, "every 100000000ns");
+        // device id 0 → its instance name `gpio0`.
+        assert_eq!(sites[1].when_state, vec![("gpio0".to_string(), "configured".to_string())]);
     }
 }

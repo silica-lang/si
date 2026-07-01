@@ -25,6 +25,7 @@ fn reaction(body: Vec<SirStmt>) -> SirReaction {
         yields: false,
         deadline_ns: None,
         overflow: SirOverflow::Coalesce,
+        when_state: vec![],
     }
 }
 
@@ -410,6 +411,35 @@ fn reg_store_is_followed_by_a_dmb_matching_the_c_backend() {
             "{label}: LLVM/C trailing-barrier count must match (llvm={llvm_dmb}, c={c_dmb}):\n{ll}"
         );
     }
+}
+
+// ─── P7-4a: Layer-3 site map (PC → handler / when-state) ──────────────────────
+
+#[test]
+fn metal_emits_the_layer3_site_map_table() {
+    // The LLVM metal backend emits the site table as handler entry-pointer +
+    // reaction-id constants (when-state as a comment); the fault-time decode that
+    // consumes it is P7-4b.
+    let mut m = module(
+        vec![cell("v", SirType::U32, 0)],
+        vec![SirStmt::Assign { target: SirPlace::Var("v".into()), value: SirExpr::U64(1) }],
+    );
+    let mut rx = reaction(vec![SirStmt::Assign {
+        target: SirPlace::Var("v".into()),
+        value: SirExpr::U64(2),
+    }]);
+    rx.id = 1;
+    rx.trigger = SirTrigger::EveryNs(100_000_000);
+    m.reactions.push(rx);
+    let ll = LlvmBackend::with_target(Target::MetalNrf52840).emit(&m);
+
+    assert!(ll.contains("@__site_fn = constant [2 x ptr]"), "no site fn table:\n{}", ll);
+    // sys.start (reaction 0) is inlined into @Reset_Handler; the `every` handler
+    // keeps its own @__reaction_1 symbol.
+    assert!(ll.contains("ptr @Reset_Handler") && ll.contains("ptr @__reaction_1"), "site table missing handler pointers:\n{}", ll);
+    assert!(ll.contains("@__site_rid = constant [2 x i32] [i32 0, i32 1]"), "no site rid table:\n{}", ll);
+    assert!(ll.contains("; site[1] = __reaction_1 [every 100000000ns]"), "no site comment:\n{}", ll);
+    assert_no_c_isms(&ll);
 }
 
 // ─── P3-4c: metal direction (vector table + Reset_Handler) ────────────────────

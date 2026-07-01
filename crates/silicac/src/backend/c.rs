@@ -1604,6 +1604,37 @@ impl CBackend {
                 self.line(&format!("/* owner[{}] = {} [0x{:08x}, 0x{:08x}) */", i, r.label, r.start, r.end));
             }
         }
+        // Layer-3 site map: PC → (handler, when-state) (§5.4/§7.2, P7-4a).  The
+        // table stores each reaction handler's entry address + id; the when-state
+        // rides along as a host-rendered comment (no on-device strings, §4.3).
+        // The fault-time PC decode that consumes this is P7-4b.
+        let sites = layer3::site_map(module);
+        self.line("/* Layer-3 site map: PC -> (handler, when-state) (§5.4/§7.2, P7-4a) */");
+        if sites.is_empty() {
+            self.line("#define __SITE_COUNT 0U");
+            self.line("static void (* const __site_fn[1])(void) = {0};");
+            self.line("static const uint32_t __site_rid[1] = {0U};");
+        } else {
+            self.line(&format!("#define __SITE_COUNT {}U", sites.len()));
+            let fns: Vec<String> = sites.iter().map(|s| s.handler.clone()).collect();
+            let rids: Vec<String> = sites.iter().map(|s| format!("{}U", s.reaction_id)).collect();
+            self.line(&format!(
+                "static void (* const __site_fn[__SITE_COUNT])(void) = {{ {} }};",
+                fns.join(", ")
+            ));
+            self.line(&format!(
+                "static const uint32_t __site_rid[__SITE_COUNT] = {{ {} }};",
+                rids.join(", ")
+            ));
+            for (i, s) in sites.iter().enumerate() {
+                let ws = if s.when_state.is_empty() {
+                    "any".to_string()
+                } else {
+                    s.when_state.iter().map(|(d, st)| format!("{d}={st}")).collect::<Vec<_>>().join(", ")
+                };
+                self.line(&format!("/* site[{}] = {} [{}] when {{ {} }} */", i, s.handler, s.trigger, ws));
+            }
+        }
         self.line("/* fault record (read by the host decoder) — structured, no strings (§4.3) */");
         self.line("volatile uint32_t __fault_addr = 0U;");
         self.line("volatile uint32_t __fault_owner = 0xFFFFFFFFUL; /* index, or 0xFFFFFFFF = unclaimed/invalid */");
@@ -2917,6 +2948,7 @@ mod tests {
                 yields: false,
                 deadline_ns: None,
                 overflow: SirOverflow::Coalesce,
+                when_state: vec![],
             }],
             ..Default::default()
         };
@@ -2939,6 +2971,7 @@ mod tests {
                 yields: false,
                 deadline_ns: None,
                 overflow: SirOverflow::Coalesce,
+                when_state: vec![],
             }],
             ..Default::default()
         };
