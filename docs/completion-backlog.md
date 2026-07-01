@@ -584,3 +584,4 @@ Cluster P7 — post-P6 audit remediation (tracking issue #86):
 - P7-4b Layer-3 site map: fault-time PC decode + HardFault wire-up — PR #91 — 2026-06-30
 - P7-5a Implement `buffer<N>` (bounded byte buffer) — PR #92 — 2026-06-30
 - P7-5b Implement `pool<T,N>` (bounded pool) — PR #93 — 2026-06-30
+- P7-6a Register residual: `rc`/`pop_on_read` read-clear in conditions — PR #94 — 2026-06-30
