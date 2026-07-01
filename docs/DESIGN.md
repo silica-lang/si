@@ -1427,8 +1427,15 @@ demonstrates one pattern cleanly, because the agent will learn the language *fro
 > the `escape_audit` bin + `harness/escape_hatch_audit.sh` report them per file. Baseline: corpus
 > total **11** (9 casts, 2 wrap/sat), with the **std lib at just 1** (the bme280 compensation cast).
 > `tests/escape_hatch.rs` gates the std lib at ≤ 3 so a regression toward "escape-hatch everywhere"
-> fails CI — a concrete, deterministic proxy for the agentic-native goal (a live agent eval, risk
-> #5, remains future work).
+> fails CI — a concrete, deterministic proxy for the agentic-native goal. **Agentic-eval harness
+> (audit #35 P7-7a, risk #5).** The static corpus metric is now wrapped in a task runner: `eval::`
+> loads an **author/edit/debug** task set from `crates/silicac/evals/` (each task a `prompt.md` +
+> reference `solution.si`, plus a `before.si` for edit/debug) and `evaluate()` scores a *candidate*
+> solution — does it compile (lex→parse→resolve), how many escape hatches does it use, and (for a
+> debug task) was the `before` genuinely broken?  The `agentic_eval` bin + `tests/agentic_eval.rs` run
+> the committed reference solutions (all compile; one legitimate `as u8` cast total) as the baseline.
+> **Remaining (P7-7b):** run it on real agent output and report the `.raw`/escape-hatch frequency vs.
+> this baseline.
 
 ### 7.5 Self-versioning
 

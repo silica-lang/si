@@ -1,0 +1,11 @@
+// Buggy starting point — debug_narrowing.  Does NOT compile: `low = total`
+// narrows a u32 into a u8 without an explicit cast (§4.3).
+program narrow {
+  cell total : u32 = 0
+  cell low : u8 = 0
+
+  every 100ms {
+    total = total + 100
+    low = total
+  }
+}
