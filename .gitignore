@@ -3,3 +3,11 @@
 # mdBook build output and generated full-text index
 /docs/book/book/
 /docs/book/src/llms-full.txt
+
+# stray silicac codegen artifacts emitted to the repo root (use -o <tmp>)
+/*.c
+/*.ll
+/*.ld
+/*.ci
+/*.su
+/*.elf
