@@ -629,7 +629,21 @@ impl Parser {
         let offset = self.expect_int_lit()?;
 
         // optional `access <acc>` and other register-level qualifiers
-        let (access, read_side_effect) = self.parse_opt_access(RegAccess::Rw)?;
+        let mods = self.parse_opt_access(RegAccess::Rw)?;
+        let (access, read_side_effect, reserved, access_width) = mods;
+        // `width = N` must match the register's storage width (§4.2, P7-6b):
+        // no illegal narrowing/widening of the bus access.
+        if let Some(w) = access_width {
+            if w != width {
+                return Err(ParseError {
+                    span: name.span,
+                    msg: format!(
+                        "register '{}' declares `width = {}` but its storage type is {}-bit — the access width must match (§4.2)",
+                        name.name, w, width
+                    ),
+                });
+            }
+        }
 
         // optional field block
         let mut fields = Vec::new();
@@ -647,29 +661,43 @@ impl Parser {
             self.eat(&Token::RBrace)?;
         }
         let end = self.prev_span().end;
-        Ok(RegDecl { name, width, offset, access, read_side_effect, fields, span: Span::new(start, end) })
+        Ok(RegDecl { name, width, offset, access, read_side_effect, reserved, access_width, fields, span: Span::new(start, end) })
     }
 
     /// Parse an optional `access <acc>` qualifier plus the §4.2 register-level
-    /// modifier idents.  Returns the access and whether a **read-side-effect**
-    /// modifier (`side_effect` / `pop_on_read`) was present (§4.2/D04, P0-2b);
-    /// `reserved` is still recorded-then-ignored.
-    fn parse_opt_access(&mut self, default: RegAccess) -> Result<(RegAccess, bool), ParseError> {
+    /// modifier idents.  Returns `(access, read_side_effect, reserved,
+    /// access_width)`: a **read-side-effect** modifier (`side_effect` /
+    /// `pop_on_read`, §4.2/D04, P0-2b); the `reserved` modifier and a
+    /// `width = 8|16|32` access width (§4.2, audit #35 P7-6b).
+    fn parse_opt_access(&mut self, default: RegAccess) -> Result<(RegAccess, bool, bool, Option<u8>), ParseError> {
         let mut access = default;
         if matches!(self.peek(), Some(Token::Ident(s)) if s == "access") {
             self.advance();
             access = self.parse_access_kind()?;
         }
         let mut read_side_effect = false;
+        let mut reserved = false;
+        let mut access_width = None;
         while let Some(Token::Ident(s)) = self.peek() {
             match s.as_str() {
                 "side_effect" | "pop_on_read" => read_side_effect = true,
-                "reserved" => {} // not a read-side-effect; still unmodelled
+                "reserved" => reserved = true,
+                // `width = N` — required bus access width (P7-6b).
+                "width" => {
+                    self.advance();
+                    self.eat(&Token::Eq)?;
+                    let w = self.expect_int_lit()? as u8;
+                    if !matches!(w, 8 | 16 | 32) {
+                        return Err(self.error(format!("`width` must be 8, 16, or 32, got {w}")));
+                    }
+                    access_width = Some(w);
+                    continue; // already advanced past the value
+                }
                 _ => break,
             }
             self.advance();
         }
-        Ok((access, read_side_effect))
+        Ok((access, read_side_effect, reserved, access_width))
     }
 
     fn parse_access_kind(&mut self) -> Result<RegAccess, ParseError> {

@@ -643,7 +643,12 @@ fixed-width volatile pointers (§6.2, D09).
 > store (`Stmt::RegWrite` → `SirStmt::RegWrite`): a single masked write when every field is w1c/wo,
 > else one read-modify-write over the *union* mask — never one RMW per field. Direction (`ro`),
 > duplicate-field, unknown-field, and read-side-effect-RMW errors all apply. **Finding 2 complete.**
-> **Remaining (deferred):** `reserved`/`width=` enforcement (P7-6b).
+> **`reserved` / `width=` enforcement (audit #35 P7-6b).** A register marked `reserved` rejects a
+> whole-register write of an arbitrary value (it would clobber the undeclared reserved bits) — the
+> register must be written per-field, whose read-modify-write reads and writes the reserved bits back
+> unchanged, preserving them. A `width = 8|16|32` modifier must equal the register's storage width
+> (`reg8`/`reg16`/`reg32`), else it is a parse error — no illegal narrowing/widening of the bus access.
+> Both are covered by `tests/reg_access.rs`. **Finding-2 register residual fully closed.**
 
 > **Status (implemented — ARM-conformant barriers, audit #35 P1-1).** The emitted barriers now match
 > the Cortex-M architecture rather than over-/under-barriering. **Cheaper:** Device-memory accesses

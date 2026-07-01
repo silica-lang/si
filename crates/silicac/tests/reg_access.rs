@@ -174,6 +174,51 @@ fn pop_on_read_register_read_clears_even_though_access_is_rw() {
     assert!(out.contains("cell c = 0"), "pop_on_read must clear on read (access is rw):\n{out}");
 }
 
+// ─── P7-6b: reserved-bit preservation + width= enforcement ────────────────────
+
+#[test]
+fn whole_register_write_to_a_reserved_register_is_an_error() {
+    // A whole-register write would clobber the reserved (undeclared) bits — the
+    // register must be written per-field (P7-6b).
+    let dev = "device statusdev { regs { CFG : reg32 at 0x0 access rw reserved { en: bit[0] } } ops { op bad() -> () { CFG = 5 } } }";
+    let errs = resolve_err(&program(dev, "bad"));
+    assert!(errs.iter().any(|e| e.contains("reserved") && e.contains("preserved")), "{errs:?}");
+}
+
+#[test]
+fn field_write_to_a_reserved_register_is_allowed_and_rmws() {
+    // Writing a named field is fine: its read-modify-write reads the register,
+    // changes only the field bits, and writes the rest (the reserved bits) back
+    // unchanged (P7-6b).
+    let dev = "device statusdev { regs { CFG : reg32 at 0x0 access rw reserved { en: bit[0] } } ops { op go() -> () { CFG.en = 1 } } }";
+    let src = program(dev, "go");
+    let tokens = lexer::lex(&src).expect("lex");
+    let ast = parser::parse(tokens).expect("parse");
+    assert!(resolver::resolve(&ast).is_ok(), "field write on a reserved register must be allowed");
+    // The metal RMW masks off only the `en` bit, preserving everything else.
+    let out = emit_metal(&src);
+    assert!(out.contains("& ~0x1UL"), "field write must RMW-preserve reserved bits:\n{out}");
+}
+
+#[test]
+fn width_not_matching_the_storage_type_is_an_error() {
+    // `width = 8` on a `reg32` is an illegal narrowing of the bus access (P7-6b).
+    let dev = "device statusdev { regs { CFG : reg32 at 0x0 access rw width = 8 { en: bit[0] } } ops { op x() -> () { CFG.en = 1 } } }";
+    let src = program(dev, "x");
+    let tokens = lexer::lex(&src).expect("lex");
+    let err = parser::parse(tokens).expect_err("expected a width-mismatch parse error");
+    assert!(err.msg.contains("width") && err.msg.contains("match"), "got: {}", err.msg);
+}
+
+#[test]
+fn width_matching_the_storage_type_is_accepted() {
+    let dev = "device statusdev { regs { CFG : reg32 at 0x0 access rw width = 32 { en: bit[0] } } ops { op x() -> () { CFG.en = 1 } } }";
+    let src = program(dev, "x");
+    let tokens = lexer::lex(&src).expect("lex");
+    let ast = parser::parse(tokens).expect("parse");
+    assert!(resolver::resolve(&ast).is_ok(), "width = 32 on a reg32 must be accepted");
+}
+
 #[test]
 fn per_field_w1c_in_an_rw_register_lowers_to_a_single_write() {
     // A `w1c` field overriding its `rw` register: writing it must NOT read-

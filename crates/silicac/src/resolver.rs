@@ -77,6 +77,11 @@ struct RegInfo {
     /// or any `rc` field), so an implicit read-modify-write of one field would
     /// disturb it (§4.2/D04, audit #35 P0-2b).
     read_side_effect: bool,
+    /// The register carries `reserved` bits that must be preserved (§4.2, audit
+    /// #35 P7-6b): a whole-register write of an arbitrary value is rejected, so
+    /// the reserved bits are only ever touched by a field write's read-modify-
+    /// write (which keeps them intact).
+    reserved: bool,
 }
 
 /// What a device instance's `needs` relation resolves to.
@@ -1186,7 +1191,7 @@ impl Resolver {
                         || fields.values().any(|(_, _, a)| matches!(a, SirRegAccess::Rc));
                     m.insert(
                         r.name.name.clone(),
-                        RegInfo { device, offset: r.offset, width: r.width, access: reg_access, fields, read_side_effect },
+                        RegInfo { device, offset: r.offset, width: r.width, access: reg_access, fields, read_side_effect, reserved: r.reserved },
                     );
                 }
             }
@@ -3033,6 +3038,15 @@ impl Resolver {
                 Some(Binding::Reg(ri)) => {
                     if matches!(ri.access, SirRegAccess::Ro) {
                         self.err(ident.span, format!("cannot write read-only register '{}' (§4.2)", ident.name));
+                    }
+                    // A whole-register write of an arbitrary value would clobber
+                    // the reserved (undeclared) bits (§4.2, P7-6b) — require
+                    // per-field writes, whose read-modify-write preserves them.
+                    if ri.reserved {
+                        self.err(ident.span, format!(
+                            "register '{}' has `reserved` bits that must be preserved — write its named fields (a read-modify-write keeps the reserved bits intact) instead of the whole register (§4.2)",
+                            ident.name
+                        ));
                     }
                     Some(reg_place(ri, full_mask(ri.width), 0, ri.access))
                 }
