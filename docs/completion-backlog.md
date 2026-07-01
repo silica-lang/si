@@ -586,3 +586,4 @@ Cluster P7 — post-P6 audit remediation (tracking issue #86):
 - P7-5b Implement `pool<T,N>` (bounded pool) — PR #93 — 2026-06-30
 - P7-6a Register residual: `rc`/`pop_on_read` read-clear in conditions — PR #94 — 2026-06-30
 - P7-6b Register residual: `reserved`-bit preservation + `width=` enforcement — PR #95 — 2026-06-30
+- P7-7a Agentic-eval harness scaffold (runner + author/edit/debug task set) — PR #96 — 2026-06-30
