@@ -578,3 +578,4 @@ Cluster P6 — fully landed on `main`:
 
 Cluster P7 — post-P6 audit remediation (tracking issue #86):
 - P7-1 LLVM/C MMIO barrier parity — PR #87 — 2026-06-30
+- P7-2 `EXC_FRAME` soundness on the FPU path (104 B) — PR #88 — 2026-06-30
