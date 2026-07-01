@@ -1942,6 +1942,18 @@ impl Parser {
                         span: Span::new(start, self.prev_span().end),
                     });
                 }
+                // `pool<T, N>` (§5.3, P7-5b) — same shape as `ring<T, N>`.
+                if name == "pool" && self.peek() == Some(&Token::Lt) {
+                    self.advance();
+                    let elem = self.parse_type()?;
+                    self.eat(&Token::Comma)?;
+                    let n = self.parse_add()?;
+                    self.eat(&Token::Gt)?;
+                    return Ok(TypeExpr {
+                        kind: TypeKind::Pool(Box::new(elem), Box::new(n)),
+                        span: Span::new(start, self.prev_span().end),
+                    });
+                }
                 if name == "bytes" {
                     return Ok(TypeExpr { kind: TypeKind::Bytes, span });
                 }

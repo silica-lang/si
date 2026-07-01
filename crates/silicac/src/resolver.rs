@@ -1144,7 +1144,7 @@ impl Resolver {
                     self.err(ty.span, "anonymous `enum { … }` types are not yet implemented");
                 }
             }
-            TypeKind::Ring(elem, _) => self.check_type_expr(elem),
+            TypeKind::Ring(elem, _) | TypeKind::Pool(elem, _) => self.check_type_expr(elem),
             TypeKind::Fixed(..) | TypeKind::Unit | TypeKind::Bytes => {}
         }
     }
@@ -2365,6 +2365,10 @@ impl Resolver {
                                 self.lower_buffer_stmt(&cell, &method.name, args, expr.span, scope, vars, out);
                                 return;
                             }
+                            Some(Binding::Cell(cell, ty)) if matches!(ty, SirType::Pool { .. }) => {
+                                self.lower_pool_stmt(&cell, &method.name, args, expr.span, scope, vars, out);
+                                return;
+                            }
                             None => {
                                 self.err(dev_expr.span, format!("undefined device '{}'", device_name));
                                 return;
@@ -2414,6 +2418,9 @@ impl Resolver {
                             }
                             Some(Binding::Cell(cell, ty)) if matches!(ty, SirType::Buffer { .. }) => {
                                 return self.lower_buffer_value(&cell, &method.name, args, expr.span, scope, vars, out);
+                            }
+                            Some(Binding::Cell(cell, ty)) if matches!(ty, SirType::Pool { .. }) => {
+                                return self.lower_pool_value(&cell, &method.name, args, expr.span, scope, vars, out);
                             }
                             _ => {}
                         }
@@ -2519,6 +2526,69 @@ impl Resolver {
             }
             other => {
                 self.err(span, format!("buffer has no op '{other}' (expected set/get/len)"));
+                SirExpr::U64(0)
+            }
+        }
+    }
+
+    /// Lower a pool op used as a **statement** (§5.3, P7-5b): `p.free(h)` /
+    /// `p.set(h, v)`; a discarded `p.alloc()` still claims a slot.
+    fn lower_pool_stmt(&mut self, cell: &str, method: &str, args: &[Expr], span: Span, scope: &mut Scope, vars: &[SirVar], out: &mut Vec<SirStmt>) {
+        match method {
+            "alloc" => {
+                let dst = self.fresh("poolalloc");
+                out.push(SirStmt::PoolAlloc { pool: cell.to_string(), dst });
+            }
+            "free" => {
+                if args.len() != 1 {
+                    self.err(span, "pool `free` takes exactly one argument (handle)");
+                    return;
+                }
+                let handle = self.lower_expr_emit(&args[0], scope, vars, out);
+                out.push(SirStmt::PoolFree { pool: cell.to_string(), handle });
+            }
+            "set" => {
+                if args.len() != 2 {
+                    self.err(span, "pool `set` takes exactly two arguments (handle, value)");
+                    return;
+                }
+                let handle = self.lower_expr_emit(&args[0], scope, vars, out);
+                let value = self.lower_expr_emit(&args[1], scope, vars, out);
+                out.push(SirStmt::PoolSet { pool: cell.to_string(), handle, value });
+            }
+            "get" | "count" | "cap" => {
+                self.err(span, format!("pool `{method}` returns a value — use it in an expression"));
+            }
+            other => self.err(span, format!("pool has no op '{other}' (expected alloc/free/set/get/count/cap)")),
+        }
+    }
+
+    /// Lower a pool op used as a **value** (§5.3, P7-5b): `p.alloc()` returns the
+    /// claimed handle (or the exhausted sentinel = `cap`); `p.get(h)` reads a
+    /// slot; `p.count()`/`p.cap()` are pure reads.
+    fn lower_pool_value(&mut self, cell: &str, method: &str, args: &[Expr], span: Span, scope: &mut Scope, vars: &[SirVar], out: &mut Vec<SirStmt>) -> SirExpr {
+        match method {
+            "alloc" => {
+                let dst = self.fresh("poolalloc");
+                out.push(SirStmt::PoolAlloc { pool: cell.to_string(), dst: dst.clone() });
+                SirExpr::Load(dst)
+            }
+            "get" => {
+                if args.len() != 1 {
+                    self.err(span, "pool `get` takes exactly one argument (handle)");
+                    return SirExpr::U64(0);
+                }
+                let handle = self.lower_expr_emit(&args[0], scope, vars, out);
+                SirExpr::PoolGet { pool: cell.to_string(), handle: Box::new(handle) }
+            }
+            "count" => SirExpr::PoolCount(cell.to_string()),
+            "cap" => SirExpr::PoolCap(cell.to_string()),
+            "free" | "set" => {
+                self.err(span, format!("pool `{method}` returns nothing — use it as a statement"));
+                SirExpr::U64(0)
+            }
+            other => {
+                self.err(span, format!("pool has no op '{other}' (expected alloc/free/set/get/count/cap)"));
                 SirExpr::U64(0)
             }
         }
@@ -3286,6 +3356,11 @@ fn stmt_touches_cell(stmt: &SirStmt, cell: &str) -> bool {
         SirStmt::BufferSet { buffer, index, value } => {
             buffer == cell || expr_touches_cell(index, cell) || expr_touches_cell(value, cell)
         }
+        SirStmt::PoolAlloc { pool, .. } => pool == cell,
+        SirStmt::PoolFree { pool, handle } => pool == cell || expr_touches_cell(handle, cell),
+        SirStmt::PoolSet { pool, handle, value } => {
+            pool == cell || expr_touches_cell(handle, cell) || expr_touches_cell(value, cell)
+        }
         // A safe-state drive touches no cell (it halts the system).
         SirStmt::DriveSafe => false,
     }
@@ -3388,6 +3463,8 @@ fn expr_touches_cell(expr: &SirExpr, cell: &str) -> bool {
         SirExpr::RingLen(r) | SirExpr::RingEmpty(r) | SirExpr::RingFull(r) => r == cell,
         SirExpr::BufferGet { buffer, index } => buffer == cell || expr_touches_cell(index, cell),
         SirExpr::BufferLen(b) => b == cell,
+        SirExpr::PoolGet { pool, handle } => pool == cell || expr_touches_cell(handle, cell),
+        SirExpr::PoolCount(p) | SirExpr::PoolCap(p) => p == cell,
         _ => false,
     }
 }
@@ -3623,6 +3700,15 @@ fn resolve_type_expr(ty: &TypeExpr) -> SirType {
             };
             SirType::Buffer { bytes }
         }
+        // `pool<T, N>` — N slots of `T` (§5.3, P7-5b).
+        TypeKind::Pool(elem, n) => {
+            let elem_bytes = resolve_type_expr(elem).byte_size().clamp(1, 8) as u8;
+            let cap = match const_eval(n, &HashMap::new()) {
+                Some(ConstVal::Int(c)) => c as u32,
+                _ => 0,
+            };
+            SirType::Pool { elem_bytes, cap }
+        }
         _ => SirType::U32,
     }
 }
@@ -3662,8 +3748,8 @@ fn sirtype_ctx(ty: &SirType) -> (u8, bool) {
         SirType::Bytes => (32, false),
         // instant/duration are u64 ns at runtime (§4.5).
         SirType::Instant | SirType::Duration => (64, false),
-        // a ring/buffer is not a scalar — never an arithmetic operand.
-        SirType::Ring { .. } | SirType::Buffer { .. } => (32, false),
+        // a ring/buffer/pool is not a scalar — never an arithmetic operand.
+        SirType::Ring { .. } | SirType::Buffer { .. } | SirType::Pool { .. } => (32, false),
         // floats are not integer-overflow-checked (§4.3); width is unused here.
         SirType::F32 | SirType::F64 => (32, false),
         // fixed-point is integer math at its storage width (§4.3, P0-3a), so

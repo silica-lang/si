@@ -52,6 +52,8 @@ pub struct CBackend {
     ring_info: HashMap<String, (u8, u32)>,
     /// Buffer cell name → capacity in bytes, for buffer op codegen (§5.3, P7-5a).
     buffer_info: HashMap<String, u32>,
+    /// Pool cell name → (element bytes, capacity), for pool op codegen (§5.3, P7-5b).
+    pool_info: HashMap<String, (u8, u32)>,
     /// Yielding-reaction id → its `within <d>` deadline in TIMER2 base ticks
     /// (§4.5/§5.6).  Populated only when a watchdog exists (the reset mechanism);
     /// an overrun sets `__deadline_missed`, which stops the watchdog feed.
@@ -84,6 +86,7 @@ impl CBackend {
             fixed_combos: HashSet::new(),
             ring_info: HashMap::new(),
             buffer_info: HashMap::new(),
+            pool_info: HashMap::new(),
             deadline_ticks: HashMap::new(),
             bus_contenders: HashMap::new(),
         }
@@ -126,6 +129,9 @@ impl CBackend {
             }
             if let SirType::Buffer { bytes } = v.ty {
                 self.buffer_info.insert(v.name.clone(), bytes);
+            }
+            if let SirType::Pool { elem_bytes, cap } = v.ty {
+                self.pool_info.insert(v.name.clone(), (elem_bytes, cap));
             }
         }
         self.global_vars = module.vars.iter().map(|v| v.name.clone()).collect();
@@ -283,6 +289,16 @@ impl CBackend {
                 self.line(&format!(
                     "{q} uint8_t __buf_{n}[{c}]; /* buffer<{c}> */",
                     q = qualifier, n = var.name, c = bytes
+                ));
+                continue;
+            }
+            // A bounded pool (§5.3, P7-5b): slot array + per-slot used flags + an
+            // allocated count, all counted in the static RAM budget.
+            if let SirType::Pool { elem_bytes, cap } = var.ty {
+                let elem = SirType::ring_elem_ctype(elem_bytes);
+                self.line(&format!(
+                    "{q} {e} __pool_{n}_slot[{c}]; {q} uint8_t __pool_{n}_used[{c}]; {q} uint32_t __pool_{n}_count = 0; /* pool<{e},{c}> */",
+                    q = qualifier, e = elem, n = var.name, c = cap
                 ));
                 continue;
             }
@@ -708,6 +724,7 @@ impl CBackend {
             match stmt {
                 SirStmt::Assign { target: SirPlace::Var(name), .. } => self.add_temp(name, seen, out),
                 SirStmt::RingPop { dst, .. } => self.add_temp(dst, seen, out),
+                SirStmt::PoolAlloc { dst, .. } => self.add_temp(dst, seen, out),
                 SirStmt::BusXfer { dst, code_dst, .. } => {
                     self.add_temp(dst, seen, out);
                     if let Some(code) = code_dst {
@@ -1082,6 +1099,29 @@ impl CBackend {
                 let n = self.buffer_info.get(buffer).copied().unwrap_or(0);
                 // Bounded write (§5.3): an out-of-range index is a defined no-op.
                 self.line(&format!("{{ /* buffer {}.set */ uint32_t __bi = (uint32_t)({i}); if (__bi < {n}U) {{ __buf_{b}[__bi] = (uint8_t)({v}); }} }}", buffer, i = i, v = v, n = n, b = buffer));
+            }
+            SirStmt::PoolAlloc { pool, dst } => {
+                let d = self.var_ref(dst);
+                let cap = self.pool_info.get(pool).map(|(_, c)| *c).unwrap_or(0);
+                // Claim the first free slot; return the exhausted sentinel (cap)
+                // when full (§5.3, a defined bounded allocation).
+                self.line(&format!("{{ /* pool {}.alloc */", pool));
+                self.indent += 1;
+                self.line(&format!("{d} = {cap}U;", d = d, cap = cap));
+                self.line(&format!("for (uint32_t __pi = 0U; __pi < {cap}U; __pi++) {{ if (!__pool_{p}_used[__pi]) {{ __pool_{p}_used[__pi] = 1U; __pool_{p}_count++; {d} = __pi; break; }} }}", p = pool, cap = cap, d = d));
+                self.indent -= 1;
+                self.line("}");
+            }
+            SirStmt::PoolFree { pool, handle } => {
+                let h = self.emit_expr(handle);
+                let cap = self.pool_info.get(pool).map(|(_, c)| *c).unwrap_or(0);
+                self.line(&format!("{{ /* pool {}.free */ uint32_t __ph = (uint32_t)({h}); if (__ph < {cap}U && __pool_{p}_used[__ph]) {{ __pool_{p}_used[__ph] = 0U; __pool_{p}_count--; }} }}", pool, h = h, cap = cap, p = pool));
+            }
+            SirStmt::PoolSet { pool, handle, value } => {
+                let h = self.emit_expr(handle);
+                let v = self.emit_expr(value);
+                let cap = self.pool_info.get(pool).map(|(_, c)| *c).unwrap_or(0);
+                self.line(&format!("{{ /* pool {}.set */ uint32_t __ph = (uint32_t)({h}); if (__ph < {cap}U && __pool_{p}_used[__ph]) {{ __pool_{p}_slot[__ph] = ({v}); }} }}", pool, h = h, v = v, cap = cap, p = pool));
             }
             SirStmt::If { cond, then } => {
                 let c = self.emit_expr(cond);
@@ -1562,6 +1602,17 @@ impl CBackend {
             SirExpr::BufferLen(b) => {
                 let n = self.buffer_info.get(b).copied().unwrap_or(0);
                 format!("{n}U")
+            }
+            SirExpr::PoolGet { pool, handle } => {
+                let h = self.emit_expr(handle);
+                let cap = self.pool_info.get(pool).map(|(_, c)| *c).unwrap_or(0);
+                // Bounded read (§5.3): out-of-range or unallocated reads 0.
+                format!("((uint32_t)({h}) < {cap}U && __pool_{p}_used[(uint32_t)({h})] ? __pool_{p}_slot[(uint32_t)({h})] : 0U)", h = h, cap = cap, p = pool)
+            }
+            SirExpr::PoolCount(p) => format!("__pool_{}_count", p),
+            SirExpr::PoolCap(p) => {
+                let cap = self.pool_info.get(p).map(|(_, c)| *c).unwrap_or(0);
+                format!("{cap}U")
             }
         }
     }
@@ -2519,6 +2570,12 @@ fn collect_arith_stmts(stmts: &[SirStmt], set: &mut HashSet<(SirArithOp, Overflo
                 collect_arith_expr(index, set);
                 collect_arith_expr(value, set);
             }
+            SirStmt::PoolAlloc { .. } => {}
+            SirStmt::PoolFree { handle, .. } => collect_arith_expr(handle, set),
+            SirStmt::PoolSet { handle, value, .. } => {
+                collect_arith_expr(handle, set);
+                collect_arith_expr(value, set);
+            }
             SirStmt::Intrinsic(SirIntrinsic::HostIoPrint(e)) => collect_arith_expr(e, set),
             SirStmt::Intrinsic(_) => {}
             SirStmt::DriveSafe => {}
@@ -2594,6 +2651,9 @@ fn stmts_have_now(stmts: &[SirStmt]) -> bool {
         SirStmt::RingPush { value, .. } => expr_has_now(value),
         SirStmt::RingPop { .. } => false,
         SirStmt::BufferSet { index, value, .. } => expr_has_now(index) || expr_has_now(value),
+        SirStmt::PoolAlloc { .. } => false,
+        SirStmt::PoolFree { handle, .. } => expr_has_now(handle),
+        SirStmt::PoolSet { handle, value, .. } => expr_has_now(handle) || expr_has_now(value),
         SirStmt::Intrinsic(SirIntrinsic::HostIoPrint(e)) => expr_has_now(e),
         SirStmt::Intrinsic(_) => false,
         SirStmt::DriveSafe => false,
