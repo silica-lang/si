@@ -675,6 +675,14 @@ an odd width like `u7` or `u24`.
 > register results stay width-flexible so ordinary code needs no annotation. **Remaining:** `.le`/`.be`
 > endianness, odd-width fields (`u7`/`u24`) in expressions, and a *checked* (fallible) narrowing cast
 > are not yet built — only the truncating `as`. (Overflow trap-by-default is tracked separately as B1.)
+> **Unknown/unsupported types hard-error (audit #35 P7-3 / Finding C).** `resolve_type_expr` used to
+> end both matches with `_ => SirType::U32`, so a misspelled/undeclared type name and a
+> parsed-but-unlowered `buffer<N>`/anon-enum silently compiled as `u32` — a "nothing statically
+> unknowable" hole. A type annotation at any declaration site (cell/local/op-param/cast target, and a
+> `ring<T,N>` element) is now checked: an unknown name is `unknown type \`X\``, and `buffer<N>` /
+> `enum { … }` are explicit "not yet implemented" errors (the latter until P7-5a lowers `buffer<N>`).
+> Pure type *inference* still falls back to `u32`, and the error is deduped by span so it is reported
+> once per annotation.
 
 > **Flagged inconsistency in the source decisions.** The settled list says overflow "traps by
 > default" but parenthesizes "(fault in debug/sim)", which quietly implies *no* trap in
