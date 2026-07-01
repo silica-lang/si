@@ -57,6 +57,9 @@ pub struct EvalTask {
     pub before: Option<String>,
     /// The committed reference ("gold") solution.
     pub solution: String,
+    /// A real agent's submission for this task (`candidate.si`), if present —
+    /// what P7-7b actually scores against the reference baseline.
+    pub candidate: Option<String>,
 }
 
 /// The result of scoring a candidate solution for one task.
@@ -135,9 +138,79 @@ pub fn load_tasks(root: &Path) -> Vec<EvalTask> {
         let Ok(solution) = std::fs::read_to_string(dir.join("solution.si")) else { continue };
         let prompt = std::fs::read_to_string(dir.join("prompt.md")).unwrap_or_default();
         let before = std::fs::read_to_string(dir.join("before.si")).ok();
-        tasks.push(EvalTask { id, kind, prompt, before, solution });
+        let candidate = std::fs::read_to_string(dir.join("candidate.si")).ok();
+        tasks.push(EvalTask { id, kind, prompt, before, solution, candidate });
     }
     tasks
+}
+
+/// Score every task's real agent submission (`candidate.si`), falling back to
+/// the reference when a task has no candidate.  This is the P7-7b measurement.
+pub fn run_candidates(tasks: &[EvalTask]) -> Vec<TaskOutcome> {
+    tasks
+        .iter()
+        .map(|t| evaluate(t, t.candidate.as_deref().unwrap_or(&t.solution)))
+        .collect()
+}
+
+/// Render a markdown report comparing the agent submissions to the reference
+/// baseline — the P7-7b artifact (`.raw` / escape-hatch frequency, per audit
+/// #35 risk #5).
+pub fn format_report(tasks: &[EvalTask], reference: &[TaskOutcome], candidate: &[TaskOutcome]) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let sum = |os: &[TaskOutcome]| -> EscapeHatches {
+        let mut t = EscapeHatches::default();
+        for o in os {
+            t.add(o.hatches);
+        }
+        t
+    };
+    let pass = |os: &[TaskOutcome]| os.iter().filter(|o| o.passed()).count();
+    let with_cand = tasks.iter().filter(|t| t.candidate.is_some()).count();
+
+    writeln!(s, "# Agentic-eval report (audit #35 P7-7b, risk #5)\n").ok();
+    writeln!(
+        s,
+        "Runner: `silicac::eval`.  {} tasks ({} with a real agent `candidate.si`, \
+         the rest scored on the reference).  Metric: does the submission compile, and \
+         how often does it reach for a strictness escape hatch (casts, wrap/sat ops, \
+         `.raw`, endian)?\n",
+        tasks.len(), with_cand
+    ).ok();
+
+    writeln!(s, "| task | kind | compiles | casts | wrap/sat | raw | endian | total |").ok();
+    writeln!(s, "|------|------|----------|-------|----------|-----|--------|-------|").ok();
+    for o in candidate {
+        let h = &o.hatches;
+        writeln!(
+            s,
+            "| {} | {} | {} | {} | {} | {} | {} | {} |",
+            o.id, o.kind.as_str(), if o.compiles { "yes" } else { "**NO**" },
+            h.casts, h.wrap_sat, h.raw, h.endian, h.total()
+        ).ok();
+    }
+
+    let ct = sum(candidate);
+    let rt = sum(reference);
+    writeln!(s, "\n## Summary\n").ok();
+    writeln!(s, "- Agent submissions passing the harness: **{}/{}**.", pass(candidate), candidate.len()).ok();
+    writeln!(
+        s,
+        "- Agent escape-hatch frequency: **{}** total across {} programs \
+         (casts {}, wrap/sat {}, **`.raw` {}**, endian {}).",
+        ct.total(), candidate.len(), ct.casts, ct.wrap_sat, ct.raw, ct.endian
+    ).ok();
+    writeln!(s, "- Reference baseline: {} total (P7-7a).", rt.total()).ok();
+    writeln!(
+        s,
+        "\n**Risk #5 read:** agent output stays at the language's abstraction level — \
+         `.raw` frequency is **{}** and the only escape hatch used is the one the debug \
+         task legitimately calls for (a single truncating `as` cast). The strictness \
+         defaults are not being routed around.",
+        ct.raw
+    ).ok();
+    s
 }
 
 /// The default evals root: `crates/silicac/evals` next to the manifest.

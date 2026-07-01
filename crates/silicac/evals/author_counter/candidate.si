@@ -1,0 +1,8 @@
+// Agent submission (Claude) — author_counter.
+program counter {
+  cell ticks : u32 = 0
+
+  every 100ms {
+    ticks = ticks + 1
+  }
+}
