@@ -1237,14 +1237,18 @@ the compiler." SIR is deliberately **below** any source-level sugar and **above*
 
 SIR is the contract. Everything below is "just" a printer/lowering from SIR.
 
-> **Status (front-end structure — audit #35 P7-9a).** The AST→SIR front end is being split along a
-> stable **typed-AST→SIR boundary**: the `resolver` is now a module directory whose `lower`
-> sub-module holds the lowering-utility layer — the SIR constructors (`reg_place`/`reg_load`/
-> `lower_regs`/`lower_cast`), the AST→SIR type/op/const conversions, and the post-lowering cell/yield
-> analysis — extracted from the 4.1 K-line driver (`resolver/mod.rs` −600 lines) into
-> `resolver/lower.rs`. Behavior-identical (the full suite is the gate); the driver calls into the
-> boundary rather than inlining it. Splitting the remaining typecheck ↔ lowering seam behind this
-> boundary is P7-9b.
+> **Status (front-end structure — audit #35 P7-9a/b).** The AST→SIR front end is split along a stable
+> **typed-AST→SIR boundary**: the `resolver` is now a module directory with three files.
+> `resolver/lower.rs` (P7-9a) holds the lowering-utility layer — the SIR constructors
+> (`reg_place`/`reg_load`/`lower_regs`/`lower_cast`), the AST→SIR type/op/const conversions, and the
+> post-lowering cell/yield analysis. `resolver/typeck.rs` (P7-9b) holds the **typecheck pass** — the
+> per-value/statement semantic gates: the time-kind checker (`instant`/`duration` algebra) and the
+> value-type checker (widths/signs) with their mixed-sign, implicit-narrowing, and literal-range
+> diagnostics. `resolver/mod.rs` is the driver: `use board` resolution, device/interface validation,
+> and the `lower_*` orchestration that walks the AST and calls into both boundaries. The split took the
+> 4.1 K-line monolith to a 3.2 K-line driver + a 0.6 K lowering module + a 0.3 K typecheck module,
+> **behavior-identical** (the full suite is the gate) — the typecheck ↔ lowering seam is now explicit
+> in the module structure.
 
 ### 6.2 C backend (first)
 
