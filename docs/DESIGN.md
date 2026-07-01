@@ -1237,6 +1237,15 @@ the compiler." SIR is deliberately **below** any source-level sugar and **above*
 
 SIR is the contract. Everything below is "just" a printer/lowering from SIR.
 
+> **Status (front-end structure — audit #35 P7-9a).** The AST→SIR front end is being split along a
+> stable **typed-AST→SIR boundary**: the `resolver` is now a module directory whose `lower`
+> sub-module holds the lowering-utility layer — the SIR constructors (`reg_place`/`reg_load`/
+> `lower_regs`/`lower_cast`), the AST→SIR type/op/const conversions, and the post-lowering cell/yield
+> analysis — extracted from the 4.1 K-line driver (`resolver/mod.rs` −600 lines) into
+> `resolver/lower.rs`. Behavior-identical (the full suite is the gate); the driver calls into the
+> boundary rather than inlining it. Splitting the remaining typecheck ↔ lowering seam behind this
+> boundary is P7-9b.
+
 ### 6.2 C backend (first)
 
 The first backend emits C — the fast path to real hardware and to design feedback. Each reaction
