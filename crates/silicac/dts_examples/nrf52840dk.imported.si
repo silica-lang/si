@@ -1,0 +1,15 @@
+// Imported from DTS by silicac dts_import (§8, P7-8a).
+board nordic_nrf52840_dk {
+  soc soc {
+    memory {
+      flash : region at 0x00000000 size 1M
+      ram   : region at 0x20000000 size 256K
+    }
+    clocks {
+      sysclk : clock_source = 64MHz  // TODO: import the real clock topology (P7-8b)
+    }
+  }
+
+  gpio0 : nrf_gpio at 0x50000000
+  // TODO(raw stub): uart0 at 0x40002000 — compatible "nordic,nrf-uarte" (no Silica device type yet)
+}

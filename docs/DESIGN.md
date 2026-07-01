@@ -1486,6 +1486,16 @@ over Zephyr. Drivers are designed from **datasheets** — the real `regs`/`ops` 
 dovetails with a future datasheet-extraction pipeline. The line is sharp: *DTS is data we ingest;
 the driver framework is a model we reject.*
 
+> **Status (MVP spike — audit #35 P7-8a).** A first `dts_import` binary (`silicac::dts`) parses a
+> **flat** `.dts` subset — root node, `model`, a `soc` node, `memory` nodes, and device nodes with
+> `reg` — and emits a `board`/`soc` skeleton: memory regions from `reg`, a default `clocks` block, and
+> device instances whose `compatible` maps to a Silica device type. The mapping is **data-driven from
+> the std-lib `device` names** (never a hardcoded table — the compiler core stays free of peripheral
+> names, §2); an unmatched `compatible` becomes a **commented stub *and* a diagnostic** (§8/D10 — no
+> silent drops). Worked example: `crates/silicac/dts_examples/nrf52840dk.dts` → `.imported.si`. The
+> `cpp` ingestion phase, `interrupts`/`clocks`/`pinctrl` node coverage, and a round-trip against an
+> existing board are the P7-8b follow-up.
+
 ---
 
 ## 9. Open questions — recommendations & tradeoffs

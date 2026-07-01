@@ -1,0 +1,31 @@
+/dts-v1/;
+
+/ {
+    model = "Nordic nRF52840 DK";
+    compatible = "nordic,nrf52840-dk", "nordic,nrf52840";
+
+    soc {
+        #address-cells = <1>;
+        #size-cells = <1>;
+
+        flash0: flash@0 {
+            device_type = "memory";
+            reg = <0x00000000 0x100000>;
+        };
+
+        sram0: memory@20000000 {
+            device_type = "memory";
+            reg = <0x20000000 0x40000>;
+        };
+
+        gpio0: gpio@50000000 {
+            compatible = "nordic,nrf-gpio";
+            reg = <0x50000000 0x1000>;
+        };
+
+        uart0: uart@40002000 {
+            compatible = "nordic,nrf-uarte";
+            reg = <0x40002000 0x1000>;
+        };
+    };
+};

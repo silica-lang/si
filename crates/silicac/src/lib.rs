@@ -21,6 +21,7 @@
 pub mod ast;
 pub mod backend;
 pub mod diag;
+pub mod dts;
 pub mod eval;
 pub mod layer3;
 pub mod lexer;
