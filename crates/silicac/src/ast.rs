@@ -271,6 +271,15 @@ pub struct RegDecl {
     /// disturb it.  Distinct from `access` so a `pop_on_read` register can still
     /// be `rw` for whole-register writes.
     pub read_side_effect: bool,
+    /// `reserved` modifier (§4.2, audit #35 P7-6b): the register has reserved
+    /// (undeclared) bits that must be preserved — a whole-register write with an
+    /// arbitrary value is rejected, forcing per-field writes whose read-modify-
+    /// write keeps the reserved bits intact.
+    pub reserved: bool,
+    /// `width = 8|16|32` modifier (§4.2, audit #35 P7-6b): the required bus access
+    /// width.  Must equal the register's storage width (no illegal narrowing /
+    /// widening of the access).  `None` when unstated.
+    pub access_width: Option<u8>,
     pub fields: Vec<FieldDecl>,
     pub span: Span,
 }
