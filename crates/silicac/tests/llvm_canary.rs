@@ -346,6 +346,72 @@ fn reg_load_is_a_masked_shifted_volatile_load() {
     assert_no_c_isms(&ll);
 }
 
+// ─── P7-1: LLVM/C MMIO barrier parity (audit #35 Finding A) ────────────────────
+
+#[test]
+fn reg_store_is_followed_by_a_dmb_matching_the_c_backend() {
+    // Every LLVM register `store volatile` must be followed by a single trailing
+    // `dmb 0xf` ordering barrier — byte-for-byte parity with the C backend's
+    // trailing `__DMB()` (which expands to `dmb 0xf`).  This is the one place the
+    // risk-#2 "SIR is C-ism-free *at parity*" proof most needs to hold: without it
+    // the two backends disagree on MMIO write ordering.
+    use silicac::backend::c::CBackend;
+
+    // A read/write field (read-modify-write store) and a write-only field (bare
+    // store, no read) — both store shapes must carry the trailing barrier.
+    let rmw = SirStmt::Assign {
+        target: SirPlace::Reg {
+            device: 0,
+            reg_offset: 0x00,
+            width: 32,
+            field_mask: 0x1,
+            field_shift: 0,
+            access: SirRegAccess::Rw,
+        },
+        value: SirExpr::U64(1),
+    };
+    let wo = SirStmt::Assign {
+        target: SirPlace::Reg {
+            device: 0,
+            reg_offset: 0x08,
+            width: 32,
+            field_mask: 0x1,
+            field_shift: 0,
+            access: SirRegAccess::Wo,
+        },
+        value: SirExpr::U64(1),
+    };
+
+    for (label, stmt) in [("rw", rmw), ("wo", wo)] {
+        let m = module_with_device(0x4000_5000, vec![], vec![stmt]);
+        let ll = LlvmBackend::with_target(Target::MetalNrf52840).emit(&m);
+
+        // A `dmb 0xf` *immediately follows* the register store to the MMIO pointer
+        // (the register store targets an `inttoptr` pointer `ptr %tN`; the later
+        // `@__fault_*` decoder stores are not MMIO and correctly carry no barrier).
+        let lines: Vec<&str> = ll.lines().collect();
+        let reg_store = lines
+            .iter()
+            .position(|l| l.contains("store volatile i32") && l.contains(", ptr %"))
+            .unwrap_or_else(|| panic!("{label}: no register store to an MMIO pointer:\n{ll}"));
+        assert!(
+            lines[reg_store + 1].contains("dmb 0xf"),
+            "{label}: the register store must be immediately followed by a dmb:\n{ll}"
+        );
+
+        // Exactly one trailing DMB per store — parity with the C backend's single
+        // trailing `__DMB();` invocation (the `#define __DMB()` line has no `;`).
+        let llvm_dmb = ll.matches("dmb 0xf").count();
+        let c = CBackend::with_target(Target::MetalNrf52840).emit(&m);
+        let c_dmb = c.matches("__DMB();").count();
+        assert_eq!(llvm_dmb, 1, "{label}: LLVM must emit exactly one trailing dmb per store:\n{ll}");
+        assert_eq!(
+            llvm_dmb, c_dmb,
+            "{label}: LLVM/C trailing-barrier count must match (llvm={llvm_dmb}, c={c_dmb}):\n{ll}"
+        );
+    }
+}
+
 // ─── P3-4c: metal direction (vector table + Reset_Handler) ────────────────────
 
 #[test]
