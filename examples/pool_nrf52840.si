@@ -1,0 +1,53 @@
+// Bounded pool on the nRF52840-DK — isolates the `pool<T,N>` lowering (audit
+// #35 P7-5b, §5.3).  A single reaction drives a deterministic
+// alloc/set/get/free sequence (no inter-reaction timing race), so the
+// observable cells match the simulator exactly across the sim and both metal
+// backends.
+//
+//   silicac --sim                                   examples/pool_nrf52840.si
+//   silicac --target metal-nrf52840 --emit-c        examples/pool_nrf52840.si
+//   silicac --target metal-nrf52840 --emit-llvm     examples/pool_nrf52840.si -o pool
+//
+// A `pool<T,N>` is N slots of T.  `alloc` claims the first free slot and returns
+// its handle, or the exhausted sentinel (`cap`) when full — a defined, bounded
+// allocation with no dynamic memory (§5.3, "bounded allocation, not absent").
+
+board nrf52840_dk {
+  soc nrf52840 {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+}
+
+program app {
+  use board nrf52840_dk as dev
+
+  cell p    : pool<u32, 2> = 0   // 2 slots (init ignored)
+  cell n    : u32 = 0
+  cell h0   : u32 = 9            // first handle (= 0)
+  cell got  : u32 = 0           // value read back from slot h0
+  cell exh  : u32 = 9           // third alloc → sentinel (= cap = 2)
+  cell cnt  : u32 = 0           // allocated count after a free
+
+  every 100ms {
+    n = n + 1
+    match n {
+      3 => {
+        let a = p.alloc()        // 0
+        h0 = a
+        let b = p.alloc()        // 1
+        p.set(a, 200)            // write slot 0
+        got = p.get(a)           // = 200
+        exh = p.alloc()          // pool full → 2 (sentinel)
+        p.free(b)                // release slot 1
+        cnt = p.count()          // = 1 (only slot 0 remains)
+      }
+      _ => {}
+    }
+  }
+}
+
+sim app_sim for app { run until 350ms }

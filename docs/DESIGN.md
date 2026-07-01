@@ -1036,9 +1036,15 @@ No general heap. Memory comes in **statically-sized** forms the compiler sums at
 > out-of-range `get` reads 0 (never UB, §5.3 "bounded allocation, not absent"). Modelled in the sim and
 > lowered on both backends to a `uint8_t __buf_<n>[N]` / `[N x i8]` array summed into the static RAM
 > budget; verified by `tests/buffer.rs`, `examples/buffer_nrf52840.si`, and a Renode readback
-> (`got=200`, `cap=8`) confirming sim ≡ metal. **Remaining:** `pool<T,N>` (P7-5b) and `arena` are not
-> yet built; a ring's `T` must be an integer scalar; a fault-on-full/empty variant (vs
-> overwrite-oldest) is a follow-up.
+> (`got=200`, `cap=8`) confirming sim ≡ metal. **`pool<T, N>` (audit #35 P7-5b).** A third bounded
+> container: `N` slots of `T` with `.alloc()` (claims the first free slot, returning its handle or the
+> exhausted sentinel `cap` — a defined bounded allocation, no dynamic memory), `.free(h)`, `.set(h,v)`,
+> `.get(h)`, `.count()`, `.cap()`.  Lowered on both backends to a slot array + per-slot used flags + an
+> allocated count (the LLVM `alloc` scan is an unrolled `select` chain, pure SSA); verified by
+> `tests/pool.rs`, `examples/pool_nrf52840.si`, and a Renode readback (`got=200`, exhausted `alloc`→`2`,
+> `count`→`1`) confirming sim ≡ metal. **Remaining:** `arena` (carve-and-reset sub-allocation) is not
+> yet built; a ring/pool `T` must be an integer scalar; a fault-on-full/empty variant (vs
+> overwrite-oldest / sentinel) is a follow-up.
 
 Handler frames for suspendable handlers (§5.2) are also statically sized and counted. The result:
 **total RAM use is a compile-time constant** — but that claim is only true if the *stack* is bounded

@@ -271,6 +271,15 @@ pub enum SirStmt {
     /// `buffer.set(i, v)` (§5.3, P7-5a): write byte `value` at `index`; an
     /// out-of-range index is a defined no-op (bounded access, never UB).
     BufferSet { buffer: String, index: SirExpr, value: SirExpr },
+    /// `let h = pool.alloc()` (§5.3, P7-5b): claim a free slot into `dst`, or the
+    /// exhausted sentinel (`cap`) if the pool is full — a defined, bounded alloc.
+    PoolAlloc { pool: String, dst: String },
+    /// `pool.free(h)` (§5.3, P7-5b): release slot `handle` back to the pool (a
+    /// no-op if the handle is out of range or already free).
+    PoolFree { pool: String, handle: SirExpr },
+    /// `pool.set(h, v)` (§5.3, P7-5b): write `value` into allocated slot `handle`
+    /// (a defined no-op if the handle is out of range or not allocated).
+    PoolSet { pool: String, handle: SirExpr, value: SirExpr },
     /// `if <cond> { <then> }` — no else for now.
     If { cond: SirExpr, then: Vec<SirStmt> },
     /// `exit(code)` — terminate the process (host only).
@@ -436,6 +445,14 @@ pub enum SirExpr {
     BufferGet { buffer: String, index: Box<SirExpr> },
     /// `buffer.len` (§5.3, P7-5a): the buffer's fixed capacity `N` in bytes.
     BufferLen(String),
+    /// `pool.get(h)` (§5.3, P7-5b): read allocated slot `handle` (0 if out of
+    /// range or not allocated).
+    PoolGet { pool: String, handle: Box<SirExpr> },
+    /// `pool.count()` (§5.3, P7-5b): number of currently-allocated slots.
+    PoolCount(String),
+    /// `pool.cap()` (§5.3, P7-5b): the pool's fixed capacity `N` — also the value
+    /// `alloc` returns when the pool is exhausted.
+    PoolCap(String),
     /// An IEEE-754 float literal (§4.3, P6-8): the bit pattern + width (32/64).
     /// A decimal literal in a float context lowers here (it stays a Q16.16 fixed
     /// raw `U64` in a fixed context).  Carried as bits so the sim's `u64` value
@@ -525,6 +542,11 @@ pub enum SirType {
     /// P7-5a): exactly `bytes` bytes of statically-allocated storage with
     /// bounds-guarded byte access (`.set(i,v)`/`.get(i)`/`.len`).
     Buffer { bytes: u32 },
+    /// `pool<T, N>` — a bounded fixed-capacity pool (§5.3, audit #35 P7-5b):
+    /// `cap` slots each of `elem_bytes` bytes, plus a per-slot used flag and an
+    /// allocated count.  `alloc` returns a slot handle or the exhausted sentinel
+    /// (`cap`); statically counted, no dynamic allocation.
+    Pool { elem_bytes: u8, cap: u32 },
     /// IEEE-754 single / double (§4.3).  Allowed only on an FPU-bearing SoC
     /// (§4.1); the resolver rejects them elsewhere.  Runtime float arithmetic is
     /// a follow-up — these carry the type so the gate is enforceable.
@@ -557,6 +579,8 @@ impl SirType {
             // A buffer is a byte array, never a scalar value in expression
             // position (accessed only via its `.set`/`.get`/`.len` ops).
             SirType::Buffer { .. } => "uint8_t *",
+            // A pool is a slot array + bookkeeping, never a scalar value.
+            SirType::Pool { .. } => "struct __pool",
             SirType::F32 => "float",
             SirType::F64 => "double",
             SirType::Fixed { int_bits, frac_bits, signed } => {
@@ -610,6 +634,8 @@ impl SirType {
             SirType::Ring { elem_bytes, cap } => (*cap as u64) * (*elem_bytes as u64) + 12,
             // N bytes of backing storage (capacity is a compile-time constant).
             SirType::Buffer { bytes } => *bytes as u64,
+            // cap slots + cap used-flags (1 B each) + a u32 allocated count.
+            SirType::Pool { elem_bytes, cap } => (*cap as u64) * (*elem_bytes as u64 + 1) + 4,
             SirType::Fixed { int_bits, frac_bits, .. } => {
                 (SirType::fixed_storage_bits(*int_bits, *frac_bits) / 8) as u64
             }

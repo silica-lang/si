@@ -741,6 +741,9 @@ pub enum TypeKind {
     /// `ring<T, N>` — a bounded ring buffer of `N` elements of integer type `T`
     /// (§5.3): the canonical producer/consumer queue between handlers.
     Ring(Box<TypeExpr>, Box<Expr>),
+    /// `pool<T, N>` — a bounded fixed-capacity pool of `N` slots of integer type
+    /// `T` (§5.3, P7-5b): `alloc` returns a handle or the exhausted sentinel.
+    Pool(Box<TypeExpr>, Box<Expr>),
     /// `fixed<I, F>` — fixed-point.
     Fixed(u32, u32),
     /// `enum { a, b, c }` — anonymous enum.

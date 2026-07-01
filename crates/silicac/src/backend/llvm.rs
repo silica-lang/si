@@ -109,7 +109,7 @@ fn sir_bits(ty: &SirType) -> u32 {
         SirType::Fixed { int_bits, frac_bits, .. } => {
             SirType::fixed_storage_bits(*int_bits, *frac_bits)
         }
-        SirType::Bytes | SirType::Ring { .. } | SirType::Buffer { .. } => 64,
+        SirType::Bytes | SirType::Ring { .. } | SirType::Buffer { .. } | SirType::Pool { .. } => 64,
     }
 }
 
@@ -191,6 +191,8 @@ pub struct LlvmBackend {
     ring_info: HashMap<String, (u32, u32)>,
     /// Buffer cell name → capacity in bytes (§5.3, P7-5a).
     buffer_info: HashMap<String, u32>,
+    /// Pool cell name → (element bits, capacity) (§5.3, P7-5b).
+    pool_info: HashMap<String, (u32, u32)>,
     /// device id → contending reactions `(reaction_id, priority)`, highest-priority
     /// first (P6-9).  Populated only for buses shared by ≥2 reactions; drives the
     /// priority-arbitrated claim/wait/grant.  Mirrors the C backend's field.
@@ -227,6 +229,7 @@ impl LlvmBackend {
             deadline_ticks: HashMap::new(),
             ring_info: HashMap::new(),
             buffer_info: HashMap::new(),
+            pool_info: HashMap::new(),
             bus_contenders: HashMap::new(),
         }
     }
@@ -296,6 +299,17 @@ impl LlvmBackend {
                 self.globals.push_str(&format!(
                     "@__buf_{n} = global [{c} x i8] zeroinitializer\n",
                     n = v.name, c = bytes.max(1)
+                ));
+                continue;
+            }
+            // A bounded pool (§5.3, P7-5b): slot array + used flags + count —
+            // mirrors the C `__pool_<n>_slot/used/count`.
+            if let SirType::Pool { elem_bytes, cap } = v.ty {
+                let ebits = (elem_bytes as u32) * 8;
+                self.pool_info.insert(v.name.clone(), (ebits, cap));
+                self.globals.push_str(&format!(
+                    "@__pool_{n}_slot = global [{c} x i{e}] zeroinitializer\n@__pool_{n}_used = global [{c} x i8] zeroinitializer\n@__pool_{n}_count = global i32 0\n",
+                    n = v.name, c = cap.max(1), e = ebits
                 ));
                 continue;
             }
@@ -991,6 +1005,7 @@ impl LlvmBackend {
             match stmt {
                 SirStmt::Assign { target: SirPlace::Var(name), .. } => add(name, seen, out),
                 SirStmt::RingPop { dst, .. } => add(dst, seen, out),
+                SirStmt::PoolAlloc { dst, .. } => add(dst, seen, out),
                 SirStmt::BusXfer { dst, code_dst, .. } => {
                     add(dst, seen, out);
                     if let Some(c) = code_dst {
@@ -1867,6 +1882,14 @@ impl LlvmBackend {
                         self.allocas.push_str(&format!("  %{}.addr = alloca i32\n", dst));
                     }
                 }
+                // `let h = pool.alloc()` (P7-5b): same as pop — the handle dst is a
+                // reaction-local with no declaring Assign, so allocate it here.
+                SirStmt::PoolAlloc { dst, .. } => {
+                    if !self.vars.contains_key(dst) {
+                        self.vars.insert(dst.clone(), (32, false, false));
+                        self.allocas.push_str(&format!("  %{}.addr = alloca i32\n", dst));
+                    }
+                }
                 // Recurse into nested bodies so a `let`/pop inside an `if`/critical
                 // still gets an alloca (mirrors the C reaction-temp collection).
                 SirStmt::If { then, .. } => self.collect_locals(then),
@@ -1904,6 +1927,9 @@ impl LlvmBackend {
             SirStmt::RingPush { ring, value } => self.emit_ring_push(ring, value),
             SirStmt::RingPop { ring, dst } => self.emit_ring_pop(ring, dst),
             SirStmt::BufferSet { buffer, index, value } => self.emit_buffer_set(buffer, index, value),
+            SirStmt::PoolAlloc { pool, dst } => self.emit_pool_alloc(pool, dst),
+            SirStmt::PoolFree { pool, handle } => self.emit_pool_free(pool, handle),
+            SirStmt::PoolSet { pool, handle, value } => self.emit_pool_set(pool, handle, value),
             // §4.1/D07 runtime typestate guard failed (P3-3): drive the system to
             // its safe state and halt (P5-2).  Host has no safe sequence — it is a
             // signposted system-integrity fault.
@@ -2509,6 +2535,119 @@ impl LlvmBackend {
         self.label(&skip);
     }
 
+    /// `let h = pool.alloc()` (§5.3, P7-5b): claim the first free slot into `dst`,
+    /// or the exhausted sentinel (`cap`).  The scan is unrolled as a `select`
+    /// chain (cap is a compile-time constant) — pure SSA, no loop/alloca.
+    fn emit_pool_alloc(&mut self, pool: &str, dst: &str) {
+        let (_ebits, cap) = self.pool_info.get(pool).copied().unwrap_or((32, 0));
+        let arr = cap.max(1);
+        let (dbits, _s, dglobal) = self.vars.get(dst).copied().unwrap_or((32, false, false));
+        let dptr = self.var_ptr(dst, dglobal);
+        // First-free scan: result stays the sentinel `cap` until a free slot is
+        // taken (only the first, since `notyet` gates each select).
+        let mut res = format!("{}", cap);
+        for i in 0..cap {
+            let up = self.fresh();
+            self.inst(&format!("{} = getelementptr [{} x i8], ptr @__pool_{}_used, i64 0, i64 {}", up, arr, pool, i));
+            let u = self.fresh();
+            self.inst(&format!("{} = load i8, ptr {}", u, up));
+            let free = self.fresh();
+            self.inst(&format!("{} = icmp eq i8 {}, 0", free, u));
+            let notyet = self.fresh();
+            self.inst(&format!("{} = icmp eq i32 {}, {}", notyet, res, cap));
+            let take = self.fresh();
+            self.inst(&format!("{} = and i1 {}, {}", take, free, notyet));
+            let nres = self.fresh();
+            self.inst(&format!("{} = select i1 {}, i32 {}, i32 {}", nres, take, i, res));
+            res = nres;
+        }
+        // If a slot was found (res != cap), mark it used and bump the count.
+        let found = self.fresh();
+        self.inst(&format!("{} = icmp ne i32 {}, {}", found, res, cap));
+        let mark = self.fresh_label("palloc_mark");
+        let done = self.fresh_label("palloc_done");
+        self.inst(&format!("br i1 {}, label %{}, label %{}", found, mark, done));
+        self.label(&mark);
+        let i64 = self.fresh();
+        self.inst(&format!("{} = zext i32 {} to i64", i64, res));
+        let up = self.fresh();
+        self.inst(&format!("{} = getelementptr [{} x i8], ptr @__pool_{}_used, i64 0, i64 {}", up, arr, pool, i64));
+        self.inst(&format!("store i8 1, ptr {}", up));
+        let c = self.fresh();
+        self.inst(&format!("{} = load i32, ptr @__pool_{}_count", c, pool));
+        let c1 = self.fresh();
+        self.inst(&format!("{} = add i32 {}, 1", c1, c));
+        self.inst(&format!("store i32 {}, ptr @__pool_{}_count", c1, pool));
+        self.inst(&format!("br label %{}", done));
+        self.label(&done);
+        let val = self.convert(&res, 32, dbits, false);
+        self.inst(&format!("store i{} {}, ptr {}", dbits, val, dptr));
+    }
+
+    /// `pool.free(h)` (§5.3, P7-5b): release an allocated slot — a no-op if the
+    /// handle is out of range or already free.
+    fn emit_pool_free(&mut self, pool: &str, handle: &SirExpr) {
+        let (_e, cap) = self.pool_info.get(pool).copied().unwrap_or((32, 0));
+        let arr = cap.max(1);
+        let h = self.emit_expr(handle, 32);
+        let inr = self.fresh();
+        self.inst(&format!("{} = icmp ult i32 {}, {}", inr, h, cap));
+        let chk = self.fresh_label("pfree_chk");
+        let skip = self.fresh_label("pfree_skip");
+        self.inst(&format!("br i1 {}, label %{}, label %{}", inr, chk, skip));
+        self.label(&chk);
+        let i64 = self.fresh();
+        self.inst(&format!("{} = zext i32 {} to i64", i64, h));
+        let up = self.fresh();
+        self.inst(&format!("{} = getelementptr [{} x i8], ptr @__pool_{}_used, i64 0, i64 {}", up, arr, pool, i64));
+        let u = self.fresh();
+        self.inst(&format!("{} = load i8, ptr {}", u, up));
+        let isused = self.fresh();
+        self.inst(&format!("{} = icmp ne i8 {}, 0", isused, u));
+        let doit = self.fresh_label("pfree_do");
+        self.inst(&format!("br i1 {}, label %{}, label %{}", isused, doit, skip));
+        self.label(&doit);
+        self.inst(&format!("store i8 0, ptr {}", up));
+        let c = self.fresh();
+        self.inst(&format!("{} = load i32, ptr @__pool_{}_count", c, pool));
+        let c1 = self.fresh();
+        self.inst(&format!("{} = sub i32 {}, 1", c1, c));
+        self.inst(&format!("store i32 {}, ptr @__pool_{}_count", c1, pool));
+        self.inst(&format!("br label %{}", skip));
+        self.label(&skip);
+    }
+
+    /// `pool.set(h, v)` (§5.3, P7-5b): write an allocated slot — a no-op if the
+    /// handle is out of range or not allocated.
+    fn emit_pool_set(&mut self, pool: &str, handle: &SirExpr, value: &SirExpr) {
+        let (ebits, cap) = self.pool_info.get(pool).copied().unwrap_or((32, 0));
+        let arr = cap.max(1);
+        let h = self.emit_expr(handle, 32);
+        let v = self.emit_expr(value, ebits);
+        let inr = self.fresh();
+        self.inst(&format!("{} = icmp ult i32 {}, {}", inr, h, cap));
+        let chk = self.fresh_label("pset_chk");
+        let skip = self.fresh_label("pset_skip");
+        self.inst(&format!("br i1 {}, label %{}, label %{}", inr, chk, skip));
+        self.label(&chk);
+        let i64 = self.fresh();
+        self.inst(&format!("{} = zext i32 {} to i64", i64, h));
+        let up = self.fresh();
+        self.inst(&format!("{} = getelementptr [{} x i8], ptr @__pool_{}_used, i64 0, i64 {}", up, arr, pool, i64));
+        let u = self.fresh();
+        self.inst(&format!("{} = load i8, ptr {}", u, up));
+        let isused = self.fresh();
+        self.inst(&format!("{} = icmp ne i8 {}, 0", isused, u));
+        let doit = self.fresh_label("pset_do");
+        self.inst(&format!("br i1 {}, label %{}, label %{}", isused, doit, skip));
+        self.label(&doit);
+        let slot = self.fresh();
+        self.inst(&format!("{} = getelementptr [{} x i{}], ptr @__pool_{}_slot, i64 0, i64 {}", slot, arr, ebits, pool, i64));
+        self.inst(&format!("store i{} {}, ptr {}", ebits, v, slot));
+        self.inst(&format!("br label %{}", skip));
+        self.label(&skip);
+    }
+
     /// `let d = ring.pop()` (§5.3, P6-1): dequeue the oldest into `dst`, or 0 if
     /// empty.  Mirrors the C `RingPop` lowering.
     fn emit_ring_pop(&mut self, ring: &str, dst: &str) {
@@ -2690,6 +2829,46 @@ impl LlvmBackend {
             SirExpr::BufferLen(b) => {
                 let n = self.buffer_info.get(b).copied().unwrap_or(0);
                 self.convert(&n.to_string(), 32, want, false)
+            }
+            // Bounded pool reads (§5.3, P7-5b): a guarded slot load (0 when out of
+            // range or unallocated), the allocated count, and the fixed capacity.
+            SirExpr::PoolGet { pool, handle } => {
+                let (ebits, cap) = self.pool_info.get(pool).copied().unwrap_or((32, 0));
+                let arr = cap.max(1);
+                let h = self.emit_expr(handle, 32);
+                let inr = self.fresh();
+                self.inst(&format!("{} = icmp ult i32 {}, {}", inr, h, cap));
+                // Clamp the gep index so an out-of-range access never loads OOB.
+                let safe = self.fresh();
+                self.inst(&format!("{} = select i1 {}, i32 {}, i32 0", safe, inr, h));
+                let i64 = self.fresh();
+                self.inst(&format!("{} = zext i32 {} to i64", i64, safe));
+                let up = self.fresh();
+                self.inst(&format!("{} = getelementptr [{} x i8], ptr @__pool_{}_used, i64 0, i64 {}", up, arr, pool, i64));
+                let u = self.fresh();
+                self.inst(&format!("{} = load i8, ptr {}", u, up));
+                let isused = self.fresh();
+                self.inst(&format!("{} = icmp ne i8 {}, 0", isused, u));
+                let slot = self.fresh();
+                self.inst(&format!("{} = getelementptr [{} x i{}], ptr @__pool_{}_slot, i64 0, i64 {}", slot, arr, ebits, pool, i64));
+                let raw = self.fresh();
+                self.inst(&format!("{} = load i{}, ptr {}", raw, ebits, slot));
+                // Result is 0 unless the handle was both in range and allocated.
+                let ok = self.fresh();
+                self.inst(&format!("{} = and i1 {}, {}", ok, inr, isused));
+                let z = if ebits == 32 { raw.clone() } else { let t = self.fresh(); self.inst(&format!("{} = zext i{} {} to i32", t, ebits, raw)); t };
+                let res = self.fresh();
+                self.inst(&format!("{} = select i1 {}, i32 {}, i32 0", res, ok, z));
+                self.convert(&res, 32, want, false)
+            }
+            SirExpr::PoolCount(p) => {
+                let t = self.fresh();
+                self.inst(&format!("{} = load i32, ptr @__pool_{}_count", t, p));
+                self.convert(&t, 32, want, false)
+            }
+            SirExpr::PoolCap(p) => {
+                let cap = self.pool_info.get(p).map(|(_, c)| *c).unwrap_or(0);
+                self.convert(&cap.to_string(), 32, want, false)
             }
             // Fixed-point mul/div + rescale cast (§4.3, P6-2).
             SirExpr::FixedArith { op, mode, frac_bits, width, signed, lhs, rhs } => {
@@ -3049,6 +3228,9 @@ fn stmt_kind(s: &SirStmt) -> &'static str {
         SirStmt::RingPush { .. } => "RingPush",
         SirStmt::RingPop { .. } => "RingPop",
         SirStmt::BufferSet { .. } => "BufferSet",
+        SirStmt::PoolAlloc { .. } => "PoolAlloc",
+        SirStmt::PoolFree { .. } => "PoolFree",
+        SirStmt::PoolSet { .. } => "PoolSet",
         SirStmt::If { .. } => "If",
         SirStmt::Exit(_) => "Exit",
         SirStmt::DriveSafe => "DriveSafe",
@@ -3079,6 +3261,9 @@ fn expr_kind(e: &SirExpr) -> &'static str {
         SirExpr::RingFull(_) => "RingFull",
         SirExpr::BufferGet { .. } => "BufferGet",
         SirExpr::BufferLen(_) => "BufferLen",
+        SirExpr::PoolGet { .. } => "PoolGet",
+        SirExpr::PoolCount(_) => "PoolCount",
+        SirExpr::PoolCap(_) => "PoolCap",
         SirExpr::FloatLit { .. } => "FloatLit",
         SirExpr::FloatArith { .. } => "FloatArith",
     }

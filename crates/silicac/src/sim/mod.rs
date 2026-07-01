@@ -263,6 +263,9 @@ struct Sim<'m> {
     rings: HashMap<String, (std::collections::VecDeque<u64>, u32)>,
     /// Bounded `buffer<N>` storage (§5.3, P7-5a): name → its `N` backing bytes.
     buffers: HashMap<String, Vec<u8>>,
+    /// Bounded `pool<T, N>` storage (§5.3, P7-5b): name → (slot values, per-slot
+    /// used flags).  The capacity `N` is `slots.len()`.
+    pools: HashMap<String, (Vec<u64>, Vec<bool>)>,
     /// Per-reaction single-live-activation flag (§5.1).
     in_flight: Vec<bool>,
     /// Per-reaction activation generation, bumped each fire, so a stale `within`
@@ -311,6 +314,7 @@ pub fn run(module: &SirModule) -> SimResult {
         cell_names,
         rings: HashMap::new(),
         buffers: HashMap::new(),
+        pools: HashMap::new(),
         bus_busy: HashMap::new(),
         bus_waiters: HashMap::new(),
         in_flight: vec![false; module.reactions.len()],
@@ -374,6 +378,9 @@ impl<'m> Sim<'m> {
             } else if let SirType::Buffer { bytes } = var.ty {
                 // A bounded buffer starts zeroed (§5.3, P7-5a).
                 self.buffers.insert(var.name.clone(), vec![0u8; bytes as usize]);
+            } else if let SirType::Pool { cap, .. } = var.ty {
+                // A bounded pool starts empty: all slots zeroed and free (§5.3, P7-5b).
+                self.pools.insert(var.name.clone(), (vec![0u64; cap as usize], vec![false; cap as usize]));
             } else {
                 self.cells.insert(var.name.clone(), const_value(&var.init));
             }
@@ -942,6 +949,39 @@ impl<'m> Sim<'m> {
                     }
                 }
             }
+            SirStmt::PoolAlloc { pool, dst } => {
+                // Claim the first free slot, or the exhausted sentinel (cap) (§5.3).
+                let h = if let Some((_slots, used)) = self.pools.get_mut(pool) {
+                    match used.iter().position(|&u| !u) {
+                        Some(i) => {
+                            used[i] = true;
+                            i as u64
+                        }
+                        None => used.len() as u64,
+                    }
+                } else {
+                    0
+                };
+                frame.insert(dst.clone(), h);
+            }
+            SirStmt::PoolFree { pool, handle } => {
+                let h = self.eval_expr(handle, frame) as usize;
+                if let Some((slots, used)) = self.pools.get_mut(pool) {
+                    if h < used.len() && used[h] {
+                        used[h] = false;
+                        slots[h] = 0;
+                    }
+                }
+            }
+            SirStmt::PoolSet { pool, handle, value } => {
+                let h = self.eval_expr(handle, frame) as usize;
+                let v = self.eval_expr(value, frame);
+                if let Some((slots, used)) = self.pools.get_mut(pool) {
+                    if h < used.len() && used[h] {
+                        slots[h] = v;
+                    }
+                }
+            }
             SirStmt::If { cond, then } => {
                 if self.eval_expr(cond, frame) != 0 {
                     self.eval_stmts(then, frame);
@@ -1175,6 +1215,19 @@ impl<'m> Sim<'m> {
                 self.buffers.get(buffer).and_then(|b| b.get(i)).map(|&x| x as u64).unwrap_or(0)
             }
             SirExpr::BufferLen(b) => self.buffers.get(b).map(|buf| buf.len() as u64).unwrap_or(0),
+            // Bounded pool reads (§5.3, P7-5b): guarded slot load (0 if out of
+            // range or unallocated), allocated count, and fixed capacity.
+            SirExpr::PoolGet { pool, handle } => {
+                let h = self.eval_expr(handle, frame) as usize;
+                self.pools
+                    .get(pool)
+                    .and_then(|(slots, used)| if h < used.len() && used[h] { Some(slots[h]) } else { None })
+                    .unwrap_or(0)
+            }
+            SirExpr::PoolCount(p) => {
+                self.pools.get(p).map(|(_, used)| used.iter().filter(|&&u| u).count() as u64).unwrap_or(0)
+            }
+            SirExpr::PoolCap(p) => self.pools.get(p).map(|(_, used)| used.len() as u64).unwrap_or(0),
         }
     }
 
