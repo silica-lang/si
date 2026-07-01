@@ -1650,6 +1650,38 @@ impl LlvmBackend {
                 self.globals.push_str(&format!("; owner[{}] = {} [0x{:08x}, 0x{:08x})\n", i, r.label, r.start, r.end));
             }
         }
+        // Layer-3 site map: PC → (handler, when-state) (§5.4/§7.2, P7-4a).  Handler
+        // entry pointers + reaction ids as constants; when-state as a comment (no
+        // on-device strings, §4.3).  Fault-time PC decode is P7-4b.
+        let sites = crate::layer3::site_map(module);
+        if sites.is_empty() {
+            self.globals
+                .push_str("@__site_fn = constant [1 x ptr] [ptr null]\n@__site_rid = constant [1 x i32] [i32 0]\n");
+        } else {
+            // The LLVM backend inlines a `sys.start` reaction into `@Reset_Handler`
+            // (no `@__reaction_0` function), so a site's real entry symbol is
+            // `@Reset_Handler` for sys.start and `@__reaction_<id>` otherwise.
+            let symbol = |i: usize| -> String {
+                match module.reactions.get(i).map(|r| &r.trigger) {
+                    Some(SirTrigger::SysStart) => "Reset_Handler".to_string(),
+                    _ => sites[i].handler.clone(),
+                }
+            };
+            let fns: Vec<String> = (0..sites.len()).map(|i| format!("ptr @{}", symbol(i))).collect();
+            let rids: Vec<String> = sites.iter().map(|s| format!("i32 {}", s.reaction_id)).collect();
+            self.globals.push_str(&format!(
+                "@__site_fn = constant [{n} x ptr] [{f}]\n@__site_rid = constant [{n} x i32] [{r}]\n",
+                n = sites.len(), f = fns.join(", "), r = rids.join(", ")
+            ));
+            for (i, s) in sites.iter().enumerate() {
+                let ws = if s.when_state.is_empty() {
+                    "any".to_string()
+                } else {
+                    s.when_state.iter().map(|(d, st)| format!("{d}={st}")).collect::<Vec<_>>().join(", ")
+                };
+                self.globals.push_str(&format!("; site[{}] = {} [{}] when {{ {} }}\n", i, symbol(i), s.trigger, ws));
+            }
+        }
         self.globals.push_str(
             "@__fault_addr = global i32 0\n@__fault_owner = global i32 -1\n@__fault_cfsr = global i32 0\n@__fault_pending = global i32 0\n",
         );

@@ -516,10 +516,15 @@ statically-proven fraction; the runtime check is the sound fallback, never silen
 > can establish stays a compile error (the op is provably uncallable). The same SIR drives both
 > consumers: the sim halts in `drive_safe`; metal does `__drive_safe()` + halt. `harness/typestate_runtime.sh`
 > is the Renode gate (unarmed → ticks frozen; armed → ticks climb); `examples/typestate_runtime.si`.
-> **Remaining:** the Layer-3 **site map** (per-call-site debug info naming "handler X touched device Y
-> outside its valid state"); soundness of a *proven* state across a `yields` when a shared device may
-> be preempted; and op-internal transitions read from the op's own top-level `become` (not through
-> nested sub-op inlining).
+> **Layer-3 site map — table generation (audit #35 P7-4a).** Codegen now emits a **PC→(handler,
+> `when`-state) site table** (`layer3::site_map`; §7.2): one entry per reaction handler carrying its
+> `__reaction_<id>` entry symbol (a `sys.start` reaction inlines into `@Reset_Handler` on the LLVM
+> backend), its reaction id, and the device typestate it provably runs under — rendered as a host-side
+> comment, no on-device strings (§4.3). Both backends emit it (`__site_fn`/`__site_rid`), verified by
+> `metal_codegen.rs` (C) and `llvm_canary.rs` (LLVM). **Remaining:** the fault-time PC **decode**
+> that consumes this table (matching a stacked PC to its handler in the `HardFault` decoder) is P7-4b;
+> plus soundness of a *proven* state across a `yields` when a shared device may be preempted, and
+> op-internal transitions read from the op's own top-level `become` (not through nested sub-op inlining).
 
 An **interface** is the contract a device provides (`implements i2c`) or requires
 (`needs bus: i2c`). Interfaces are how composition is typed: any device providing `i2c` can satisfy

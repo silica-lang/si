@@ -113,6 +113,12 @@ pub struct SirReaction {
     /// Event-source overflow policy (§5.1/D02): what a re-fire does while an
     /// activation is in flight.  Default `Coalesce`.
     pub overflow: SirOverflow,
+    /// §4.1/D07 + §5.4/§7.2 (P7-4a): the device typestate this reaction provably
+    /// runs under — `(device id, state name)` for each device with a known state
+    /// (the boot-published state, plus any `become` established within the body).
+    /// Feeds the Layer-3 PC→(handler, `when`-state) site map so a fault in this
+    /// handler can be attributed to the state it was operating in.  Sorted by id.
+    pub when_state: Vec<(usize, String)>,
 }
 
 /// Event-source overflow policy (§5.1/D02).
