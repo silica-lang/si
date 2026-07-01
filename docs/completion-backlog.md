@@ -580,3 +580,4 @@ Cluster P7 — post-P6 audit remediation (tracking issue #86):
 - P7-1 LLVM/C MMIO barrier parity — PR #87 — 2026-06-30
 - P7-2 `EXC_FRAME` soundness on the FPU path (104 B) — PR #88 — 2026-06-30
 - P7-3 Hard-error on unknown/unsupported types — PR #89 — 2026-06-30
+- P7-4a Layer-3 site map: PC→(handler, when-state) table generation — PR #90 — 2026-06-30
