@@ -36,14 +36,14 @@ fn a_misspelled_cell_type_is_rejected() {
 }
 
 #[test]
-fn buffer_type_is_not_yet_implemented() {
-    // `buffer<N>` parses but has no lowering yet (P7-5a implements it); until then
-    // it is an explicit "not yet implemented", never a silent `u32`.
-    let errs = resolve_err(&program("  cell b : buffer<8> = 0\n  every 100ms { }"));
-    assert!(
-        errs.iter().any(|m| m.contains("`buffer<N>`") && m.contains("not yet implemented")),
-        "expected a buffer not-implemented error, got: {errs:?}"
-    );
+fn buffer_type_now_compiles() {
+    // P7-5a replaced P7-3's `buffer<N>` "not yet implemented" placeholder with a
+    // real bounded byte buffer — declaring one is no longer an error (behaviour is
+    // covered by tests/buffer.rs).
+    let src = program("  cell b : buffer<8> = 0\n  every 100ms { b.set(0, 1) }");
+    let tokens = lexer::lex(&src).expect("lex");
+    let ast = parser::parse(tokens).expect("parse");
+    assert!(resolver::resolve(&ast).is_ok(), "buffer<N> must compile after P7-5a");
 }
 
 #[test]

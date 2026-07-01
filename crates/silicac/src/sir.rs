@@ -268,6 +268,9 @@ pub enum SirStmt {
     RingPush { ring: String, value: SirExpr },
     /// `let x = ring.pop()` (§5.3): dequeue the oldest into `dst` (0 if empty).
     RingPop { ring: String, dst: String },
+    /// `buffer.set(i, v)` (§5.3, P7-5a): write byte `value` at `index`; an
+    /// out-of-range index is a defined no-op (bounded access, never UB).
+    BufferSet { buffer: String, index: SirExpr, value: SirExpr },
     /// `if <cond> { <then> }` — no else for now.
     If { cond: SirExpr, then: Vec<SirStmt> },
     /// `exit(code)` — terminate the process (host only).
@@ -429,6 +432,10 @@ pub enum SirExpr {
     RingEmpty(String),
     /// `ring.is_full()` — count == cap.
     RingFull(String),
+    /// `buffer.get(i)` (§5.3, P7-5a): read the byte at `index` (0 if out of range).
+    BufferGet { buffer: String, index: Box<SirExpr> },
+    /// `buffer.len` (§5.3, P7-5a): the buffer's fixed capacity `N` in bytes.
+    BufferLen(String),
     /// An IEEE-754 float literal (§4.3, P6-8): the bit pattern + width (32/64).
     /// A decimal literal in a float context lowers here (it stays a Q16.16 fixed
     /// raw `U64` in a fixed context).  Carried as bits so the sim's `u64` value
@@ -514,6 +521,10 @@ pub enum SirType {
     /// `ring<T, N>` — a bounded ring buffer (§5.3): `cap` elements each of
     /// `elem_bytes` bytes, plus head/tail/count indices.  Statically counted.
     Ring { elem_bytes: u8, cap: u32 },
+    /// `buffer<N>` — a bounded, fixed-capacity byte buffer (§5.3, audit #35
+    /// P7-5a): exactly `bytes` bytes of statically-allocated storage with
+    /// bounds-guarded byte access (`.set(i,v)`/`.get(i)`/`.len`).
+    Buffer { bytes: u32 },
     /// IEEE-754 single / double (§4.3).  Allowed only on an FPU-bearing SoC
     /// (§4.1); the resolver rejects them elsewhere.  Runtime float arithmetic is
     /// a follow-up — these carry the type so the gate is enforceable.
@@ -543,6 +554,9 @@ impl SirType {
             // Rings are not scalar values; they are emitted as a named struct,
             // never via `c_type` in expression position.
             SirType::Ring { .. } => "struct __ring",
+            // A buffer is a byte array, never a scalar value in expression
+            // position (accessed only via its `.set`/`.get`/`.len` ops).
+            SirType::Buffer { .. } => "uint8_t *",
             SirType::F32 => "float",
             SirType::F64 => "double",
             SirType::Fixed { int_bits, frac_bits, signed } => {
@@ -594,6 +608,8 @@ impl SirType {
             SirType::U64 | SirType::S64 | SirType::Instant | SirType::Duration | SirType::F64 => 8,
             // cap elements + head/tail/count (3 × u32).
             SirType::Ring { elem_bytes, cap } => (*cap as u64) * (*elem_bytes as u64) + 12,
+            // N bytes of backing storage (capacity is a compile-time constant).
+            SirType::Buffer { bytes } => *bytes as u64,
             SirType::Fixed { int_bits, frac_bits, .. } => {
                 (SirType::fixed_storage_bits(*int_bits, *frac_bits) / 8) as u64
             }

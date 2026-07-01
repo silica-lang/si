@@ -1,0 +1,48 @@
+// Bounded byte buffer on the nRF52840-DK — isolates the `buffer<N>` lowering
+// (audit #35 P7-5a, §5.3).  A single reaction drives a deterministic
+// set/get/len sequence (no inter-reaction timing race), so the observable cells
+// match the simulator exactly across the sim and both metal backends.
+//
+//   silicac --sim                                   examples/buffer_nrf52840.si
+//   silicac --target metal-nrf52840 --emit-c        examples/buffer_nrf52840.si
+//   silicac --target metal-nrf52840 --emit-llvm     examples/buffer_nrf52840.si -o buf
+//
+// `buffer<N>` is `N` bytes of fixed backing storage with bounds-guarded access:
+// an out-of-range `.set` is a defined no-op and an out-of-range `.get` reads 0
+// (§5.3, "bounded allocation, not absent").
+
+board nrf52840_dk {
+  soc nrf52840 {
+    memory {
+      flash : region at 0x0 size 1024K
+      ram   : region at 0x2000_0000 size 256K
+    }
+    clocks { sysclk : clock_source = 64MHz }
+  }
+}
+
+program app {
+  use board nrf52840_dk as dev
+
+  cell buf : buffer<8> = 0   // 8 bytes of bounded storage (init ignored)
+  cell n   : u32 = 0
+  cell cap : u32 = 0         // buf.len() — the fixed capacity
+  cell got : u32 = 0         // a byte read back after a write
+  cell oob : u32 = 7         // stays 0 after an out-of-range read
+
+  every 100ms {
+    n = n + 1
+    match n {
+      3 => {
+        buf.set(2, 200)       // in-range write
+        buf.set(99, 5)        // out-of-range → dropped (no-op)
+        cap = buf.len()       // = 8
+        got = buf.get(2)      // = 200
+        oob = buf.get(99)     // = 0 (bounded read)
+      }
+      _ => {}
+    }
+  }
+}
+
+sim app_sim for app { run until 350ms }

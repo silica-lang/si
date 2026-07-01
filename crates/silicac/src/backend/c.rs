@@ -50,6 +50,8 @@ pub struct CBackend {
     fixed_combos: HashSet<(FixedArithOp, OverflowMode, u8, bool, u8)>,
     /// Ring cell name → (element bytes, capacity), for ring op codegen (§5.3).
     ring_info: HashMap<String, (u8, u32)>,
+    /// Buffer cell name → capacity in bytes, for buffer op codegen (§5.3, P7-5a).
+    buffer_info: HashMap<String, u32>,
     /// Yielding-reaction id → its `within <d>` deadline in TIMER2 base ticks
     /// (§4.5/§5.6).  Populated only when a watchdog exists (the reset mechanism);
     /// an overrun sets `__deadline_missed`, which stops the watchdog feed.
@@ -81,6 +83,7 @@ impl CBackend {
             arith_combos: HashSet::new(),
             fixed_combos: HashSet::new(),
             ring_info: HashMap::new(),
+            buffer_info: HashMap::new(),
             deadline_ticks: HashMap::new(),
             bus_contenders: HashMap::new(),
         }
@@ -120,6 +123,9 @@ impl CBackend {
         for v in &module.vars {
             if let SirType::Ring { elem_bytes, cap } = v.ty {
                 self.ring_info.insert(v.name.clone(), (elem_bytes, cap));
+            }
+            if let SirType::Buffer { bytes } = v.ty {
+                self.buffer_info.insert(v.name.clone(), bytes);
             }
         }
         self.global_vars = module.vars.iter().map(|v| v.name.clone()).collect();
@@ -268,6 +274,15 @@ impl CBackend {
                 self.line(&format!(
                     "{q} {e} __ring_{n}_buf[{c}]; {q} uint32_t __ring_{n}_head = 0, __ring_{n}_tail = 0, __ring_{n}_count = 0; /* ring<{e},{c}> */",
                     q = qualifier, e = elem, n = var.name, c = cap
+                ));
+                continue;
+            }
+            // A bounded byte buffer (§5.3, P7-5a): a fixed backing array, counted
+            // in the static RAM budget via SirType::Buffer::byte_size.
+            if let SirType::Buffer { bytes } = var.ty {
+                self.line(&format!(
+                    "{q} uint8_t __buf_{n}[{c}]; /* buffer<{c}> */",
+                    q = qualifier, n = var.name, c = bytes
                 ));
                 continue;
             }
@@ -1061,6 +1076,13 @@ impl CBackend {
                 self.indent -= 1;
                 self.line("}");
             }
+            SirStmt::BufferSet { buffer, index, value } => {
+                let i = self.emit_expr(index);
+                let v = self.emit_expr(value);
+                let n = self.buffer_info.get(buffer).copied().unwrap_or(0);
+                // Bounded write (§5.3): an out-of-range index is a defined no-op.
+                self.line(&format!("{{ /* buffer {}.set */ uint32_t __bi = (uint32_t)({i}); if (__bi < {n}U) {{ __buf_{b}[__bi] = (uint8_t)({v}); }} }}", buffer, i = i, v = v, n = n, b = buffer));
+            }
             SirStmt::If { cond, then } => {
                 let c = self.emit_expr(cond);
                 self.line(&format!("if ({}) {{", c));
@@ -1530,6 +1552,16 @@ impl CBackend {
             SirExpr::RingFull(r) => {
                 let cap = self.ring_info.get(r).map(|(_, c)| *c).unwrap_or(1).max(1);
                 format!("(__ring_{}_count >= {}U)", r, cap)
+            }
+            SirExpr::BufferGet { buffer, index } => {
+                let i = self.emit_expr(index);
+                let n = self.buffer_info.get(buffer).copied().unwrap_or(0);
+                // Bounded read (§5.3): an out-of-range index reads as 0.
+                format!("((uint32_t)({i}) < {n}U ? __buf_{b}[(uint32_t)({i})] : 0U)", i = i, n = n, b = buffer)
+            }
+            SirExpr::BufferLen(b) => {
+                let n = self.buffer_info.get(b).copied().unwrap_or(0);
+                format!("{n}U")
             }
         }
     }
@@ -2483,6 +2515,10 @@ fn collect_arith_stmts(stmts: &[SirStmt], set: &mut HashSet<(SirArithOp, Overflo
             }
             SirStmt::RingPush { value, .. } => collect_arith_expr(value, set),
             SirStmt::RingPop { .. } => {}
+            SirStmt::BufferSet { index, value, .. } => {
+                collect_arith_expr(index, set);
+                collect_arith_expr(value, set);
+            }
             SirStmt::Intrinsic(SirIntrinsic::HostIoPrint(e)) => collect_arith_expr(e, set),
             SirStmt::Intrinsic(_) => {}
             SirStmt::DriveSafe => {}
@@ -2557,6 +2593,7 @@ fn stmts_have_now(stmts: &[SirStmt]) -> bool {
         SirStmt::DeviceOp { args, .. } | SirStmt::BusXfer { args, .. } => args.iter().any(expr_has_now),
         SirStmt::RingPush { value, .. } => expr_has_now(value),
         SirStmt::RingPop { .. } => false,
+        SirStmt::BufferSet { index, value, .. } => expr_has_now(index) || expr_has_now(value),
         SirStmt::Intrinsic(SirIntrinsic::HostIoPrint(e)) => expr_has_now(e),
         SirStmt::Intrinsic(_) => false,
         SirStmt::DriveSafe => false,
