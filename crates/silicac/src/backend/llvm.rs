@@ -1683,11 +1683,48 @@ impl LlvmBackend {
             }
         }
         self.globals.push_str(
-            "@__fault_addr = global i32 0\n@__fault_owner = global i32 -1\n@__fault_cfsr = global i32 0\n@__fault_pending = global i32 0\n",
+            "@__fault_addr = global i32 0\n@__fault_owner = global i32 -1\n@__fault_cfsr = global i32 0\n@__fault_pc = global i32 0\n@__fault_site = global i32 -1\n@__fault_pending = global i32 0\n",
         );
 
         self.body.clear();
         self.allocas.clear();
+        // P7-4b: read the *stacked* PC (return address of the faulting
+        // instruction) from the exception frame the naked trampoline handed us,
+        // and attribute it to a handler site via a nearest-below scan over the
+        // site tables (§5.4/§7.2).  `%frame` is @__hardfault_decode's parameter.
+        let pcp = self.fresh();
+        self.inst(&format!("{} = getelementptr i32, ptr %frame, i32 6", pcp));
+        let pc = self.fresh();
+        self.inst(&format!("{} = load i32, ptr {}", pc, pcp));
+        self.inst(&format!("store volatile i32 {}, ptr @__fault_pc", pc));
+        // Unrolled nearest-below: best entry address <= pc so far, and its rid.
+        let mut best = "0".to_string();
+        let mut site = "-1".to_string();
+        for i in 0..sites.len() {
+            let fp = self.fresh();
+            self.inst(&format!("{} = getelementptr [{} x ptr], ptr @__site_fn, i32 0, i32 {}", fp, sites.len(), i));
+            let fnp = self.fresh();
+            self.inst(&format!("{} = load ptr, ptr {}", fnp, fp));
+            let fa = self.fresh();
+            self.inst(&format!("{} = ptrtoint ptr {} to i32", fa, fnp));
+            let rp = self.fresh();
+            self.inst(&format!("{} = getelementptr [{} x i32], ptr @__site_rid, i32 0, i32 {}", rp, sites.len(), i));
+            let rid = self.fresh();
+            self.inst(&format!("{} = load i32, ptr {}", rid, rp));
+            let le = self.fresh();
+            self.inst(&format!("{} = icmp ule i32 {}, {}", le, fa, pc));
+            let ge = self.fresh();
+            self.inst(&format!("{} = icmp uge i32 {}, {}", ge, fa, best));
+            let take = self.fresh();
+            self.inst(&format!("{} = and i1 {}, {}", take, le, ge));
+            let nb = self.fresh();
+            self.inst(&format!("{} = select i1 {}, i32 {}, i32 {}", nb, take, fa, best));
+            let ns = self.fresh();
+            self.inst(&format!("{} = select i1 {}, i32 {}, i32 {}", ns, take, rid, site));
+            best = nb;
+            site = ns;
+        }
+        self.inst(&format!("store volatile i32 {}, ptr @__fault_site", site));
         // cfsr = *SCB_CFSR (0xE000ED28); record it.
         let cp = self.fresh();
         self.inst(&format!("{} = inttoptr i64 3758157096 to ptr", cp));
@@ -1732,9 +1769,18 @@ impl LlvmBackend {
         self.label(&halt);
         self.m_asm("wfi", "halt; safe-state drive is a later phase (§5.6)");
         self.inst(&format!("br label %{}", halt));
-        self.functions.push_str("define void @HardFault_Handler() {\nentry:\n");
+        // The decoder proper takes the exception-frame pointer; the HardFault
+        // vector target is a naked trampoline (P7-4b) that recovers the active
+        // stack pointer (MSP unless EXC_RETURN bit 2 selects PSP) into r0 and
+        // tail-branches here — no prologue disturbs the frame before we read it.
+        self.functions.push_str("define void @__hardfault_decode(ptr %frame) {\nentry:\n");
         self.functions.push_str(&self.body);
         self.functions.push_str("}\n\n");
+        self.functions.push_str("define void @HardFault_Handler() naked noinline {\nentry:\n");
+        self.functions.push_str(
+            "  call void asm sideeffect \"tst lr, #4\\0A\\09ite eq\\0A\\09mrseq r0, msp\\0A\\09mrsne r0, psp\\0A\\09b __hardfault_decode\", \"\"()\n",
+        );
+        self.functions.push_str("  unreachable\n}\n\n");
     }
 
     /// The Cortex-M vector table (P4-1): system slots + external IRQ slots up to

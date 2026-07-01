@@ -34,13 +34,21 @@ cargo run -q --bin silicac -- --target metal-nrf52840 --emit-llvm "$EX" -o "$WOR
   || { echo "FAIL: --emit-llvm errored"; cat "$WORK/emit.log"; exit 1; }
 grep -q 'define void @HardFault_Handler()' "$WORK/flt.ll" || { echo "FAIL: no HardFault decoder in IR"; exit 1; }
 grep -q '@__owner_start = constant' "$WORK/flt.ll" || { echo "FAIL: no ownership table in IR"; exit 1; }
+# P7-4b: the PC→(handler, when-state) site table + the naked trampoline that
+# recovers the exception frame and the decoder that scans the table for the PC.
+grep -q '@__site_fn = constant' "$WORK/flt.ll"                  || { echo "FAIL: no site table in IR (P7-4a)"; exit 1; }
+grep -q 'define void @HardFault_Handler() naked' "$WORK/flt.ll" || { echo "FAIL: HardFault is not a naked trampoline (P7-4b)"; exit 1; }
+grep -q 'define void @__hardfault_decode(ptr' "$WORK/flt.ll"    || { echo "FAIL: no PC decoder fn (P7-4b)"; exit 1; }
+grep -q 'b __hardfault_decode' "$WORK/flt.ll"                   || { echo "FAIL: trampoline does not branch to the decoder (P7-4b)"; exit 1; }
 llc "$WORK/flt.ll" -filetype=obj -o "$WORK/flt.o" 2>"$WORK/llc.log" || { echo "FAIL: llc"; cat "$WORK/llc.log"; exit 1; }
 arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -nostdlib -nostartfiles -T "$WORK/flt.ld" "$WORK/flt.o" -o "$WORK/flt.elf" 2>"$WORK/link.log" \
   || { echo "FAIL: link"; cat "$WORK/link.log"; exit 1; }
 
 addr() { arm-none-eabi-nm "$WORK/flt.elf" | awk -v s="$1" '$3==s{print "0x"$1}'; }
 HF="$(addr HardFault_Handler)"; OWN="$(addr __fault_owner)"; PEND="$(addr __fault_pending)"
-for s in "$HF" "$OWN" "$PEND"; do [[ -n "$s" ]] || { echo "FAIL: missing a decoder symbol"; exit 1; }; done
+# P7-4b: the decoder fn + the PC/site fault-record slots must link too.
+HD="$(addr __hardfault_decode)"; SITE="$(addr __fault_site)"; FPC="$(addr __fault_pc)"
+for s in "$HF" "$OWN" "$PEND" "$HD" "$SITE" "$FPC"; do [[ -n "$s" ]] || { echo "FAIL: missing a decoder symbol"; exit 1; }; done
 
 echo "== run on metal (Renode) — the decoder coexists with a live program =="
 # A precise BFAR fault can't be injected on Renode (CFSR is hardware-managed /
@@ -68,7 +76,7 @@ echo "metal: LED @250ms=$L1 (before first fire) @750ms=$L2 (after) — expect 0 
 
 echo "== compare =="
 if (( L1 == 0 && L2 == 1 )); then
-  echo "PASS: LLVM-built Layer-3 decoder (ownership table + HardFault handler) links and coexists with a live program on metal (P6-3). Address→owner decode validated by sim + canary."
+  echo "PASS: LLVM-built Layer-3 decoder (ownership table + site map + naked HardFault trampoline → __hardfault_decode) links and coexists with a live program on metal (P6-3/P7-4a/P7-4b). Address→owner and PC→handler decode validated by sim (layer3::decode_site) + canary."
   exit 0
 else
   echo "FAIL: program not running with the decoder present (LED @750=$L1 @1250=$L2, expected 1 0)"

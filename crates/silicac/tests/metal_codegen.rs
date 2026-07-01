@@ -128,6 +128,42 @@ program app {
 }
 
 #[test]
+fn hardfault_decoder_consumes_the_site_table() {
+    // P7-4b: the HardFault decoder attributes the faulting PC to a handler site.
+    // A naked trampoline recovers the exception-frame pointer (MSP/PSP per
+    // EXC_RETURN bit 2) and tail-branches to `__hardfault_decode`, which reads the
+    // stacked PC (frame[6]) and scans the site table for the nearest-below entry.
+    let src = r#"
+board dk {
+  soc s { memory { flash : region at 0x0 size 1024K   ram : region at 0x2000_0000 size 256K } clocks { sysclk : clock_source = 64MHz } }
+}
+program app {
+  use board dk as b
+  cell n : u32 = 0
+  every 100ms { n = n + 1 }
+}
+"#;
+    let sir = compile(src);
+    let out = c::CBackend::with_target(Target::MetalNrf52840).emit(&sir);
+
+    // Naked trampoline recovering the frame + branching to the decoder.
+    assert!(out.contains("__attribute__((naked)) void HardFault_Handler(void)"), "no naked trampoline:\n{out}");
+    assert!(out.contains("mrseq r0, msp") && out.contains("mrsne r0, psp"), "trampoline must select MSP/PSP:\n{out}");
+    assert!(out.contains("b __hardfault_decode"), "trampoline must branch to the decoder:\n{out}");
+    // The decoder reads the stacked PC and records it.
+    assert!(out.contains("void __hardfault_decode(uint32_t *__frame)"), "no decoder fn:\n{out}");
+    assert!(out.contains("__frame[6]"), "decoder must read the stacked PC:\n{out}");
+    assert!(out.contains("volatile uint32_t __fault_pc"), "no __fault_pc record:\n{out}");
+    assert!(out.contains("volatile uint32_t __fault_site"), "no __fault_site record:\n{out}");
+    // Nearest-below scan over the site table (consumes both tables).
+    assert!(out.contains("__i < __SITE_COUNT"), "no site scan:\n{out}");
+    assert!(
+        out.contains("__fa <= __pc && __fa >= __best") && out.contains("__site = __site_rid[__i]"),
+        "decoder must attribute PC to the owning site via nearest-below:\n{out}"
+    );
+}
+
+#[test]
 fn fpu_soc_reserves_the_larger_exception_frame() {
     // P7-2 / Finding B: hardware float is real (P6-8), so on an FPU-bearing SoC a
     // preempting reaction can lazily stack a 104 B FP exception frame, not the

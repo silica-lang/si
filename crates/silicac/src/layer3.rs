@@ -86,6 +86,20 @@ pub fn handler_symbol(reaction_id: usize) -> String {
     format!("__reaction_{reaction_id}")
 }
 
+/// Decode a faulting program counter to its owning site (§5.4/§7.2, P7-4b): the
+/// site whose handler-entry address is the greatest `<= pc` — a nearest-below
+/// match, since handler code regions are contiguous and the table stores only
+/// entry points.  `entries` pairs each site with its (link-time) entry address;
+/// this is the host oracle for the on-device scan the `HardFault` decoder runs
+/// over `__site_fn`/`__site_rid`.  `None` if `pc` precedes every handler.
+pub fn decode_site(entries: &[(u64, SiteEntry)], pc: u64) -> Option<&SiteEntry> {
+    entries
+        .iter()
+        .filter(|(addr, _)| *addr <= pc)
+        .max_by_key(|(addr, _)| *addr)
+        .map(|(_, s)| s)
+}
+
 /// A human-readable description of a reaction trigger, for the site map.
 fn trigger_desc(t: &SirTrigger) -> String {
     match t {
@@ -235,5 +249,26 @@ mod tests {
         assert_eq!(sites[1].trigger, "every 100000000ns");
         // device id 0 → its instance name `gpio0`.
         assert_eq!(sites[1].when_state, vec![("gpio0".to_string(), "configured".to_string())]);
+    }
+
+    #[test]
+    fn decode_site_nearest_below_attributes_the_pc() {
+        // P7-4b: a PC is attributed to the handler whose entry is the greatest
+        // address ≤ pc (the region it falls within).
+        let s = |id: usize| SiteEntry {
+            reaction_id: id,
+            handler: handler_symbol(id),
+            trigger: "every 100000000ns".into(),
+            when_state: vec![],
+        };
+        // Two handlers laid out at 0x1000 and 0x1080.
+        let entries = vec![(0x1000u64, s(0)), (0x1080u64, s(1))];
+        // A PC inside the first handler's region.
+        assert_eq!(decode_site(&entries, 0x1040).unwrap().reaction_id, 0);
+        // A PC at/after the second handler's entry.
+        assert_eq!(decode_site(&entries, 0x1080).unwrap().reaction_id, 1);
+        assert_eq!(decode_site(&entries, 0x2000).unwrap().reaction_id, 1);
+        // A PC before any handler → no attribution.
+        assert!(decode_site(&entries, 0x0800).is_none());
     }
 }

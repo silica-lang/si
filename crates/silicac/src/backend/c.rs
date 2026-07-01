@@ -1639,9 +1639,16 @@ impl CBackend {
         self.line("volatile uint32_t __fault_addr = 0U;");
         self.line("volatile uint32_t __fault_owner = 0xFFFFFFFFUL; /* index, or 0xFFFFFFFF = unclaimed/invalid */");
         self.line("volatile uint32_t __fault_cfsr = 0U;");
+        self.line("volatile uint32_t __fault_pc = 0U;   /* stacked return address of the faulting instruction (P7-4b) */");
+        self.line("volatile uint32_t __fault_site = 0xFFFFFFFFUL; /* owning reaction id, or 0xFFFFFFFF = unattributed (P7-4b) */");
         self.line("volatile uint32_t __fault_pending = 0U;");
-        self.line("void HardFault_Handler(void) {");
+        // P7-4b: the decoder proper takes the exception-frame pointer (recovered
+        // by the naked trampoline below) so it can read the *stacked* PC — the
+        // return address of the faulting instruction — and attribute it to a
+        // handler site via a nearest-below scan over the site table.
+        self.line("void __hardfault_decode(uint32_t *__frame) {");
         self.indent += 1;
+        self.line("uint32_t __pc = __frame[6]; /* stacked PC (offset 24 in the exception frame) */");
         self.line("uint32_t __cfsr = *(volatile uint32_t *)0xE000ED28UL; /* SCB CFSR */");
         self.line("uint32_t __a = 0U;");
         self.line("uint32_t __o = 0xFFFFFFFFUL;");
@@ -1657,8 +1664,35 @@ impl CBackend {
         self.line("}");
         self.indent -= 1;
         self.line("}");
-        self.line("__fault_addr = __a; __fault_owner = __o; __fault_cfsr = __cfsr; __fault_pending = 1U;");
+        // Attribute the faulting PC to the owning handler site: the greatest entry
+        // address <= PC (nearest-below), consuming both site tables (§5.4/§7.2).
+        self.line("uint32_t __site = 0xFFFFFFFFUL; uint32_t __best = 0U;");
+        self.line("for (uint32_t __i = 0U; __i < __SITE_COUNT; __i++) {");
+        self.indent += 1;
+        self.line("uint32_t __fa = (uint32_t)(uintptr_t)__site_fn[__i];");
+        self.line("if (__fa <= __pc && __fa >= __best) { __best = __fa; __site = __site_rid[__i]; }");
+        self.indent -= 1;
+        self.line("}");
+        self.line("__fault_addr = __a; __fault_owner = __o; __fault_cfsr = __cfsr;");
+        self.line("__fault_pc = __pc; __fault_site = __site; __fault_pending = 1U;");
         self.line("for (;;) { /* halt; safe-state drive is a later phase (§5.6) */ }");
+        self.indent -= 1;
+        self.line("}");
+        // The HardFault vector target is a naked trampoline: recover the active
+        // stack pointer (MSP unless EXC_RETURN bit 2 selects PSP) as the frame
+        // pointer in r0 and tail-branch to the decoder — no prologue disturbs the
+        // exception frame before we read it.
+        self.line("__attribute__((naked)) void HardFault_Handler(void) {");
+        self.indent += 1;
+        self.line("__asm volatile (");
+        self.indent += 1;
+        self.line("\"tst lr, #4\\n\"       /* EXC_RETURN bit 2: 0 = MSP, 1 = PSP */");
+        self.line("\"ite eq\\n\"");
+        self.line("\"mrseq r0, msp\\n\"");
+        self.line("\"mrsne r0, psp\\n\"");
+        self.line("\"b __hardfault_decode\\n\"");
+        self.indent -= 1;
+        self.line(");");
         self.indent -= 1;
         self.line("}");
     }

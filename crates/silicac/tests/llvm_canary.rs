@@ -442,6 +442,36 @@ fn metal_emits_the_layer3_site_map_table() {
     assert_no_c_isms(&ll);
 }
 
+#[test]
+fn metal_hardfault_decoder_reads_stacked_pc_and_scans_sites() {
+    // P7-4b: the LLVM HardFault decoder is a naked trampoline into
+    // `@__hardfault_decode(ptr %frame)`, which reads the stacked PC (frame+24) and
+    // scans the site tables (nearest-below) to record @__fault_site / @__fault_pc.
+    let mut m = module(vec![cell("v", SirType::U32, 0)], vec![]);
+    let mut rx = reaction(vec![SirStmt::Assign {
+        target: SirPlace::Var("v".into()),
+        value: SirExpr::U64(1),
+    }]);
+    rx.id = 1;
+    rx.trigger = SirTrigger::EveryNs(100_000_000);
+    m.reactions.push(rx);
+    let ll = LlvmBackend::with_target(Target::MetalNrf52840).emit(&m);
+
+    // Naked trampoline + separate decoder taking the frame pointer.
+    assert!(ll.contains("define void @HardFault_Handler() naked noinline"), "no naked trampoline:\n{}", ll);
+    assert!(ll.contains("mrseq r0, msp") && ll.contains("mrsne r0, psp"), "trampoline must select MSP/PSP:\n{}", ll);
+    assert!(ll.contains("b __hardfault_decode"), "trampoline must branch to the decoder:\n{}", ll);
+    assert!(ll.contains("define void @__hardfault_decode(ptr %frame)"), "no decoder fn:\n{}", ll);
+    // Reads the stacked PC (frame index 6 = offset 24) and records it.
+    assert!(ll.contains("getelementptr i32, ptr %frame, i32 6"), "decoder must read the stacked PC:\n{}", ll);
+    assert!(ll.contains("store volatile i32") && ll.contains("@__fault_pc"), "no __fault_pc record:\n{}", ll);
+    // Consumes both site tables + records the attributed site.
+    assert!(ll.contains("getelementptr [2 x ptr], ptr @__site_fn"), "decoder must load site fn entries:\n{}", ll);
+    assert!(ll.contains("@__site_rid") && ll.contains("@__fault_site"), "decoder must record the attributed site:\n{}", ll);
+    assert!(ll.contains("select i1"), "nearest-below scan must use selects:\n{}", ll);
+    assert_no_c_isms(&ll);
+}
+
 // ─── P3-4c: metal direction (vector table + Reset_Handler) ────────────────────
 
 #[test]
