@@ -1,0 +1,8 @@
+// Starting point — edit_add_second_led.
+program blink {
+  cell lit : bool = false
+
+  every 500ms {
+    lit = not lit
+  }
+}

@@ -1,0 +1,10 @@
+// Reference solution — edit_add_second_led.
+program blink {
+  cell lit : bool = false
+  cell lit2 : bool = false
+
+  every 250ms {
+    lit = not lit
+    lit2 = not lit2
+  }
+}
