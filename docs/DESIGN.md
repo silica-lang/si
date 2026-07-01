@@ -521,10 +521,18 @@ statically-proven fraction; the runtime check is the sound fallback, never silen
 > `__reaction_<id>` entry symbol (a `sys.start` reaction inlines into `@Reset_Handler` on the LLVM
 > backend), its reaction id, and the device typestate it provably runs under — rendered as a host-side
 > comment, no on-device strings (§4.3). Both backends emit it (`__site_fn`/`__site_rid`), verified by
-> `metal_codegen.rs` (C) and `llvm_canary.rs` (LLVM). **Remaining:** the fault-time PC **decode**
-> that consumes this table (matching a stacked PC to its handler in the `HardFault` decoder) is P7-4b;
-> plus soundness of a *proven* state across a `yields` when a shared device may be preempted, and
-> op-internal transitions read from the op's own top-level `become` (not through nested sub-op inlining).
+> `metal_codegen.rs` (C) and `llvm_canary.rs` (LLVM). **Fault-time decode (audit #35 P7-4b).** The
+> `HardFault` vector target is now a **naked trampoline** that recovers the active stack pointer (MSP
+> unless EXC_RETURN bit 2 selects PSP) as the exception-frame pointer and tail-branches to
+> `__hardfault_decode(frame)`, which reads the *stacked* PC (`frame[6]`) and attributes it to the owning
+> handler via a **nearest-below** scan over the site tables (greatest entry `<= pc`), recording
+> `__fault_pc`/`__fault_site` beside the address record. The decode logic is `layer3::decode_site`
+> (the host oracle, unit-tested + exercised in `sim_fault_decode.rs`); on metal, per Renode's BFAR
+> limitation the `harness/fault_decode_metal.sh` gate proves the naked trampoline + decoder + site
+> table **link and coexist** with a live program (the address→owner and PC→handler decode themselves
+> are validated by the sim oracle + the IR/C canary). **Remaining:** soundness of a *proven* state
+> across a `yields` when a shared device may be preempted, and op-internal transitions read from the
+> op's own top-level `become` (not through nested sub-op inlining).
 
 An **interface** is the contract a device provides (`implements i2c`) or requires
 (`needs bus: i2c`). Interfaces are how composition is typed: any device providing `i2c` can satisfy
