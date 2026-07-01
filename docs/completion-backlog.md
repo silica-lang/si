@@ -583,3 +583,4 @@ Cluster P7 — post-P6 audit remediation (tracking issue #86):
 - P7-4a Layer-3 site map: PC→(handler, when-state) table generation — PR #90 — 2026-06-30
 - P7-4b Layer-3 site map: fault-time PC decode + HardFault wire-up — PR #91 — 2026-06-30
 - P7-5a Implement `buffer<N>` (bounded byte buffer) — PR #92 — 2026-06-30
+- P7-5b Implement `pool<T,N>` (bounded pool) — PR #93 — 2026-06-30
