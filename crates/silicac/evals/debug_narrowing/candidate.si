@@ -1,0 +1,12 @@
+// Agent submission (Claude) — debug_narrowing.  The narrowing site is made
+// explicit with a single `as u8` cast — the truncating behaviour is preserved
+// and spelled out, rather than widening the cell or changing the arithmetic.
+program narrow {
+  cell total : u32 = 0
+  cell low : u8 = 0
+
+  every 100ms {
+    total = total + 100
+    low = total as u8
+  }
+}

@@ -1,0 +1,8 @@
+// Agent submission (Claude) — author_heartbeat.
+program heartbeat {
+  cell lit : bool = false
+
+  every 500ms {
+    lit = not lit
+  }
+}

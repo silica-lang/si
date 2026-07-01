@@ -1668,7 +1668,14 @@ Honest failure modes, roughly in order of how much they would hurt:
 5. **Agentic-native is asserted, not validated.** "Good for agents" is a hypothesis until an agent
    actually authors/edits/debugs non-trivial Silica and we measure it. *Mitigation:* treat the std
    lib as the idiom corpus (§7.4) and the overlay API as the edit surface (§7.3) from Phase 2, and
-   run real agentic loops against them as an evaluation, not a vibe.
+   run real agentic loops against them as an evaluation, not a vibe. **Status (audit #35 P7-7a/b):**
+   the agentic-eval harness (`silicac::eval`, §7.4) is built and *run on real agent output* — an
+   author/edit/debug task set scored by the runner. The committed report (`crates/silicac/evals/
+   REPORT.md`, regenerable via `cargo run --bin agentic_eval -- --report`) records the result: **4/4**
+   agent submissions compile, **`.raw` frequency 0**, and total escape-hatch use is **1** (the single
+   truncating `as` cast the debug task legitimately calls for) — i.e. the agent stays at the language's
+   abstraction level rather than routing around the strictness defaults. Still a small task set;
+   broadening it (more, harder programs; multiple agents) is the ongoing work.
 6. **The "no privileged built-ins" purity costs more than it's worth.** Forcing `gpio`/`uart`/NVIC
    through the same `device`/`ops` machinery as exotic parts could make common things verbose.
    *Mitigation:* let the std lib carry the verbosity once so user code stays terse; revisit only if

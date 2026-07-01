@@ -11,13 +11,17 @@
 
 use std::path::PathBuf;
 
-use silicac::eval::{load_tasks, run_reference, TaskOutcome};
+use silicac::eval::{format_report, load_tasks, run_candidates, run_reference, TaskOutcome};
 use silicac::metrics::EscapeHatches;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `--report` (P7-7b): score real agent submissions (`candidate.si`) against
+    // the reference baseline and print the markdown report artifact to stdout.
+    let report_mode = args.iter().any(|a| a == "--report");
     let root = args
-        .first()
+        .iter()
+        .find(|a| !a.starts_with("--"))
         .map(PathBuf::from)
         .unwrap_or_else(silicac::eval::default_evals_dir);
 
@@ -25,6 +29,17 @@ fn main() {
     if tasks.is_empty() {
         eprintln!("no eval tasks found under {}", root.display());
         std::process::exit(1);
+    }
+
+    if report_mode {
+        let reference = run_reference(&tasks);
+        let candidate = run_candidates(&tasks);
+        print!("{}", format_report(&tasks, &reference, &candidate));
+        // A candidate that does not compile is a real agent failure — surface it.
+        if candidate.iter().any(|o| !o.compiles) {
+            std::process::exit(1);
+        }
+        return;
     }
 
     println!("== agentic-eval: {} reference solutions ({}) ==", tasks.len(), root.display());
