@@ -592,3 +592,6 @@ Cluster P7 — post-P6 audit remediation (tracking issue #86):
 - P7-8b DTS importer: pins/clocks/memory node coverage + round-trip — PR #99 — 2026-06-30
 - P7-9a Resolver refactor: extract the lowering-utility layer (typed-AST→SIR boundary) — PR #100 — 2026-06-30
 - P7-9b Resolver refactor: split the typecheck pass from the driver — PR #101 — 2026-06-30
+
+Post-P7 follow-ups:
+- Fix measured worst-case-stack ISR coverage: TIMER1/TIMER2 + `__hardfault_decode`, retire stale SysTick (issue #83; closes audit #35 Finding 1) — PR #102 — 2026-07-01

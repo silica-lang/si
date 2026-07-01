@@ -1096,7 +1096,14 @@ on parts that have one — not a runtime mystery.
 > `harness/stack_budget.sh` (healthy build reports a measured budget; an oversized program is rejected
 > with no firmware emitted; a float program builds through the FPU-aware measured path) and the
 > `stackinfo`/`metal_codegen` fixture tests (both frame sizes; the +40 B/level FPU delta).
-> **Remaining:** the **frame-union** optimisation (overlapping
+> **ISR-entry coverage (issue #83).** The measured walk starts from `stackinfo::ISR_ENTRIES`, which had
+> gone stale: it named the retired `SysTick_Handler` (P6-6) and omitted the real `TIMER1_IRQHandler`
+> (`every`) and `TIMER2_IRQHandler` (tick) ISRs, so a `TIMER1 → __reaction_N` chain was excluded and the
+> bound could pass an over-RAM image. It now lists the handlers the backends actually emit — TIMER1,
+> TIMER2, GPIOTE, `__BUS`, and `__hardfault_decode` (the naked `HardFault_Handler` trampoline's real
+> frame lives there, invisible to `-fcallgraph-info`'s call edges after P7-4b). Blink's measured budget
+> rose 641 → 721 B (the previously-skipped TIMER1 frame). With this, **audit Finding 1 — the sound
+> measured stack — is fully closed. Remaining:** the **frame-union** optimisation (overlapping
 > disjoint-lifetime frames) is not yet applied — it can only make the budget smaller.
 
 > **Status (implemented — flash / code-size budget, audit #35 P1-3).** Symmetric to RAM, metal builds
