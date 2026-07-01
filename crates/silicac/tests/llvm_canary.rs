@@ -337,6 +337,7 @@ fn reg_load_is_a_masked_shifted_volatile_load() {
             field_mask: 0xF0,
             field_shift: 4,
             access: SirRegAccess::Ro,
+            read_clears: false,
         },
     }];
     let ll = LlvmBackend::new()

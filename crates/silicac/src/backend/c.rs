@@ -1531,7 +1531,9 @@ impl CBackend {
                 format!("(const uint8_t *)\"{}\"", escaped)
             }
             SirExpr::Load(name) => self.var_ref(name),
-            SirExpr::RegLoad { device, reg_offset, width, field_mask, field_shift, access } => {
+            SirExpr::RegLoad { device, reg_offset, width, field_mask, field_shift, access, .. } => {
+                // `read_clears` is metal-irrelevant: a volatile read clears the
+                // register in hardware (§4.2/D04); only the sim needs to model it.
                 self.emit_reg_load(*device, *reg_offset, *width, *field_mask, *field_shift, *access)
             }
             SirExpr::Not(inner) => format!("(!({}))", self.emit_expr(inner)),

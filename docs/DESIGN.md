@@ -636,13 +636,14 @@ fixed-width volatile pointers (§6.2, D09).
 > are now load-bearing: a register read with a side effect (`rc` access, the `pop_on_read`/`side_effect`
 > modifier — now captured rather than swallowed — or any `rc` field) makes a partial *field* write a
 > **compile error** (the implicit read-modify-write would disturb it) — write the whole register, use a
-> `w1c` field, or `.raw`. The sim models `rc` read-to-clear at assignment sites. **Multi-field single
+> `w1c` field, or `.raw`. The sim models the read-clear (`rc` *and* `pop_on_read`, via a `read_clears`
+> flag on `SirExpr::RegLoad`) in **every** read position — assignment RHS *and* `if`/`poll`/`await`
+> conditions (audit #35 P7-6a); on metal the hardware clears on the volatile read. **Multi-field single
 > write (audit #35 P0-2c).** `REG{ a = .., b = .. }` updates several fields of one register in **one**
 > store (`Stmt::RegWrite` → `SirStmt::RegWrite`): a single masked write when every field is w1c/wo,
 > else one read-modify-write over the *union* mask — never one RMW per field. Direction (`ro`),
 > duplicate-field, unknown-field, and read-side-effect-RMW errors all apply. **Finding 2 complete.**
-> **Remaining (deferred):** `rc` read-clear for reads buried in conditions (not assignment RHS), and
-> `reserved`/`width=` enforcement.
+> **Remaining (deferred):** `reserved`/`width=` enforcement (P7-6b).
 
 > **Status (implemented — ARM-conformant barriers, audit #35 P1-1).** The emitted barriers now match
 > the Cortex-M architecture rather than over-/under-barriering. **Cheaper:** Device-memory accesses

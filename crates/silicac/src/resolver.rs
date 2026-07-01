@@ -3003,6 +3003,8 @@ impl Resolver {
                                             field_mask: 1u64 << pin.index,
                                             field_shift: pin.index,
                                             access: reg.2,
+                                            // A GPIO input read clears only if the input register is `rc`.
+                                            read_clears: matches!(reg.2, SirRegAccess::Rc),
                                         };
                                     }
                                     self.err(
@@ -3294,6 +3296,10 @@ fn reg_load(ri: &RegInfo, mask: u64, shift: u8, access: SirRegAccess) -> SirExpr
         field_mask: mask,
         field_shift: shift,
         access,
+        // P7-6a: reads of an `rc`/`pop_on_read` register clear it — track it here
+        // so the sim models the clear for *any* read position (RHS or condition),
+        // even when the field/register access is `rw` (a `pop_on_read` register).
+        read_clears: ri.read_side_effect,
     }
 }
 
