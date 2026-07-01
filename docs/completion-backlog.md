@@ -575,3 +575,6 @@ Cluster P6 — fully landed on `main`:
 - P6-7 Metal semihosting (`host_io` on metal, both backends) — PR #78 — 2026-06-27
 - P6-9 Multi-consumer bus arbitration (priority-ordered, implicit) — PR #81 — 2026-06-27 _(recreated from #79, which auto-closed when its stacked base branch was deleted)_
 - P6-6 TIMER-rebase `now()`/deadlines onto TIMER2, retire SysTick — PR #80 — 2026-06-27
+
+Cluster P7 — post-P6 audit remediation (tracking issue #86):
+- P7-1 LLVM/C MMIO barrier parity — PR #87 — 2026-06-30
